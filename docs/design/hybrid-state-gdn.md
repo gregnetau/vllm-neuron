@@ -105,7 +105,11 @@ activations use static scales from an offline calibration file
 | MLP | `NF.mlp` STATIC, post-attention RMSNorm fused (as in the Llama static-FP8 path) |
 | GDN `in_proj_qkv`, `in_proj_z` | `NF.qkv_proj` STATIC as a generic projection (one scale for all parts) |
 | GDN `out_proj` | `NF.o_proj` STATIC |
+| Attention q / k / v | `NF.qkv_proj` STATIC (prefill), `NF.attention_decode` STATIC QKV (decode); one scale per part |
+| Attention `o_proj` | `NF.o_proj` STATIC on `[B, Nh*Dh/128, 128, S]` (head_dim 256 exceeds the kernel's 128) |
 
-`NF.mlp` falls back to PyTorch, without quantization, where its kernel does not apply (CTE
-with intermediate size per rank above 4096 and hidden size below 7168); the FP8 MLP then
-runs in BF16 on dequantized weights.
+The attention output gate stays BF16. `NF.mlp` falls back to PyTorch, without quantization,
+where its kernel does not apply (CTE with intermediate size per rank above 4096 and hidden
+size below 7168). The FP8 MLP then splits the intermediate dimension into two kernel calls
+(the MLP is separable along it) and uses BF16 on dequantized weights only if that does not
+fit either.

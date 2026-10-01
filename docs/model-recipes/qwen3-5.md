@@ -33,8 +33,7 @@ rotary). This recipe serves the text tower; the vision tower and the MTP head ar
 | **Inputs** | Text | ✅ |
 | | Image / video | ❌ |
 | **Quantization** | BF16 | ✅ |
-| | Static FP8 (E4M3, per tensor), MLP and GDN projections | ✅ |
-| | Static FP8, full-attention projections | ❌ |
+| | Static FP8 (E4M3, per tensor): MLP, GDN and attention projections | ✅ |
 | | FP8 KV cache | ❌ |
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
 | | Pipeline / context parallelism | ❌ |
@@ -71,10 +70,18 @@ An offline example is in `examples/vllm_neuron/models/qwen3_5/run.py`.
 
 ### FP8
 
-The plugin quantizes the MLP weights and the GDN `in_proj_qkv`, `in_proj_z` and `out_proj`
-weights per tensor at load time (`scale = amax / 240`, values kept within the Trn2 E4M3
-range) and uses static activation scales from an offline calibration file. `in_proj_a`,
-`in_proj_b`, the conv weights and the full-attention layers stay BF16.
+The plugin quantizes weights per tensor at load time (`scale = amax / 240`, values kept within
+the Trn2 E4M3 range) and uses static activation scales from an offline calibration file:
+
+| Module | FP8 | BF16 |
+|---|---|---|
+| MLP | gate, up, down | |
+| Gated DeltaNet | `in_proj_qkv`, `in_proj_z`, `out_proj` | `in_proj_a`, `in_proj_b`, conv |
+| Full attention | q / k / v (one scale per part), `o_proj` | output gate |
+
+The output gate stays BF16: `sigmoid` turns small absolute errors on large negative gate
+logits into large relative errors, and per-tensor FP8 on the gate raises the attention output
+error from about 1% to about 10%.
 
 ```bash
 python examples/vllm_neuron/models/qwen3_5/calibrate_fp8.py \
@@ -85,8 +92,9 @@ MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=$PWD/fp8_act_amax.json \
 
 Calibration runs the Hugging Face model on CPU (about 2 s per prompt for 27B; 124 GB host
 RAM is sufficient). `neuron_config.modules_to_not_convert` keeps selected modules in BF16,
-for example `["layers.59.mlp", "layers.62.linear_attn"]`. MLPs in prefills larger than the
-FP8 MLP kernel supports (more than 128 tokens) run in BF16 on dequantized weights.
+for example `["layers.30.linear_attn", "layers.59.mlp"]`. For prefills above 128 tokens the
+FP8 MLP runs as two kernel calls over halves of the intermediate dimension, since the full
+width exceeds the kernel's limit for this model.
 
 ## Performance
 
@@ -96,22 +104,24 @@ FP8 MLP kernel supports (more than 128 tokens) run in BF16 on dequantized weight
 | Configuration | Prompt / output tokens | TTFT | TPOT |
 |---|---|---|---|
 | BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 350 ms | 41.6 ms |
-| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 420 ms | 36.8 ms |
+| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 385 ms | 36.3 ms |
 
 With `max_model_len` 128 (one attention block per request, no decode-time block clearing),
 a 5-token prompt with 40 output tokens takes 1.15 s end to end in BF16 and 0.93 s with FP8
 MLPs only (about 28 ms and 23 ms per token including prefill).
 
-Cold compilation takes about 4 minutes for the `max_model_len` 2048 configuration and is
-cached afterwards.
+Cold compilation of the `max_model_len` 2048 configuration takes about 4 minutes in BF16 and
+12 minutes in FP8, and is cached afterwards.
 
 ## Accuracy
 
 Per-module outputs of the Neuron model (BF16, all 64 layers and the final norm) match the
 Hugging Face reference with cosine similarity >= 0.9999. Static FP8 MLP outputs match the
-BF16 reference with cosine similarity >= 0.998 per layer. With FP8 MLPs and GDN projections,
-greedy 64-token continuations of 12 prompts match BF16 exactly for 5 prompts, with a mean
-identical prefix of 37 tokens. A task-level evaluation is in progress (see [Roadmap](#roadmap)).
+BF16 reference with cosine similarity >= 0.998 per layer. Against the Hugging Face reference
+on real activations, FP8 layer outputs have relative errors of 1-7% (GDN), 1-6% (MLP) and
+1-2.5% (full attention). With all FP8 modules, greedy 64-token continuations of 12 prompts
+match BF16 exactly for 3 prompts, with a mean identical prefix of 31 tokens; divergent
+continuations remain coherent. A task-level evaluation is in progress (see [Roadmap](#roadmap)).
 
 ## Known limitations
 
@@ -153,7 +163,7 @@ propose a competing implementation.
 
 Before this work is proposed upstream:
 
-1. **FP8**: static FP8 for the full-attention projections, an FP8 MLP prefill path, and FP8 KV cache.
+1. **FP8**: FP8 KV cache, and accuracy-driven selection of layers kept in BF16.
 2. **MTP**: the checkpoint's multi-token-prediction head for speculative decoding.
 3. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, including [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark)

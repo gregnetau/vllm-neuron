@@ -314,5 +314,11 @@ def fp8_quantize(w: torch.Tensor, scale: float) -> torch.Tensor:
     return (w.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
 
 
+def fp8_quantize_parts(w: torch.Tensor, scales: list[float], sizes: list[int]) -> torch.Tensor:
+    """Quantize consecutive column blocks of w [H, sum(sizes)] with their own scales (fused QKV)."""
+    blocks = torch.split(w, sizes, dim=1)
+    return torch.cat([fp8_quantize(b, s) for b, s in zip(blocks, scales)], dim=1)
+
+
 def fp8_scale_tile(scale: float, n: int = 1) -> torch.Tensor:
     return torch.full((SCALE_PARTITIONS, n), scale, dtype=torch.float32)

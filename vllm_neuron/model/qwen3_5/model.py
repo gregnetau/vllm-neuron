@@ -176,6 +176,12 @@ class Qwen3_5Attention(nn.Module):
         # attention_decode is called with d_head=256).
     """
 
+    # Static-FP8 input scales: buffer -> calibration modules (relative to the layer).
+    FP8_INPUT_SCALES = {
+        "qkv_input_scale": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+        "o_input_scale": ("self_attn.o_proj",),
+    }
+
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -201,15 +207,21 @@ class Qwen3_5Attention(nn.Module):
         self.q_size, self.kv_size = q_size, kv_size
         self.qkv_split_indices = [q_size, q_size + kv_size]
 
-        self.qkv_proj_weight = nn.Parameter(
-            torch.empty(self.hidden_size, q_size + 2 * kv_size, dtype=self.dtype)
-        )
-        self.gate_weight = nn.Parameter(
-            torch.empty(self.hidden_size, q_size, dtype=self.dtype)
-        )
-        self.o_proj_weight = nn.Parameter(
-            torch.empty(q_size, self.hidden_size, dtype=self.dtype)
-        )
+        H = self.hidden_size
+        self.fp8 = config.fp8_quantized(f"layers.{layer_idx}.self_attn")
+        # The output gate stays BF16: sigmoid turns small absolute errors on large negative
+        # gate logits into large relative errors, and per-tensor FP8 is too coarse for that.
+        self.gate_weight = nn.Parameter(torch.empty(H, q_size, dtype=self.dtype))
+        if self.fp8:
+            self.qkv_proj_weight = _fp8_param(H, q_size + 2 * kv_size)
+            self.o_proj_weight = _fp8_param(q_size, H)
+            self.qkv_proj_weight_scale = _scale_param(3)  # per q / k / v part
+            self.o_proj_weight_scale = _scale_param(1)
+            for name in self.FP8_INPUT_SCALES:
+                self.register_buffer(name, torch.ones(W.SCALE_PARTITIONS, 1), persistent=False)
+        else:
+            self.qkv_proj_weight = nn.Parameter(torch.empty(H, q_size + 2 * kv_size, dtype=self.dtype))
+            self.o_proj_weight = nn.Parameter(torch.empty(q_size, H, dtype=self.dtype))
         # Kernel-facing gamma (folded + channel-permuted), model dtype.
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
@@ -235,10 +247,40 @@ class Qwen3_5Attention(nn.Module):
     def _gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """sigmoid(gate) laid out [Nh, Dh, T] (matches flash_attention tp_out=True)."""
         T = hidden_states.shape[0]
-        gate = (hidden_states @ self.gate_weight).view(
-            T, self.num_attention_heads_per_rank, self.head_dim
-        )
+        gate = (hidden_states @ self.gate_weight).view(T, self.num_attention_heads_per_rank, self.head_dim)
         return torch.sigmoid(gate.float()).permute(1, 2, 0)
+
+    def _o_proj(self, attn):
+        """attn [B, Nh, Dh, S] -> [B, S, H]. Viewed as [B, Nh*Dh/128, 128, S] (same contraction)
+        so the output-projection kernel applies at head_dim 256."""
+        B, Nh, Dh, S = attn.shape
+        if Dh > 128 and Dh % 128 == 0:
+            attn = attn.reshape(B, Nh * Dh // 128, 128, S)
+        if self.fp8:
+            from nkilib.core.utils.common_types import QuantizationType
+
+            return NF.o_proj(attn, self.o_proj_weight, None, quantization_type=QuantizationType.STATIC,
+                             weight_scales=self.o_proj_weight_scale, input_scales=self.o_input_scale)
+        return NF.o_proj(attn, self.o_proj_weight, None)
+
+    def _decode_quant_kwargs(self) -> dict:
+        if not self.fp8:
+            return {}
+        from nkilib.core.utils.common_types import QuantizationType
+
+        return dict(quantization_type_qkv=QuantizationType.STATIC,
+                    weight_dequant_scale_qkv=self.qkv_proj_weight_scale,
+                    input_dequant_scale_qkv=self.qkv_input_scale)
+
+    def _qkv_quant_kwargs(self) -> dict:
+        if not self.fp8:
+            return {}
+        from nkilib.core.utils.common_types import QuantizationType
+
+        return dict(quantization_type=QuantizationType.STATIC, qkv_w_scale=self.qkv_proj_weight_scale,
+                    qkv_in_scale=self.qkv_input_scale, d_head=self.head_dim,
+                    num_q_heads=self.num_attention_heads_per_rank,
+                    num_kv_heads=self.num_key_value_heads_per_rank)
 
     def _write_kv(self, k, v, slot_mapping, block_size):
         """k, v [Nkv, T, Dh] -> paged cache (same scheme as Qwen3)."""
@@ -301,7 +343,8 @@ class Qwen3_5Attention(nn.Module):
         T = hidden_states.shape[0]
 
         qkv = NF.qkv_proj(
-            hidden=hidden_states.unsqueeze(0), qkv_weights=self.qkv_proj_weight, bias=None
+            hidden=hidden_states.unsqueeze(0), qkv_weights=self.qkv_proj_weight, bias=None,
+            **self._qkv_quant_kwargs(),
         ).squeeze(0)
         q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
         q = q.view(T, self.num_attention_heads_per_rank, self.head_dim).transpose(0, 1)
@@ -343,7 +386,7 @@ class Qwen3_5Attention(nn.Module):
 
         # <-- MODEL-SPECIFIC: output gate before o_proj
         attn_output = (attn_output.float() * self._gate(hidden_states)).to(self.dtype)
-        out = NF.o_proj(attn_output.unsqueeze(0), self.o_proj_weight, None).squeeze(0)
+        out = self._o_proj(attn_output.unsqueeze(0)).squeeze(0)
         if self.world_size > 1:  # >>> PARALLELISM: reduce-scatter to SP layout <<<
             out = self.tp_group.reduce_scatter(out, dim=0)
         return out.contiguous()
@@ -399,13 +442,14 @@ class Qwen3_5Attention(nn.Module):
             W_out=None, bias_out=None, transposed_out=False, out_in_sb=False,
             k_scale=self.k_scale, v_scale=self.v_scale,
             attention_dp=1, attention_dp_group=None, attention_dp_rank=0, kv_needs_a2a=False,
+            **self._decode_quant_kwargs(),
         )
 
         gate = (hidden_states @ self.gate_weight).view(
             B, S_decode, self.num_attention_heads_per_rank, self.head_dim
         ).permute(0, 2, 3, 1)  # [B, Nh, Dh, S]
         attn = (attn.float() * torch.sigmoid(gate.float()) / self.v_scale_float).to(self.dtype)
-        output = NF.o_proj(attn, self.o_proj_weight, None).reshape(B * S_decode, hidden)
+        output = self._o_proj(attn).reshape(B * S_decode, hidden)
 
         # Manual KV cache update (same as Qwen3)
         block_indices = slot_mapping // block_size
@@ -731,17 +775,19 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         for name in self.FP8_INPUT_SCALES:
             self.register_buffer(name, torch.ones(W.SCALE_PARTITIONS, 1), persistent=False)
 
-    def _kernel_ok(self, hidden_states: torch.Tensor, n_tokens: int) -> bool:
-        """Whether NF.mlp runs the FP8 kernel for n_tokens rows; its PyTorch fallback ignores
-        the quantization scales (e.g. CTE with intermediate/rank > 4096 and hidden < 7168)."""
+    def _kernel_ok(self, hidden_states: torch.Tensor, n_tokens: int, n_inter: int) -> bool:
+        """Whether NF.mlp runs the FP8 kernel for n_tokens rows and an n_inter-wide intermediate;
+        its PyTorch fallback ignores the quantization scales (e.g. CTE with intermediate/rank
+        > 4096 and hidden < 7168)."""
         from nkilib.core.utils.common_types import QuantizationType
 
         from vllm_neuron.functional.mlp import _can_use_kernel
         from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-        probe = torch.empty((n_tokens, self.gate_proj_weight.shape[0]), device="meta")
+        H = self.gate_proj_weight.shape[0]
         return can_run_kernel(hidden_states) and _can_use_kernel(
-            probe, self.gate_proj_weight, quantization_type=QuantizationType.STATIC)
+            torch.empty((n_tokens, H), device="meta"), torch.empty((H, n_inter), device="meta"),
+            quantization_type=QuantizationType.STATIC)
 
     def _forward_dequant(self, hidden_states, is_prefill: bool, ln_w: torch.Tensor):
         """BF16 MLP over dequantized FP8 weights (weight-only FP8) with the fused norm."""
@@ -759,7 +805,12 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         from nkilib.core.utils.common_types import NormType, QuantizationType
 
         n_tokens = hidden_states.shape[0] * (self.world_size if is_prefill else 1)
-        if not self._kernel_ok(hidden_states, n_tokens):
+        inter = self.gate_proj_weight.shape[1]
+        if self._kernel_ok(hidden_states, n_tokens, inter):
+            splits = 1
+        elif inter % 256 == 0 and self._kernel_ok(hidden_states, n_tokens, inter // 2):
+            splits = 2  # the MLP is separable along the intermediate dim: sum the halves
+        else:
             output = self._forward_dequant(hidden_states, is_prefill, ln_w)
             return self._reduce(output, is_prefill)
         ln_w = ln_w.to(torch.bfloat16).view(1, -1)
@@ -774,14 +825,21 @@ class Qwen3_5MLPStaticFP8(nn.Module):
             norm_type, mlp_ln_w = NormType.NO_NORM, None
         else:
             norm_type, mlp_ln_w = NormType.RMS_NORM, ln_w  # TKG fuses norm + quant
-        output = NF.mlp(
-            hidden_states, self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight,
-            eps=self.eps, ln_w=mlp_ln_w, norm_type=norm_type,
-            quantization_type=QuantizationType.STATIC,
-            gate_w_scale=self.gate_weight_scale, up_w_scale=self.up_weight_scale,
-            down_w_scale=self.down_weight_scale, gate_up_in_scale=self.gate_up_input_scale,
-            down_in_scale=self.down_input_scale, output_dtype="bfloat16",
-        )
+        output = None
+        step = inter // splits
+        for i in range(splits):
+            cols = slice(i * step, (i + 1) * step)
+            gate, up, down = self.gate_proj_weight, self.up_proj_weight, self.down_proj_weight
+            if splits > 1:
+                gate, up, down = gate[:, cols].contiguous(), up[:, cols].contiguous(), down[cols]
+            part = NF.mlp(
+                hidden_states, gate, up, down, eps=self.eps, ln_w=mlp_ln_w, norm_type=norm_type,
+                quantization_type=QuantizationType.STATIC,
+                gate_w_scale=self.gate_weight_scale, up_w_scale=self.up_weight_scale,
+                down_w_scale=self.down_weight_scale, gate_up_in_scale=self.gate_up_input_scale,
+                down_in_scale=self.down_input_scale, output_dtype="bfloat16",
+            )
+            output = part if output is None else output + part
         return self._reduce(output, is_prefill)
 
     def _reduce(self, output, is_prefill: bool):
@@ -1025,10 +1083,23 @@ class Qwen3_5ForCausalLM(nn.Module):
                 set_weight_loader(mlp.down_proj_weight, _loader(lambda t, r: W.mlp_down_device(t[0], r, tp)))
             if layer.layer_type == FULL_ATTENTION:
                 a = layer.self_attn
-                set_weight_loader(a.qkv_proj_weight, _loader(
-                    lambda t, r: W.attention_qkv_device(t[0], t[1], t[2], cfg, r, tp)))
-                set_weight_loader(a.gate_weight, _loader(lambda t, r: W.attention_gate_device(t[0], cfg, r, tp)))
-                set_weight_loader(a.o_proj_weight, _loader(lambda t, r: W.attention_o_device(t[0], cfg, r, tp)))
+                attn_qkv = lambda t, r: W.attention_qkv_device(t[0], t[1], t[2], cfg, r, tp)
+                gate_dev = lambda t, r: W.attention_gate_device(t, cfg, r, tp)
+                o_dev = lambda t, r: W.attention_o_device(t, cfg, r, tp)
+                if a.fp8:
+                    parts = (a.q_size, a.kv_size, a.kv_size)
+                    set_weight_loader(a.qkv_proj_weight, _loader(
+                        lambda t, r, f=attn_qkv, parts=parts: W.fp8_quantize_parts(
+                            f(t, r), [W.fp8_weight_scale(x) for x in t], parts)))
+                    set_weight_loader(a.qkv_proj_weight_scale, _loader(
+                        lambda t, r: torch.cat([W.fp8_scale_tile(W.fp8_weight_scale(x)) for x in t], dim=1)))
+                    wl, sl = _fp8_loaders(o_dev, 1)
+                    set_weight_loader(a.o_proj_weight, wl)
+                    set_weight_loader(a.o_proj_weight_scale, sl)
+                else:
+                    set_weight_loader(a.qkv_proj_weight, _loader(attn_qkv))
+                    set_weight_loader(a.o_proj_weight, _loader(lambda t, r, f=o_dev: f(t[0], r)))
+                set_weight_loader(a.gate_weight, _loader(lambda t, r, f=gate_dev: f(t[0], r)))
                 qk = _loader(lambda t, r: W.attention_qk_norm_device(t[0], cfg))
                 set_weight_loader(a.q_norm.weight, qk)
                 set_weight_loader(a.k_norm.weight, qk)
@@ -1044,10 +1115,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                         set_weight_loader(getattr(g, f"{param}_weight"), wl)
                         set_weight_loader(getattr(g, f"{param}_weight_scale"), sl)
                 else:
-                    set_weight_loader(g.in_proj_qkv_weight, _loader(lambda t, r: qkv_dev(t[0], r)))
-                    set_weight_loader(g.in_proj_z_weight, _loader(lambda t, r: heads_dev(t[0], r)))
-                    set_weight_loader(g.out_proj_weight, _loader(lambda t, r: out_dev(t[0], r)))
-                head_cols = _loader(lambda t, r: heads_dev(t[0], r))
+                    set_weight_loader(g.in_proj_qkv_weight, _loader(lambda t, r, f=qkv_dev: f(t[0], r)))
+                    set_weight_loader(g.in_proj_z_weight, _loader(lambda t, r, f=heads_dev: f(t[0], r)))
+                    set_weight_loader(g.out_proj_weight, _loader(lambda t, r, f=out_dev: f(t[0], r)))
+                head_cols = _loader(lambda t, r, f=heads_dev: f(t[0], r))
                 for wp in (g.in_proj_b_weight, g.in_proj_a_weight):
                     set_weight_loader(wp, head_cols)
                 set_weight_loader(g.conv_weight, _loader(lambda t, r: W.gdn_conv_device(t[0], cfg, r, tp)))
@@ -1078,6 +1149,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 m[s + "qkv_proj_weight"] = [c + "q_proj.weight", c + "k_proj.weight", c + "v_proj.weight"]
                 m[s + "gate_weight"] = c + "q_proj.weight"
                 m[s + "o_proj_weight"] = c + "o_proj.weight"
+                if layer.self_attn.fp8:
+                    m[s + "qkv_proj_weight_scale"] = m[s + "qkv_proj_weight"]
+                    m[s + "o_proj_weight_scale"] = c + "o_proj.weight"
                 m[s + "q_norm.weight"] = c + "q_norm.weight"
                 m[s + "k_norm.weight"] = c + "k_norm.weight"
             else:
@@ -1122,6 +1196,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 yield i, layer.mlp
             if layer.layer_type == LINEAR_ATTENTION and layer.linear_attn.fp8:
                 yield i, layer.linear_attn
+            if layer.layer_type == FULL_ATTENTION and layer.self_attn.fp8:
+                yield i, layer.self_attn
 
     def _load_fp8_activation_scales(self, checkpoint_path: str | None) -> None:
         """Static-FP8 input scales (amax / 240) from the offline calibration JSON."""

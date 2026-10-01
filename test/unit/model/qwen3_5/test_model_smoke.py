@@ -361,3 +361,34 @@ def test_gdn_static_fp8_matches_bf16():
         a, b = a.float(), b.float()
         rel = ((a - b).norm() / a.norm()).item()
         assert F.cosine_similarity(a.flatten(), b.flatten(), 0) > 0.99 and rel < 0.1, rel
+
+
+def test_attention_o_proj_views_head_dim_256_as_128():
+    """_o_proj contracts [B, Nh, 256, S] as [B, 2*Nh, 128, S]: same result as the flat matmul."""
+    mod = _install_stubs()
+    from vllm_neuron.model.neuron_config import NeuronConfig
+    from vllm_neuron.model.qwen3_5 import weights as W
+    from vllm_neuron.model.qwen3_5.config import Qwen3_5Config
+
+    torch.manual_seed(2)
+    kw = dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+              head_dim=256, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
+              linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128)
+    for neuron_config in (None, NeuronConfig.from_dict({"quantization": "fp8"})):
+        a = mod.Qwen3_5Attention(Qwen3_5Config(**kw, neuron_config=neuron_config), 3)
+        w = torch.randn(4 * 256, 64) * 0.05
+        attn = torch.randn(2, 4, 256, 3).to(torch.bfloat16)  # [B, Nh, Dh, S]
+        flat = attn.permute(0, 3, 1, 2).reshape(2, 3, 4 * 256).float()
+        if a.fp8:
+            s = W.fp8_weight_scale(w)
+            a.o_proj_weight.data = W.fp8_quantize(w, s)
+            a.o_proj_weight_scale.data = W.fp8_scale_tile(s)
+            a.o_input_scale = W.fp8_scale_tile(W.fp8_scale(attn.float().abs().amax()))
+            tol = 0.08
+        else:
+            a.o_proj_weight.data = w.to(torch.bfloat16)
+            tol = 0.01
+        out = a._o_proj(attn).float()
+        ref = flat @ w
+        assert out.shape == ref.shape
+        assert ((out - ref).norm() / ref.norm()).item() < tol

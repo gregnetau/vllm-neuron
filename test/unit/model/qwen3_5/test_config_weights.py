@@ -89,3 +89,15 @@ def test_fp8_module_selection():
     cfg = Qwen3_5Config(neuron_config=nc)
     assert cfg.fp8_enabled and cfg.fp8_quantized("layers.0.mlp")
     assert not cfg.fp8_quantized("layers.5.mlp")
+
+
+def test_fp8_quantize_parts_uses_one_scale_per_block():
+    from vllm_neuron.model.qwen3_5 import weights as W
+
+    torch.manual_seed(1)
+    q, k, v = torch.randn(64, 8) * 4.0, torch.randn(64, 4) * 0.5, torch.randn(64, 4) * 0.1
+    scales = [W.fp8_weight_scale(t) for t in (q, k, v)]
+    packed = W.fp8_quantize_parts(torch.cat([q, k, v], dim=1), scales, [8, 4, 4])
+    for block, t, s in zip(torch.split(packed.float(), [8, 4, 4], dim=1), (q, k, v), scales):
+        assert block.abs().max().item() <= W.FP8_MAX
+        assert torch.allclose(block * s, t, rtol=0.07, atol=s * 0.5)
