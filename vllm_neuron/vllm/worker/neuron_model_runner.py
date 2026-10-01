@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from vllm import ModelRegistry
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
@@ -29,10 +30,17 @@ from vllm.sampling_params import SamplingType
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
+from vllm_neuron.model.state_cache import (
+    page_layout as _state_page_layout,
+    padded_state_page_bytes as _padded_state_page_bytes,
+    paired_half_views as _paired_half_views,
+    state_half_elems as _state_half_elems,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -4115,8 +4123,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.kv_cache_config.kv_cache_groups
         ):
             spec = kv_cache_group_spec.kv_cache_spec
-            block_size = spec.block_size
             blk_table = self.input_batch.block_table[kv_cache_group_id]
+            # Kernel block size == spec.block_size except for hybrid (attention +
+            # recurrent-state) models, where the KV manager's attention blocks are
+            # enlarged to unify page sizes and split back into kernel-sized blocks.
+            block_size = blk_table.block_size
             blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
             # from ``blk_table_tensor``. Required because torch.compile's
@@ -4301,9 +4312,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         is_prefill = (num_tokens // num_reqs) > decode_token_threshold
 
-        for _, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
             spec = kv_cache_group_spec.kv_cache_spec
-            block_size = spec.block_size
+            # Kernel block size (see _build_attention_metadata).
+            block_size = self.input_batch.block_table[kv_cache_group_id].block_size
             # Block-table seq dim. Defaults to max_model_len; overridden by
             # ctx_bucket for decode_context_length_buckets warmup. SWA path below
             # may further reduce this for SWA groups.
@@ -4331,6 +4345,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             full_max_blocks_per_req = (
                 self.max_model_len + block_size - 1
             ) // block_size
+            # Hybrid attention/state models: the KV manager block (spec.block_size)
+            # is larger than the kernel block, and the runtime BlockTable sizes its
+            # width in manager blocks and then splits each into kernel blocks. Take
+            # the width from that BlockTable so warmup traces the runtime shape.
+            runtime_bt = self.input_batch.block_table[kv_cache_group_id]
+            if (
+                spec.block_size != block_size
+                and self.neuron_config.decode_context_length_buckets is None
+            ):
+                max_num_blocks_per_req = runtime_bt.max_num_blocks_per_req
+                full_max_blocks_per_req = runtime_bt.max_num_blocks_per_req
 
             swa_kv_pos_offset = None
             # For SWA decode, warmup must match the trimmed shape that
@@ -8493,7 +8518,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device=self.device,
             vocab_size=self.vocab_size,
             block_sizes=block_sizes,
-            kernel_block_sizes=block_sizes,
+            kernel_block_sizes=self._kernel_block_sizes(kv_cache_config),
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
             is_pooling_model=self.is_pooling_model,
@@ -8521,8 +8546,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Build KV caches per group
         kv_caches = {}
-        for group in kv_cache_config.kv_cache_groups:
+        state_caches: dict[str, list[torch.Tensor]] = {}
+        kernel_block_sizes = self._kernel_block_sizes(kv_cache_config)
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
             kv_cache_spec = group.kv_cache_spec
+            kernel_block_size = kernel_block_sizes[group_idx]
 
             # This is the case that all layers have the same kv_hidden_size.
             if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
@@ -8534,6 +8562,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
                     block_size = kv_cache_spec.block_size
                     num_kv_heads = kv_cache_spec.num_kv_heads
+                    if kernel_block_size != block_size:
+                        # Hybrid model: the KV manager's block is `ratio` kernel
+                        # blocks. With one KV head per rank a manager block
+                        # [heads=1, B, hd] is exactly `ratio` contiguous kernel
+                        # blocks [1, b, hd], so this is a pure reshape.
+                        if num_kv_heads != 1:
+                            raise NotImplementedError(
+                                "Hybrid attention/state models need exactly 1 KV "
+                                f"head per rank (got {num_kv_heads}); use a TP "
+                                "degree equal to the number of KV heads."
+                            )
+                        num_blocks *= block_size // kernel_block_size
+                        block_size = kernel_block_size
                     head_size = kv_cache_spec.head_size
 
                     # Packed FP8 K cache: store K swizzled as
@@ -8595,6 +8636,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            elif isinstance(kv_cache_spec, MambaSpec):
+                # Recurrent state (e.g. Gated DeltaNet): one page per request, stored as
+                # two contiguous halves matching the attention (2, N, ...) layout of the
+                # shared raw tensor (see state_cache.paired_half_views).
+                layout = _state_page_layout(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                page_bytes = kv_cache_spec.page_size_bytes
+                _state_half_elems(layout, page_bytes)  # validates fit
+                for layer_name in group.layer_names:
+                    state_caches[layer_name] = list(
+                        _paired_half_views(kv_cache_raw_tensors[layer_name], page_bytes)
+                    )
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -8602,6 +8655,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
+        if state_caches:
+            self.model.bind_state_cache(state_caches)
+            # Hybrid models clear recycled KV blocks on first write. If one attention block
+            # covers max_model_len, every block a request uses is allocated (and cleared) at
+            # prefill, so decode can skip clearing.
+            if hasattr(self.model, "set_kv_blocks_cover_context"):
+                attn_block_sizes = [
+                    bs for g, bs in zip(kv_cache_config.kv_cache_groups, block_sizes)
+                    if isinstance(g.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec))
+                ]
+                self.model.set_kv_blocks_cover_context(
+                    bool(attn_block_sizes) and self.max_model_len <= min(attn_block_sizes))
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -8632,6 +8697,66 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return self._kv_cache_full_tensors
         return kv_caches
 
+    def _build_state_cache_specs(
+        self, state_layers, attn_specs: dict[str, KVCacheSpec]
+    ) -> dict[str, KVCacheSpec]:
+        """MambaSpec per recurrent-state layer (prefix caching / spec decode off).
+
+        The state page is padded to an integral multiple of the attention page so
+        vLLM's page-size unification can scale the attention block size to match.
+        """
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError(
+                "Prefix caching is not supported for models with recurrent state; "
+                "pass --no-enable-prefix-caching."
+            )
+        if self.speculative_config is not None:
+            raise NotImplementedError(
+                "Speculative decoding is not supported for models with recurrent state."
+            )
+        attn_page = max((s.page_size_bytes for s in attn_specs.values()), default=1)
+        # Pad the state page to a whole number of 256-token attention blocks: vLLM
+        # enlarges the attention block to (state page / attention page) * block_size
+        # tokens, and the decode attention kernels need that to be a multiple of 128.
+        kernel_block = self.vllm_config.cache_config.block_size
+        align_pages = max(1, 256 // kernel_block) if 256 % kernel_block == 0 else 1
+        specs = {}
+        for layer in state_layers:
+            layout = _state_page_layout(layer.shapes, layer.dtypes)
+            specs[layer.name] = MambaSpec(
+                # One state page per request: a single block spans the whole context.
+                block_size=self.max_model_len,
+                shapes=tuple(layer.shapes),
+                dtypes=tuple(layer.dtypes),
+                page_size_padded=_padded_state_page_bytes(
+                    layout.page_bytes, attn_page, align_pages
+                ),
+                mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+                mamba_cache_mode="none",
+            )
+        return specs
+
+    def _kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> list[int]:
+        """Per-group kernel block size.
+
+        Equal to the group's block size, except attention groups of hybrid models,
+        whose KV-manager blocks were enlarged to match the recurrent-state page: those
+        keep the plugin's original block size (vLLM's BlockTable splits each manager
+        block into ``block_size // kernel_block_size`` kernel blocks).
+        """
+        groups = kv_cache_config.kv_cache_groups
+        has_state = any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+        sizes = []
+        for g in groups:
+            spec = g.kv_cache_spec
+            kbs = spec.block_size
+            if has_state and isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                base = getattr(self, "_attn_kernel_block_size", kbs)
+                if spec.block_size % base == 0:
+                    kbs = base
+            sizes.append(kbs)
+        return sizes
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Get KV cache specifications for all model layers.
@@ -8644,6 +8769,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
+
+        # Attention kernels keep this block size even if the KV manager enlarges the
+        # blocks to unify page sizes with recurrent-state layers (hybrid models).
+        self._attn_kernel_block_size = block_size
 
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
@@ -8669,6 +8798,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        state_layers = getattr(target_kv_spec, "state_layers", None) or []
+        if state_layers:
+            all_kv_cache_specs.update(
+                self._build_state_cache_specs(state_layers, all_kv_cache_specs)
+            )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
