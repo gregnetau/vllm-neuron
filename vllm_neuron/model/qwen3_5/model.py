@@ -35,6 +35,7 @@ import logging
 import os
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
@@ -66,6 +67,45 @@ def _loader(fn) -> SafetensorsWeightLoader:
     return SafetensorsWeightLoader(
         transform=lambda slices, rank: fn([s[:] for s in slices], rank)
     )
+
+
+def _fp8_loaders(device_fn, scale_cols: int = 1):
+    """(weight loader, weight-scale loader) for a static-FP8 projection. The per-tensor scale
+    comes from the full checkpoint tensor, so every rank uses the same scale."""
+    weight = _loader(lambda t, r: W.fp8_quantize(device_fn(t[0], r), W.fp8_weight_scale(t[0])))
+    scale = _loader(lambda t, r: W.fp8_scale_tile(W.fp8_weight_scale(t[0]), scale_cols))
+    return weight, scale
+
+
+def _fp8_param(*shape) -> nn.Parameter:
+    return nn.Parameter(torch.empty(*shape, dtype=torch.float8_e4m3fn), requires_grad=False)
+
+
+def _scale_param(n: int = 1) -> nn.Parameter:
+    return nn.Parameter(torch.ones(W.SCALE_PARTITIONS, n), requires_grad=False)
+
+
+def _fp8_linear(x, weight, weight_scale, input_scale, d_head: int = 128):
+    """x [T, H] @ weight [H, N] in static FP8 through the fused-QKV projection kernel
+    (N split as (N/d_head - 2) + 1 + 1 heads; one scale for all three parts)."""
+    from nkilib.core.utils.common_types import QuantizationType
+
+    n_heads = weight.shape[1] // d_head
+    return NF.qkv_proj(
+        hidden=x.unsqueeze(0), qkv_weights=weight, bias=None, d_head=d_head,
+        num_q_heads=n_heads - 2, num_kv_heads=1, quantization_type=QuantizationType.STATIC,
+        qkv_w_scale=weight_scale, qkv_in_scale=input_scale,
+    ).squeeze(0)
+
+
+def _fp8_out_proj(x, weight, weight_scale, input_scale, n_heads: int, d_head: int):
+    """x [T, n_heads*d_head] @ weight [n_heads*d_head, H] in static FP8 (output-projection kernel)."""
+    from nkilib.core.utils.common_types import QuantizationType
+
+    T = x.shape[0]
+    active = x.reshape(T, n_heads, d_head).permute(1, 2, 0).unsqueeze(0)  # [1, N, D, T]
+    return NF.o_proj(active, weight, None, quantization_type=QuantizationType.STATIC,
+                     weight_scales=weight_scale, input_scales=input_scale).reshape(T, -1)
 
 
 # =============================================================================
@@ -401,6 +441,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     its block table.
     """
 
+    # Static-FP8 input scales: buffer -> calibration modules (relative to the layer).
+    FP8_INPUT_SCALES = {
+        "in_proj_input_scale": ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z"),
+        "out_proj_input_scale": ("linear_attn.out_proj",),
+    }
+
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -421,15 +467,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Separate projections: column slices of a fused output at unaligned offsets
         # (b/a are Hv wide) are not lowered correctly.
         H = self.hidden_size
-        self.in_proj_qkv_weight = nn.Parameter(torch.empty(H, self.conv_dim, dtype=self.dtype))
-        self.in_proj_z_weight = nn.Parameter(torch.empty(H, self.value_dim, dtype=self.dtype))
+        # Static FP8 for in_proj_qkv / in_proj_z / out_proj; in_proj_b / in_proj_a stay BF16.
+        self.fp8 = config.fp8_quantized(f"layers.{layer_idx}.linear_attn")
+        if self.fp8:
+            self.in_proj_qkv_weight = _fp8_param(H, self.conv_dim)
+            self.in_proj_z_weight = _fp8_param(H, self.value_dim)
+            self.out_proj_weight = _fp8_param(self.value_dim, self.hidden_size)
+            self.in_proj_qkv_weight_scale = _scale_param(3)
+            self.in_proj_z_weight_scale = _scale_param(3)
+            self.out_proj_weight_scale = _scale_param(1)
+            for name in self.FP8_INPUT_SCALES:
+                self.register_buffer(name, torch.ones(W.SCALE_PARTITIONS, 1), persistent=False)
+        else:
+            self.in_proj_qkv_weight = nn.Parameter(torch.empty(H, self.conv_dim, dtype=self.dtype))
+            self.in_proj_z_weight = nn.Parameter(torch.empty(H, self.value_dim, dtype=self.dtype))
+            self.out_proj_weight = nn.Parameter(torch.empty(self.value_dim, self.hidden_size, dtype=self.dtype))
         self.in_proj_b_weight = nn.Parameter(torch.empty(H, self.Hv, dtype=self.dtype))
         self.in_proj_a_weight = nn.Parameter(torch.empty(H, self.Hv, dtype=self.dtype))
         self.conv_weight = nn.Parameter(torch.empty(self.conv_dim, self.K, dtype=self.dtype))
         self.A_log = nn.Parameter(torch.empty(self.Hv, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.empty(self.Hv, dtype=torch.float32))
         self.norm_weight = nn.Parameter(torch.ones(self.Dv, dtype=self.dtype))
-        self.out_proj_weight = nn.Parameter(torch.empty(self.value_dim, self.hidden_size, dtype=self.dtype))
 
         self.conv_numel = self.conv_dim * (self.K - 1)
         self.ssm_numel = self.Hv * self.Dv * self.Dk
@@ -497,8 +555,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     # -- helpers -------------------------------------------------------------
     def _project(self, hidden_states):
-        return (hidden_states @ self.in_proj_qkv_weight, hidden_states @ self.in_proj_z_weight,
-                hidden_states @ self.in_proj_b_weight, hidden_states @ self.in_proj_a_weight)
+        b, a = hidden_states @ self.in_proj_b_weight, hidden_states @ self.in_proj_a_weight
+        if self.fp8:
+            return (_fp8_linear(hidden_states, self.in_proj_qkv_weight, self.in_proj_qkv_weight_scale,
+                                self.in_proj_input_scale, self.Dk),
+                    _fp8_linear(hidden_states, self.in_proj_z_weight, self.in_proj_z_weight_scale,
+                                self.in_proj_input_scale, self.Dv), b, a)
+        return hidden_states @ self.in_proj_qkv_weight, hidden_states @ self.in_proj_z_weight, b, a
+
+    def _out_proj(self, o):
+        if self.fp8:
+            return _fp8_out_proj(o, self.out_proj_weight, self.out_proj_weight_scale,
+                                 self.out_proj_input_scale, self.Hv, self.Dv)
+        return o @ self.out_proj_weight
 
     def _conv(self, x):
         """Depthwise causal conv as K shifted multiply-adds (not grouped conv1d).
@@ -523,7 +592,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _finish(self, o, z, n):
         o = gdn_ops.gated_rmsnorm(o, z.reshape(n, self.Hv, self.Dv),
                                   self.norm_weight, self.config.rms_norm_eps)
-        return o.reshape(n, self.value_dim) @ self.out_proj_weight
+        return self._out_proj(o.reshape(n, self.value_dim))
 
     # -- prefill: ONE request per step (like the attention path), padded to a bucket ----
     def _prefill(self, hidden_states, md):
@@ -584,7 +653,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mixed, z, b, a = self._project(hidden_states.to(self.dtype))
         o = gdn_decode(mixed, z, b, a, self.conv_weight, self.A_log, self.dt_bias, self.norm_weight,
                        self.state_a, self.state_b, slots, self.config.rms_norm_eps)
-        return o @ self.out_proj_weight
+        return self._out_proj(o)
 
     def _decode_torch(self, hidden_states, md):
         slots = md["block_table_tensor"][:, 0].long().clamp(min=0)  # [B]; padded rows (-1) -> null block 0
@@ -640,7 +709,10 @@ class Qwen3_5MLPStaticFP8(nn.Module):
     decoder layer must skip its own post_attention_layernorm and pass ``ln_w``.
     """
 
-    INPUT_SCALES = ("gate_up_input_scale", "down_input_scale")
+    FP8_INPUT_SCALES = {
+        "gate_up_input_scale": ("mlp.gate_proj", "mlp.up_proj"),
+        "down_input_scale": ("mlp.down_proj",),
+    }
 
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
@@ -656,13 +728,40 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         # the checkpoint (calibration file), so they are buffers set after loading.
         for name in ("gate_weight_scale", "up_weight_scale", "down_weight_scale"):
             setattr(self, name, nn.Parameter(torch.ones(W.SCALE_PARTITIONS, 1), requires_grad=False))
-        for name in self.INPUT_SCALES:
+        for name in self.FP8_INPUT_SCALES:
             self.register_buffer(name, torch.ones(W.SCALE_PARTITIONS, 1), persistent=False)
+
+    def _kernel_ok(self, hidden_states: torch.Tensor, n_tokens: int) -> bool:
+        """Whether NF.mlp runs the FP8 kernel for n_tokens rows; its PyTorch fallback ignores
+        the quantization scales (e.g. CTE with intermediate/rank > 4096 and hidden < 7168)."""
+        from nkilib.core.utils.common_types import QuantizationType
+
+        from vllm_neuron.functional.mlp import _can_use_kernel
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        probe = torch.empty((n_tokens, self.gate_proj_weight.shape[0]), device="meta")
+        return can_run_kernel(hidden_states) and _can_use_kernel(
+            probe, self.gate_proj_weight, quantization_type=QuantizationType.STATIC)
+
+    def _forward_dequant(self, hidden_states, is_prefill: bool, ln_w: torch.Tensor):
+        """BF16 MLP over dequantized FP8 weights (weight-only FP8) with the fused norm."""
+        x = hidden_states.float()
+        x = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * ln_w.float()).to(torch.bfloat16)
+        if is_prefill and self.world_size > 1:
+            x = self.tp_group.all_gather(x, dim=0)
+        deq = lambda w, s: w.to(torch.bfloat16) * s[0, 0].to(torch.bfloat16)
+        h = F.silu(x @ deq(self.gate_proj_weight, self.gate_weight_scale)) * (
+            x @ deq(self.up_proj_weight, self.up_weight_scale))
+        return h @ deq(self.down_proj_weight, self.down_weight_scale)
 
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool, ln_w: torch.Tensor) -> torch.Tensor:
         from nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
         from nkilib.core.utils.common_types import NormType, QuantizationType
 
+        n_tokens = hidden_states.shape[0] * (self.world_size if is_prefill else 1)
+        if not self._kernel_ok(hidden_states, n_tokens):
+            output = self._forward_dequant(hidden_states, is_prefill, ln_w)
+            return self._reduce(output, is_prefill)
         ln_w = ln_w.to(torch.bfloat16).view(1, -1)
         hidden_states = hidden_states.to(torch.bfloat16)
         if is_prefill or hidden_states.shape[0] > TKG_BS_SEQLEN_THRESHOLD:
@@ -683,6 +782,9 @@ class Qwen3_5MLPStaticFP8(nn.Module):
             down_w_scale=self.down_weight_scale, gate_up_in_scale=self.gate_up_input_scale,
             down_in_scale=self.down_input_scale, output_dtype="bfloat16",
         )
+        return self._reduce(output, is_prefill)
+
+    def _reduce(self, output, is_prefill: bool):
         if self.world_size > 1:
             if is_prefill:
                 output = self.tp_group.reduce_scatter(output, dim=0)
@@ -932,16 +1034,26 @@ class Qwen3_5ForCausalLM(nn.Module):
                 set_weight_loader(a.k_norm.weight, qk)
             else:
                 g = layer.linear_attn
-                set_weight_loader(g.in_proj_qkv_weight, _loader(
-                    lambda t, r: W.gdn_in_proj_qkv_device(t[0], cfg, r, tp)))
-                head_cols = _loader(lambda t, r: W.gdn_in_proj_heads_device(t[0], r, tp))
-                for wp in (g.in_proj_z_weight, g.in_proj_b_weight, g.in_proj_a_weight):
+                qkv_dev = lambda t, r: W.gdn_in_proj_qkv_device(t, cfg, r, tp)
+                heads_dev = lambda t, r: W.gdn_in_proj_heads_device(t, r, tp)
+                out_dev = lambda t, r: W.gdn_out_proj_device(t, cfg, r, tp)
+                if g.fp8:
+                    for param, dev_fn, cols in (("in_proj_qkv", qkv_dev, 3), ("in_proj_z", heads_dev, 3),
+                                                ("out_proj", out_dev, 1)):
+                        wl, sl = _fp8_loaders(dev_fn, cols)
+                        set_weight_loader(getattr(g, f"{param}_weight"), wl)
+                        set_weight_loader(getattr(g, f"{param}_weight_scale"), sl)
+                else:
+                    set_weight_loader(g.in_proj_qkv_weight, _loader(lambda t, r: qkv_dev(t[0], r)))
+                    set_weight_loader(g.in_proj_z_weight, _loader(lambda t, r: heads_dev(t[0], r)))
+                    set_weight_loader(g.out_proj_weight, _loader(lambda t, r: out_dev(t[0], r)))
+                head_cols = _loader(lambda t, r: heads_dev(t[0], r))
+                for wp in (g.in_proj_b_weight, g.in_proj_a_weight):
                     set_weight_loader(wp, head_cols)
                 set_weight_loader(g.conv_weight, _loader(lambda t, r: W.gdn_conv_device(t[0], cfg, r, tp)))
                 vec = _loader(lambda t, r: W.gdn_head_vector_device(t[0], cfg, r, tp).float())
                 set_weight_loader(g.A_log, vec)
                 set_weight_loader(g.dt_bias, vec)
-                set_weight_loader(g.out_proj_weight, _loader(lambda t, r: W.gdn_out_proj_device(t[0], cfg, r, tp)))
         set_weight_loader(self.model.norm.weight, _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float()))
 
     def _weight_mappings(self) -> dict:
@@ -977,6 +1089,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 m[s + "dt_bias"] = c + "dt_bias"
                 m[s + "norm_weight"] = c + "norm.weight"
                 m[s + "out_proj_weight"] = c + "out_proj.weight"
+                if layer.linear_attn.fp8:
+                    for part in ("in_proj_qkv", "in_proj_z", "out_proj"):
+                        m[s + f"{part}_weight_scale"] = c + f"{part}.weight"
         return m
 
     def _materialize_buffers(self) -> None:
@@ -1000,10 +1115,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.load_state_dict(rank_sharded, strict=False, assign=True)
         self._load_fp8_activation_scales(checkpoint_path)
 
+    def _fp8_modules(self):
+        """(layer index, module) for every static-FP8 module with input scales."""
+        for i, layer in enumerate(self.model.layers):
+            if layer.mlp_fp8:
+                yield i, layer.mlp
+            if layer.layer_type == LINEAR_ATTENTION and layer.linear_attn.fp8:
+                yield i, layer.linear_attn
+
     def _load_fp8_activation_scales(self, checkpoint_path: str | None) -> None:
         """Static-FP8 input scales (amax / 240) from the offline calibration JSON."""
-        fp8_layers = [(i, l) for i, l in enumerate(self.model.layers) if l.mlp_fp8]
-        if not fp8_layers:
+        modules = list(self._fp8_modules())
+        if not modules:
             return
         nc = self.config.neuron_config
         path = nc.fp8_activation_scales_path or os.path.join(checkpoint_path or "", "fp8_act_amax.json")
@@ -1011,19 +1134,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             raise FileNotFoundError(
                 f"quantization='fp8' needs calibrated activation scales; {path} not found. "
                 "Set neuron_config.fp8_activation_scales_path (see calibrate_fp8.py).")
-        amax = json.load(open(path))
-        def get(key):
-            if key not in amax:
-                raise KeyError(f"{path} has no calibration entry for {key}")
-            return amax[key]["amax"]
-        for i, layer in fp8_layers:
-            p = f"layers.{i}.mlp."
-            ins = {"gate_up_input_scale": max(get(p + "gate_proj"), get(p + "up_proj")),
-                   "down_input_scale": get(p + "down_proj")}
-            dev = layer.mlp.gate_proj_weight.device
-            for name, a in ins.items():
-                setattr(layer.mlp, name, W.fp8_scale_tile(W.fp8_scale(a)).to(dev))
-        logger.info("Loaded static-FP8 activation scales for %d MLPs from %s", len(fp8_layers), path)
+        with open(path) as f:
+            amax = json.load(f)
+        for i, mod in modules:
+            dev = next(mod.parameters()).device
+            for buf, keys in mod.FP8_INPUT_SCALES.items():
+                missing = [k for k in keys if f"layers.{i}.{k}" not in amax]
+                if missing:
+                    raise KeyError(f"{path} has no calibration entry for layers.{i}.{missing[0]}")
+                a = max(amax[f"layers.{i}.{k}"]["amax"] for k in keys)
+                setattr(mod, buf, W.fp8_scale_tile(W.fp8_scale(a)).to(dev))
+        logger.info("Loaded static-FP8 activation scales for %d modules from %s", len(modules), path)
 
     def load_weights_lite(self, checkpoint_path: str, device: torch.device, cache_dir: str | None) -> None:
         """CPU-compile path: no KV-cache scales to load for BF16; only buffers need real data."""

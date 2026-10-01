@@ -95,8 +95,17 @@ The model avoids patterns that lower incorrectly or slowly on Neuron:
 
 ## Static FP8
 
-With `neuron_config.quantization="fp8"`, MLP weights are quantized per tensor at load
+With `neuron_config.quantization="fp8"`, weights are quantized per tensor at load
 (`scale = amax(W) / 240` over the full tensor, so every rank uses the same scale) and
 activations use static scales from an offline calibration file
-(`neuron_config.fp8_activation_scales_path`). The post-attention RMSNorm is fused into the
-FP8 kernels, as in the Llama static-FP8 path.
+(`neuron_config.fp8_activation_scales_path`).
+
+| Module | Kernel |
+|---|---|
+| MLP | `NF.mlp` STATIC, post-attention RMSNorm fused (as in the Llama static-FP8 path) |
+| GDN `in_proj_qkv`, `in_proj_z` | `NF.qkv_proj` STATIC as a generic projection (one scale for all parts) |
+| GDN `out_proj` | `NF.o_proj` STATIC |
+
+`NF.mlp` falls back to PyTorch, without quantization, where its kernel does not apply (CTE
+with intermediate size per rank above 4096 and hidden size below 7168); the FP8 MLP then
+runs in BF16 on dequantized weights.

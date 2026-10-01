@@ -42,14 +42,24 @@ def _install_stubs():
         pkg.__path__ = [str(path)]
         sys.modules[name] = pkg
 
-    def qkv_proj(hidden, qkv_weights, bias=None):
-        return hidden @ qkv_weights
+    def fake_quant(x, scale):  # static FP8: quantize with the input scale, dequantize
+        s = scale[0, 0]
+        return (x.float() / s).clamp(-240.0, 240.0).to(torch.float8_e4m3fn).float() * s
 
-    def o_proj(active, weight, bias=None):
+    def qkv_proj(hidden, qkv_weights, bias=None, qkv_w_scale=None, qkv_in_scale=None, **kw):
+        if qkv_w_scale is None:
+            return hidden @ qkv_weights
+        out = fake_quant(hidden, qkv_in_scale) @ (qkv_weights.float() * qkv_w_scale[0, 0])
+        return out.to(torch.bfloat16)
+
+    def o_proj(active, weight, bias=None, weight_scales=None, input_scales=None, **kw):
         if active.dim() == 4:  # [B, N, D, S]
             B, N, D, S = active.shape
             active = active.reshape(B, N * D, S).transpose(1, 2)
-        return active @ weight
+        if weight_scales is None:
+            return active @ weight
+        out = fake_quant(active, input_scales) @ (weight.float() * weight_scales[0, 0])
+        return out.to(torch.bfloat16)
 
     def flash_attention(q, k, v, scale=None, tp_q=True, tp_out=False, **kw):
         # tp_q False: q [B, D, S]; k [B, D, S]; v [B, S, D]. Returns [B, D, S] for tp_out.
@@ -291,3 +301,63 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
         s = (q[:, i] @ k_all[: prior + i + 1].t()) * a.scaling
         ref = torch.softmax(s, -1) @ v_all[: prior + i + 1]
         torch.testing.assert_close(out[:, :, i], ref, rtol=1e-4, atol=1e-5)
+
+
+def test_gdn_static_fp8_matches_bf16():
+    """GDN layer with static-FP8 in_proj_qkv / in_proj_z / out_proj (kernels emulated) vs BF16."""
+    mod = _install_stubs()
+    from vllm_neuron.model.neuron_config import NeuronConfig
+    from vllm_neuron.model.qwen3_5 import weights as W
+    from vllm_neuron.model.qwen3_5.config import Qwen3_5Config
+
+    torch.manual_seed(5)
+    kw = dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+              head_dim=32, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
+              linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128)
+    cfg16 = Qwen3_5Config(**kw)
+    cfg8 = Qwen3_5Config(**kw, neuron_config=NeuronConfig.from_dict({"quantization": "fp8"}))
+    g16, g8 = mod.Qwen3_5GatedDeltaNet(cfg16, 0), mod.Qwen3_5GatedDeltaNet(cfg8, 0)
+    assert not g16.fp8 and g8.fp8 and g8.in_proj_qkv_weight.dtype == torch.float8_e4m3fn
+    with torch.no_grad():
+        for name, p in g16.named_parameters():
+            p.copy_(torch.randn_like(p) * 0.3 if name not in ("A_log", "norm_weight") else torch.rand_like(p) + 0.5)
+        for name, p in g8.named_parameters():
+            if name.endswith("_weight_scale"):
+                continue
+            src = getattr(g16, name)
+            if p.dtype == torch.float8_e4m3fn:
+                s = W.fp8_weight_scale(src)
+                p.copy_(W.fp8_quantize(src, s))
+                getattr(g8, name + "_scale").copy_(W.fp8_scale_tile(s, getattr(g8, name + "_scale").shape[1]))
+            else:
+                p.copy_(src)
+    T = 6
+    x = torch.randn(T, 64).to(torch.bfloat16)
+    g8.in_proj_input_scale = W.fp8_scale_tile(W.fp8_scale(x.float().abs().amax()))
+    half = 6 * 128  # state_numel = 384 + 1024 <= 2 * half
+    page = lambda: (torch.zeros(3, half), torch.zeros(3, half))
+    # calibrate the out_proj input scale on the BF16 layer, as calibrate_fp8.py does
+    seen, orig = [], g16._out_proj
+    g16._out_proj = lambda o: (seen.append(o.float().abs().amax()), orig(o))[1]
+    g16.bind_state(*page())
+    slot = torch.zeros(T, dtype=torch.long); slot[:5] = 8
+    with torch.no_grad():
+        g16._prefill(x, {"block_table_tensor": torch.tensor([[1]]), "slot_mapping": slot,
+                         "cached_seq_len": torch.tensor([0])})
+    g16._out_proj = orig
+    g8.out_proj_input_scale = W.fp8_scale_tile(W.fp8_scale(max(seen)))
+    outs = []
+    for g in (g16, g8):
+        sa, sb = page()
+        g.bind_state(sa, sb)
+        slot = torch.zeros(T, dtype=torch.long); slot[:5] = 8
+        md = {"block_table_tensor": torch.tensor([[1]]), "slot_mapping": slot,
+              "cached_seq_len": torch.tensor([0])}
+        with torch.no_grad():
+            pre = g._prefill(x, md)
+            dec = g._decode_torch(x[:1], {"block_table_tensor": torch.tensor([[1]])})
+        outs.append((pre[:5], dec, sa[1].clone()))
+    for a, b in zip(outs[0], outs[1]):
+        a, b = a.float(), b.float()
+        rel = ((a - b).norm() / a.norm()).item()
+        assert F.cosine_similarity(a.flatten(), b.flatten(), 0) > 0.99 and rel < 0.1, rel

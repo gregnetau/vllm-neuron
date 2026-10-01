@@ -314,5 +314,5 @@ def fp8_quantize(w: torch.Tensor, scale: float) -> torch.Tensor:
     return (w.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
 
 
-def fp8_scale_tile(scale: float) -> torch.Tensor:
-    return torch.full((SCALE_PARTITIONS, 1), scale, dtype=torch.float32)
+def fp8_scale_tile(scale: float, n: int = 1) -> torch.Tensor:
+    return torch.full((SCALE_PARTITIONS, n), scale, dtype=torch.float32)
