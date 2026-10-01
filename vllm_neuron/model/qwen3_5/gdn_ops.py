@@ -90,19 +90,27 @@ def recurrent_gated_delta_rule(
 def inverse_unit_lower(m: torch.Tensor, eye: torch.Tensor) -> torch.Tensor:
     """(I + m)^-1 for strictly lower-triangular ``m`` [..., C, C] (C a power of two).
 
-    ``m`` is nilpotent (m^C = 0), so the inverse is the finite series sum_j (-m)^j, which
-    factors exactly as (I - m)(I + m^2)(I + m^4)...(I + m^(C/2)): log2(C) batched matmuls.
-    Used instead of ``torch.linalg.solve_triangular``, which the Neuron XLA bridge cannot
-    lower (custom call) — and matmuls are what the hardware is good at anyway.
+    Bottom-up blocked inversion with matmuls only: X starts as I (inverse of the 1x1 diagonal
+    blocks) and each level merges pairs of s x s diagonal blocks,
+    [[A, 0], [M, B]]^-1 = [[A^-1, 0], [-B^-1 M A^-1, B^-1]], i.e. X <- X - X (m * mask_s) X with
+    mask_s selecting the lower-left s x s block of every 2s x 2s diagonal block. Every
+    intermediate is a sub-block of the true inverse, so values stay bounded; the power series
+    (I - m)(I + m^2)(I + m^4)... cancels terms up to ~C(C, C/2) and overflows on device when
+    keys are nearly parallel. Used instead of ``torch.linalg.solve_triangular``, which the
+    Neuron XLA bridge cannot lower.
     """
     C = m.shape[-1]
     assert C & (C - 1) == 0, "chunk size must be a power of two"
-    out = eye - m
-    p = m
-    for _ in range(C.bit_length() - 2):  # m^2, m^4, ..., m^(C/2)
-        p = p @ p
-        out = out @ (eye + p)
-    return out
+    idx = torch.arange(C, device=m.device)
+    row, col = idx[:, None], idx[None, :]
+    x = eye.expand_as(m)
+    s = 1
+    while s < C:
+        mask = (row // (2 * s) == col // (2 * s)) & ((row // s) % 2 == 1) & ((col // s) % 2 == 0)
+        lower = torch.where(mask, m, torch.zeros_like(m))
+        x = x - x @ lower @ x
+        s *= 2
+    return x
 
 
 def chunk_gated_delta_rule(

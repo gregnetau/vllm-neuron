@@ -199,3 +199,20 @@ def test_chunk_rule_graph_has_no_linalg_ops(gdn_ops):
     targets = {str(n.target) for n in gm.graph.nodes if n.op == "call_function"}
     assert targets, "empty graph"
     assert not any("linalg" in t or "triangular" in t for t in targets), sorted(targets)
+
+
+def test_inverse_unit_lower_stable_for_near_parallel_keys(gdn_ops):
+    """Near-identical keys at full strength give m entries close to 1: the inverse stays ~1
+    while powers of m grow combinatorially, so the result must not go through them."""
+    torch.manual_seed(0)
+    C = 64
+    k = torch.nn.functional.normalize(torch.ones(C, 16) + 0.01 * torch.randn(C, 16), dim=-1)
+    kk = (k @ k.t()) * 0.98
+    m = torch.tril(kk, diagonal=-1).unsqueeze(0)
+    eye = torch.eye(C).unsqueeze(0)
+    ref = torch.linalg.solve_triangular(eye + m, eye, upper=False)
+    out = gdn_ops.inverse_unit_lower(m, eye)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+    # the intermediates stay bounded by the inverse itself
+    assert out.abs().max() <= ref.abs().max() * 1.01
