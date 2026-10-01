@@ -6,6 +6,8 @@
 #   MODEL=<path-to-checkpoint>/Qwen3.8-27B examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Static FP8 MLPs:
 #   MODEL=... FP8_SCALES=<path>/fp8_act_amax.json examples/vllm_neuron/models/qwen3_5/serve.sh
+#   # FP8 KV cache (unit KV scales):
+#   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen3_5/serve.sh
 set -euo pipefail
 
 MODEL=${MODEL:?set MODEL to the checkpoint directory}
@@ -27,6 +29,7 @@ exec vllm serve "${MODEL}" \
   --max-num-seqs 1 \
   --max-num-batched-tokens "${PREFILL_BUCKET}" \
   --gpu-memory-utilization 0.65 \
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-auto}" \
   --no-enable-prefix-caching \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --additional-config "{\"neuron_config\": {${NEURON_CONFIG}}}"

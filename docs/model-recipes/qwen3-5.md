@@ -34,7 +34,7 @@ rotary). This recipe serves the text tower; the vision tower and the MTP head ar
 | | Image / video | ❌ |
 | **Quantization** | BF16 | ✅ |
 | | Static FP8 (E4M3, per tensor): MLP, GDN and attention projections | ✅ |
-| | FP8 KV cache | ❌ |
+| | FP8 KV cache (unit KV scales) | ✅ |
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
 | | Pipeline / context parallelism | ❌ |
 | **Performance** | Fused NKI GDN decode kernel (batch 1) | ✅ |
@@ -90,6 +90,11 @@ MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=$PWD/fp8_act_amax.json \
     examples/vllm_neuron/models/qwen3_5/serve.sh
 ```
 
+`KV_CACHE_DTYPE=fp8` (`--kv-cache-dtype fp8`) stores K and V in FP8 with unit scales (K is
+post-QK-norm and bounded; values are clamped to the E4M3 range on write). On trn2.3xlarge at
+`max_model_len` 2048 it raises KV capacity from about 61k to 70k tokens (recurrent-state pages
+dominate the pool) and costs about 1 ms per token at batch 1.
+
 Calibration runs the Hugging Face model on CPU (about 2 s per prompt for 27B; 124 GB host
 RAM is sufficient). `neuron_config.modules_to_not_convert` keeps selected modules in BF16,
 for example `["layers.30.linear_attn", "layers.59.mlp"]`. For prefills above 128 tokens the
@@ -103,12 +108,10 @@ width exceeds the kernel's limit for this model.
 
 | Configuration | Prompt / output tokens | TTFT | TPOT |
 |---|---|---|---|
-| BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 350 ms | 41.6 ms |
-| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 385 ms | 36.3 ms |
+| BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 368 ms | 27.2 ms |
+| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 21.8 ms |
+| FP8 + FP8 KV cache, same | 1024 / 128 | 407 ms | 23.1 ms |
 
-With `max_model_len` 128 (one attention block per request, no decode-time block clearing),
-a 5-token prompt with 40 output tokens takes 1.15 s end to end in BF16 and 0.93 s with FP8
-MLPs only (about 28 ms and 23 ms per token including prefill).
 
 Cold compilation of the `max_model_len` 2048 configuration takes about 4 minutes in BF16 and
 12 minutes in FP8, and is cached afterwards.
@@ -127,11 +130,6 @@ continuations remain coherent. A task-level evaluation is in progress (see [Road
 
 - **Batch size 1 for the fused GDN decode kernel.** Larger decode batches fall back to the
   PyTorch GDN path.
-- **Decode-time KV block clearing when `max_model_len` exceeds one attention block.** KV
-  blocks are shared with float32 recurrent-state pages, so a reused block is cleared before
-  its first read. When all of a request's blocks are allocated at prefill this happens at
-  prefill only; otherwise decode clears on block boundaries, which adds about 14 ms per
-  token at `max_model_len` 2048.
 - **Full-attention prefill falls back to PyTorch** when segmented prefill is active
   (`head_dim` 256 exceeds the segmented attention kernel's limit of 128).
 - **`on_device_sampling_config.all_greedy` returns invalid token ids** with this model;
@@ -163,7 +161,7 @@ propose a competing implementation.
 
 Before this work is proposed upstream:
 
-1. **FP8**: FP8 KV cache, and accuracy-driven selection of layers kept in BF16.
+1. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
 2. **MTP**: the checkpoint's multi-token-prediction head for speculative decoding.
 3. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, including [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark)

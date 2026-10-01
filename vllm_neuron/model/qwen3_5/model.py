@@ -282,18 +282,23 @@ class Qwen3_5Attention(nn.Module):
                     num_q_heads=self.num_attention_heads_per_rank,
                     num_kv_heads=self.num_key_value_heads_per_rank)
 
+    @property
+    def kv_fp8(self) -> bool:
+        return self.k_cache is not None and self.k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    def _to_cache(self, x: torch.Tensor, scale, cache: torch.Tensor) -> torch.Tensor:
+        """[N, Dh] rows in the cache dtype. FP8 caches store x * scale (scale = 1/s, Qwen3
+        convention), clamped to the Trn2 E4M3 range."""
+        if not self.kv_fp8:
+            return x.to(cache.dtype)
+        return (x.float() * scale.float()).clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(cache.dtype)
+
     def _write_kv(self, k, v, slot_mapping, block_size):
         """k, v [Nkv, T, Dh] -> paged cache (same scheme as Qwen3)."""
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
-        if self.k_cache.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            k_flat = (k.reshape(-1, self.head_dim) * self.k_scale).clamp(
-                -FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(self.k_cache.dtype)
-            v_flat = (v.reshape(-1, self.head_dim) * self.v_scale).clamp(
-                -FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(self.v_cache.dtype)
-        else:
-            k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
-            v_flat = v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
+        k_flat = self._to_cache(k.reshape(-1, self.head_dim), self.k_scale, self.k_cache)
+        v_flat = self._to_cache(v.reshape(-1, self.head_dim), self.v_scale, self.v_cache)
         nkh = self.num_key_value_heads_per_rank
         head_idx = torch.arange(nkh, dtype=torch.long, device=k.device).repeat_interleave(
             slot_mapping.shape[0])
@@ -322,8 +327,10 @@ class Qwen3_5Attention(nn.Module):
         prior = md["cached_seq_len"].reshape(-1)[:1].long()
         n_valid = (md["slot_mapping"] > 0).sum().reshape(1)
         S = bt.shape[0] * block_size
-        kc = self.k_cache.index_select(0, bt).transpose(0, 1).reshape(nkh, S, Dh)
-        vc = self.v_cache.index_select(0, bt).transpose(0, 1).reshape(nkh, S, Dh)
+        kc = self.k_cache.index_select(0, bt).transpose(0, 1).reshape(nkh, S, Dh).float()
+        vc = self.v_cache.index_select(0, bt).transpose(0, 1).reshape(nkh, S, Dh).float()
+        if self.kv_fp8:  # stored x * (1/s)
+            kc, vc = kc / self.k_scale_float, vc / self.v_scale_float
         key_pos = torch.arange(S, device=q.device)
         q_pos = prior + torch.arange(T, device=q.device)
         key_ok = key_pos < prior + n_valid                                  # [S]
@@ -462,8 +469,9 @@ class Qwen3_5Attention(nn.Module):
         head_idx = torch.arange(nkh, dtype=torch.long, device=hidden_states.device
                                 ).repeat_interleave(num_tokens)
         blk_idx, pos_idx = block_indices.repeat(nkh), position_indices.repeat(nkh)
-        self.k_cache.index_put_((blk_idx, head_idx, pos_idx), k_new.reshape(-1, self.head_dim).to(self.k_cache.dtype))
-        self.v_cache.index_put_((blk_idx, head_idx, pos_idx), v_new.to(self.v_cache.dtype))
+        self.k_cache.index_put_((blk_idx, head_idx, pos_idx),
+                                self._to_cache(k_new.reshape(-1, self.head_dim), self.k_scale, self.k_cache))
+        self.v_cache.index_put_((blk_idx, head_idx, pos_idx), self._to_cache(v_new, self.v_scale, self.v_cache))
 
         if self.world_size > 1:  # >>> PARALLELISM: TP all-reduce <<<
             self.tp_group.all_reduce(output)
@@ -1043,7 +1051,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             name = f"layers.{i}.self_attn"
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
-            layer.self_attn.k_cache, layer.self_attn.v_cache = kv_caches[name][0], kv_caches[name][1]
+            attn = layer.self_attn
+            attn.k_cache, attn.v_cache = kv_caches[name][0], kv_caches[name][1]
+            if attn.kv_fp8:
+                # No KV scales in BF16 checkpoints: unit scale (K is post-QK-norm, so bounded);
+                # values beyond the E4M3 range are clamped on write.
+                for name_ in ("k_scale", "v_scale"):
+                    setattr(attn, name_, torch.ones(1, 1, dtype=torch.bfloat16, device=attn.k_cache.device))
+                attn.k_scale_float = attn.v_scale_float = 1.0
 
     def set_runner_clears_kv_blocks(self, value: bool):
         for layer in self.model.layers:

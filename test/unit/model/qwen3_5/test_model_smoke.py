@@ -282,6 +282,7 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
     nkh, groups, Dh, bs, nblk = 1, 3, 16, 4, 6
     a = types.SimpleNamespace(num_key_value_heads_per_rank=nkh, num_key_value_groups=groups, scaling=Dh ** -0.5)
     a._attend_cached_torch = A._attend_cached_torch.__get__(a)
+    a.kv_fp8, a.k_scale_float, a.v_scale_float = False, 1.0, 1.0
     prior, T, n_valid = 5, 6, 4                 # 5 cached tokens, 6-row bucket with 4 real tokens
     a.k_cache = torch.full((10, nkh, bs, Dh), float("nan"))
     a.v_cache = torch.full((10, nkh, bs, Dh), float("nan"))
@@ -301,6 +302,16 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
         s = (q[:, i] @ k_all[: prior + i + 1].t()) * a.scaling
         ref = torch.softmax(s, -1) @ v_all[: prior + i + 1]
         torch.testing.assert_close(out[:, :, i], ref, rtol=1e-4, atol=1e-5)
+
+    # FP8 cache: rows stored as x * (1/s) with s = 2, read back through the dequant path
+    a.kv_fp8, a.k_scale_float, a.v_scale_float = True, 0.5, 0.5
+    k8, v8 = a.k_cache.clone(), a.v_cache.clone()
+    a.k_cache = (k8 * 0.5).to(torch.float8_e4m3fn)
+    a.v_cache = (v8 * 0.5).to(torch.float8_e4m3fn)
+    out8 = a._attend_cached_torch(q, md, bs)
+    assert torch.isfinite(out8).all()
+    rel = ((out8[:, :, :n_valid] - out[:, :, :n_valid]).norm() / out[:, :, :n_valid].norm()).item()
+    assert rel < 0.1, rel
 
 
 def test_gdn_static_fp8_matches_bf16():
