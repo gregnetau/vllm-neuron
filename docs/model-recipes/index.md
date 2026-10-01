@@ -26,6 +26,13 @@ Model recipe for GPT-OSS 20B and 120B (MoE) on Trn2/Trn3.
 Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy Qwen3.8 27B
+:link: qwen3-5
+:link-type: doc
+
+Model recipe for the dense Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) models on Trn2.
+:::
+
 :::{grid-item-card} Deploy Qwen3-Embedding 8B
 :link: qwen3-embedding-8b
 :link-type: doc
@@ -42,5 +49,6 @@ Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 Llama 3 <llama-3>
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
+Qwen3.5 / Qwen3.8 <qwen3-5>
 Qwen3-Embedding <qwen3-embedding-8b>
 :::
