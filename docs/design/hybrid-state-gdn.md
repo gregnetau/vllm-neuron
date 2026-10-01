@@ -69,12 +69,13 @@ program's heads.
 
 Block ids are global across groups, so a KV block can previously have held float32 state.
 Read as bf16, those bytes include NaN and Inf, and the decode attention kernel reads whole
-blocks (a masked `0 * NaN` is still NaN). The model clears a KV block on its first write:
-
-- at prefill, every block at or after the cached prefix;
-- at decode, the block of a token at block offset 0, unless every block of a request is
-  allocated at prefill (one attention block covers `max_model_len`), which the runner
-  signals through `set_kv_blocks_cover_context`.
+blocks (a masked `0 * NaN` is still NaN). The runner clears attention blocks when the
+scheduler allocates them: each step that allocates any runs one small compiled graph that
+zeroes the new blocks of every attention layer in place (`_setup_kv_block_clearing`). The
+model then skips its own clearing (`set_runner_clears_kv_blocks`); without the runner hook it
+clears blocks on their first write, at prefill and at block boundaries during decode. Writing
+the cache ahead of `attention_decode` inside the decode graph makes the kernel input a copy of
+the whole cache, which is why clearing moved out of the graph.
 
 Unused block-table entries are passed to the decode kernel as the null block rather than
 `-1`: the kernel skips out-of-bounds reads but keeps the previous SBUF contents.

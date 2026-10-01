@@ -104,6 +104,19 @@ NULL_BLOCK_ID = 0
 PAD_SLOT_ID = -1
 
 
+# Manager blocks cleared per call of the compiled KV-clearing graph (fixed shape: one compile).
+_KV_CLEAR_CHUNK = 8
+
+
+def _zero_kv_blocks(caches: list[torch.Tensor], kernel_blocks: torch.Tensor) -> torch.Tensor:
+    """Zero kernel blocks [N] of every KV cache tensor [num_kernel_blocks, ...] in place."""
+    for cache in caches:
+        zeros = torch.zeros((kernel_blocks.shape[0],) + tuple(cache.shape[1:]),
+                            dtype=cache.dtype, device=cache.device)
+        cache.index_put_((kernel_blocks,), zeros)
+    return kernel_blocks.sum()
+
+
 def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
     """Remap vLLM's null-block (0) in an int32 block table to -1 so the
     Neuron attention kernel can DMA-skip inactive slots via oob_mode.skip.
@@ -1920,6 +1933,65 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # in the helper stubs above (get_model, _may_reorder_batch,
     # _get_valid_sampled_token_count, _init_mrope_positions,
     # _init_xdrope_positions, _update_streaming_request).
+    def _setup_kv_block_clearing(self, kv_cache_config, block_sizes, kv_caches) -> None:
+        """Hybrid (attention + recurrent-state) models share KV blocks with float32 state pages,
+        so a reused attention block can hold NaN/Inf when read as bf16. Clear attention blocks
+        when they are allocated (one small compiled graph per step that allocates any) and tell
+        the model it need not clear them itself."""
+        self._kv_clear_groups: list[int] = []
+        if (not hasattr(self.model, "set_runner_clears_kv_blocks") or self.device.type == "cpu"
+                or self.vllm_config.cache_config.enable_prefix_caching
+                or os.environ.get("VLLM_NEURON_HYBRID_RUNNER_KV_CLEAR") == "0"):
+            return
+        from vllm_neuron.envs import get_compile_backend_name
+
+        groups, caches, ratios = [], [], set()
+        for gi, (group, bs) in enumerate(zip(kv_cache_config.kv_cache_groups, block_sizes)):
+            if not isinstance(group.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
+                continue
+            groups.append(gi)
+            for name in group.layer_names:
+                k_cache, v_cache = kv_caches[name]
+                caches += [k_cache, v_cache]
+                ratios.add(bs // k_cache.shape[2])  # manager block / kernel block
+        if not groups or len(ratios) != 1:
+            return
+        self._kv_clear_groups = groups
+        self._kv_clear_ratio = ratios.pop()
+        self._kv_clear_caches = caches
+        self._kv_clear_fn = torch.compile(_zero_kv_blocks, backend=get_compile_backend_name(),
+                                          dynamic=False)
+        self.model.set_runner_clears_kv_blocks(True)
+
+    def warm_up_kv_block_clearing(self) -> None:
+        """Compile the KV-clearing graph (clears the null block). Called after model warmup:
+        executing on device earlier would precede the parallel-trace forks."""
+        if getattr(self, "_kv_clear_groups", None):
+            self._clear_kv_blocks([0])
+
+    def _clear_kv_blocks(self, manager_blocks: list[int]) -> None:
+        ratio = self._kv_clear_ratio
+        for start in range(0, len(manager_blocks), _KV_CLEAR_CHUNK):
+            chunk = manager_blocks[start:start + _KV_CLEAR_CHUNK]
+            chunk = chunk + [0] * (_KV_CLEAR_CHUNK - len(chunk))
+            kernel_blocks = (torch.tensor(chunk)[:, None] * ratio + torch.arange(ratio)).reshape(-1)
+            self._kv_clear_fn(self._kv_clear_caches, kernel_blocks.to(self.device))
+
+    def _clear_new_attention_blocks(self, scheduler_output: "SchedulerOutput") -> None:
+        if not getattr(self, "_kv_clear_groups", None):
+            return
+        new_blocks: set[int] = set()
+        for req in scheduler_output.scheduled_new_reqs:
+            for gi in self._kv_clear_groups:
+                new_blocks.update(req.block_ids[gi])
+        for block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
+            if block_ids is not None:
+                for gi in self._kv_clear_groups:
+                    new_blocks.update(block_ids[gi])
+        new_blocks.discard(0)
+        if new_blocks:
+            self._clear_kv_blocks(sorted(new_blocks))
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1934,6 +2006,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        self._clear_new_attention_blocks(scheduler_output)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -8657,16 +8730,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.model.bind_kv_cache(kv_caches)
         if state_caches:
             self.model.bind_state_cache(state_caches)
-            # Hybrid models clear recycled KV blocks on first write. If one attention block
-            # covers max_model_len, every block a request uses is allocated (and cleared) at
-            # prefill, so decode can skip clearing.
-            if hasattr(self.model, "set_kv_blocks_cover_context"):
-                attn_block_sizes = [
-                    bs for g, bs in zip(kv_cache_config.kv_cache_groups, block_sizes)
-                    if isinstance(g.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec))
-                ]
-                self.model.set_kv_blocks_cover_context(
-                    bool(attn_block_sizes) and self.max_model_len <= min(attn_block_sizes))
+            self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

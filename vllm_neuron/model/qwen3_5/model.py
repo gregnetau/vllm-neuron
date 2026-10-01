@@ -227,7 +227,7 @@ class Qwen3_5Attention(nn.Module):
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
 
         self.k_cache = self.v_cache = None
-        self.kv_blocks_cover_context = False  # set by the runner (set_kv_blocks_cover_context)
+        self.runner_clears_kv_blocks = False  # set by the runner (set_runner_clears_kv_blocks)
         self.k_scale = self.v_scale = None
         self.k_scale_float = self.v_scale_float = 1.0
 
@@ -357,12 +357,13 @@ class Qwen3_5Attention(nn.Module):
 
         md = attn_metadata[f"layers.{self.layer_idx}.self_attn"]
         slot_mapping, block_size = md["slot_mapping"], md["block_size"]
-        # Blocks starting at/after the cached prefix hold no valid data yet -> clear them.
-        # Unused table entries are the -1 read sentinel (runner); map them to the null block.
-        bt = md["block_table_tensor"][0].long().clamp(min=0)
-        starts = torch.arange(bt.shape[0], device=bt.device) * block_size
-        prior = md["cached_seq_len"].reshape(-1)[:1].to(starts.dtype)
-        self._zero_fresh_blocks(torch.where(starts >= prior, bt, torch.zeros_like(bt)))
+        if not self.runner_clears_kv_blocks:
+            # Blocks starting at/after the cached prefix hold no valid data yet -> clear them.
+            # Unused table entries are the -1 read sentinel (runner); map them to the null block.
+            bt = md["block_table_tensor"][0].long().clamp(min=0)
+            starts = torch.arange(bt.shape[0], device=bt.device) * block_size
+            prior = md["cached_seq_len"].reshape(-1)[:1].to(starts.dtype)
+            self._zero_fresh_blocks(torch.where(starts >= prior, bt, torch.zeros_like(bt)))
         self._write_kv(k, v, slot_mapping, block_size)
 
         kv_segment_size = md.get("kv_segment_size")
@@ -415,9 +416,9 @@ class Qwen3_5Attention(nn.Module):
         v_cache = self.v_cache.squeeze(1) if self.v_cache.dim() == 4 and nkh else self.v_cache
 
         # A token at block offset 0 starts a fresh block: clear it before the kernel reads it.
-        # Writing the cache ahead of the kernel copies the whole cache, so this is skipped
-        # when every block of a request is allocated (and cleared) at prefill.
-        if not self.kv_blocks_cover_context:
+        # Writing the cache ahead of the kernel copies the whole cache, so the runner clears
+        # blocks at allocation instead when it can (set_runner_clears_kv_blocks).
+        if not self.runner_clears_kv_blocks:
             blk_new = (slot_mapping // block_size).long()
             self._zero_fresh_blocks(torch.where(slot_mapping % block_size == 0, blk_new,
                                                 torch.zeros_like(blk_new)))
@@ -1044,10 +1045,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 raise KeyError(f"KV cache for layer {name} not initialized")
             layer.self_attn.k_cache, layer.self_attn.v_cache = kv_caches[name][0], kv_caches[name][1]
 
-    def set_kv_blocks_cover_context(self, value: bool):
+    def set_runner_clears_kv_blocks(self, value: bool):
         for layer in self.model.layers:
             if layer.layer_type == FULL_ATTENTION:
-                layer.self_attn.kv_blocks_cover_context = value
+                layer.self_attn.runner_clears_kv_blocks = value
 
     def bind_state_cache(self, state_caches):
         for i, layer in enumerate(self.model.layers):
