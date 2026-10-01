@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM
+from .qwen3_5 import Qwen3_5ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 
 
@@ -23,6 +24,10 @@ def get_models() -> list[tuple[str, type]]:
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+        # Qwen3.5 / Qwen3.8 dense hybrid (Gated DeltaNet). The published checkpoint's
+        # architecture is the ConditionalGeneration name; both serve text only.
+        ("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM),
+        ("Qwen3_5ForConditionalGeneration", Qwen3_5ForCausalLM),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

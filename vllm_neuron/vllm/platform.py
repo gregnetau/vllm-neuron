@@ -305,6 +305,28 @@ class NeuronPlatform(Platform):
                 "variable or set VLLM_USE_V2_MODEL_RUNNER=0."
             )
 
+    # Architectures with per-request recurrent state (Gated DeltaNet layers). Prefix
+    # caching would need per-block state checkpoints, which are not implemented.
+    _STATEFUL_ARCHITECTURES = frozenset(
+        {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+    )
+
+    @classmethod
+    def _disable_prefix_caching_for_stateful_models(
+        cls, vllm_config: "VllmConfig"
+    ) -> None:
+        archs = set(getattr(vllm_config.model_config, "architectures", None) or [])
+        if not (archs & cls._STATEFUL_ARCHITECTURES):
+            return
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            logger.warning(
+                "Prefix caching is not supported for models with recurrent state "
+                "(%s); disabling it.",
+                ", ".join(sorted(archs)),
+            )
+            cache_config.enable_prefix_caching = False
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Configure vLLM for vLLM Neuron platform."""
@@ -347,6 +369,7 @@ class NeuronPlatform(Platform):
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
+        cls._disable_prefix_caching_for_stateful_models(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         # TODO: Implement a CPU fallback based on the value from DeviceConfig
@@ -385,7 +408,12 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Text-only architectures (Qwen3.5/3.8 serves only the language tower even though
+        # the checkpoint config carries a vision_config) need no vision buckets.
+        archs = set(getattr(model_config, "architectures", None) or [])
+        if hasattr(model_config.hf_config, "vision_config") and not (
+            archs & cls._STATEFUL_ARCHITECTURES
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute per-image embed limit for request validation.
