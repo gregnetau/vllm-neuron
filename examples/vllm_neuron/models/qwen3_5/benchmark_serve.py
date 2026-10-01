@@ -3,7 +3,9 @@
 
 Sends an exact ``--input-len``-token prompt as token ids with ``ignore_eos`` and streams
 ``--output-len`` tokens; reports mean TTFT, TPOT (time per output token after the first)
-and end-to-end latency over ``--rounds`` timed rounds after one warmup round.
+and end-to-end latency over ``--rounds`` timed rounds after one warmup round. Fails if the
+generated text is degenerate (a single repeated character, e.g. from NaN logits), since
+``ignore_eos`` produces the requested number of tokens either way.
 
 Usage:
     python examples/vllm_neuron/models/qwen3_5/benchmark_serve.py \
@@ -38,17 +40,22 @@ def timed_request(url: str, model: str, ids: list[int], output_len: int) -> dict
     body = {"model": model, "prompt": ids, "max_tokens": output_len, "temperature": 0,
             "ignore_eos": True, "stream": True}
     start = time.perf_counter()
-    first, chunks = None, 0
+    first, chunks, text = None, 0, []
     with _post(url, body) as resp:
         for raw in resp:
             line = raw.decode().strip()
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
-            if json.loads(line[5:])["choices"][0].get("text") is not None:
+            piece = json.loads(line[5:])["choices"][0].get("text")
+            if piece is not None:
                 first = first or time.perf_counter()
                 chunks += 1
+                text.append(piece)
     end = time.perf_counter()
-    return {"ttft_s": first - start, "tpot_s": (end - first) / max(output_len - 1, 1),
+    out = "".join(text)
+    if len(set(out.strip())) <= 1:
+        raise RuntimeError(f"degenerate output (NaN logits?): {out[:80]!r}")
+    return {"text": out[:200], "ttft_s": first - start, "tpot_s": (end - first) / max(output_len - 1, 1),
             "e2e_s": end - start, "chunks": chunks}
 
 
