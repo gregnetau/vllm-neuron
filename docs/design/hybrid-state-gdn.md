@@ -96,6 +96,23 @@ program's heads.
   outputs). The runner's block tables use `-1` for unused entries; the model maps them to
   the null block before indexing.
 
+## Speculative decoding (MTP)
+
+With vLLM's `mtp` speculative method and `k` draft tokens, each `MambaSpec` gets
+`num_speculative_blocks = k`, so a request holds `1 + k` state blocks per GDN layer group
+(`block_table_tensor` is `[B, 1 + k]`). A verify step runs `1 + k` tokens per request through
+the GDN layers in order (`gdn_kernels.gdn_decode_fp8` keeps the state in SBUF between them)
+and writes the state after token `j` to block `j`. The runner records, from the sampled
+tokens, which block holds the state after the last accepted token and passes it as
+`state_in` in the GDN metadata of the next step, where the state is read from that block.
+Prefills and single-token steps read `state_in` (0 after a prefill) and write block 0.
+
+Because `state_in` comes from the previous step's sampled tokens on the host, MTP runs with
+synchronous scheduling. Selecting the accepted state inside the target graph instead (copying
+it to block 0 after rejection sampling) was tried and rejected: in-place copies on the bound
+state buffers after the kernels that write them gave wrong results and cost about 13 ms per
+step.
+
 ## Recycled blocks
 
 Block ids are global across groups, so a KV block can previously have held float32 state.
