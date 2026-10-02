@@ -8957,6 +8957,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "pass --no-async-scheduling."
                 )
             num_spec_blocks = self.speculative_config.num_speculative_tokens
+            if num_spec_blocks > 2:
+                # 3 draft tokens produce invalid indices in the verify graph (under
+                # investigation); 2 already captures most of the gain (third-draft
+                # acceptance is low with a single, reused MTP layer).
+                raise NotImplementedError(
+                    "MTP for models with recurrent state supports up to 2 draft tokens.")
         attn_page = max((s.page_size_bytes for s in attn_specs.values()), default=1)
         # Pad the state page to a whole number of 256-token attention blocks: vLLM
         # enlarges the attention block to (state page / attention page) * block_size
