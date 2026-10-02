@@ -5,7 +5,7 @@
 checkpoints, feature support, FP8 calibration, performance and known limitations. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.5, Qwen3.8, Qwen3.8-27B, Gated DeltaNet, hybrid,
 linear attention, FP8, model recipe, model card, LLM serving, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-10-01 -->
+<!-- meta: date_updated: 2026-10-02 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -14,7 +14,8 @@ The dense Qwen3.5 / Qwen3.8 checkpoints (`Qwen3_5ForConditionalGeneration`,
 `model_type=qwen3_5`) are hybrid decoders: 48 of the 64 layers of the 27B model are Gated
 DeltaNet (GDN) linear attention with a fixed-size recurrent state per request, and every
 fourth layer is full attention (24 query / 4 KV heads, head_dim 256, output gate, partial
-rotary). This recipe serves the text tower; the vision tower and the MTP head are not loaded.
+rotary). This recipe serves the text tower: the vision tower is not loaded, and the
+multi-token-prediction (MTP) head is loaded as a speculative-decoding draft when enabled.
 
 **Compatible model checkpoints:**
 
@@ -36,10 +37,12 @@ rotary). This recipe serves the text tower; the vision tower and the MTP head ar
 | | Static FP8 (E4M3, per tensor): MLP, GDN and attention projections | ✅ |
 | | FP8 KV cache (unit KV scales) | ✅ |
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
+| | Decode batches > 1 (`max_num_seqs` > 1) | ❌ (wrong output, see [Known limitations](#known-limitations)) |
 | | Pipeline / context parallelism | ❌ |
-| **Performance** | Fused NKI GDN decode kernel (BF16: batch 1; FP8: whole sub-layer, batch <= 32) | ✅ |
+| **Performance** | Fused NKI GDN decode kernel (BF16: one token; FP8: whole sub-layer, up to 32 tokens) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
 | | Segmented prefill (`max_model_len` > prefill bucket) | ✅ |
+| | Long context (`max_model_len` 32768, about 360k tokens of KV/state pool) | ✅ |
 | | Prefix caching (1024-token blocks, Mamba `align` mode) | ✅ |
 | | Multi-token prediction (MTP) speculative decoding, 1-2 draft tokens | ✅ |
 | **Compilation** | torch.compile (XLA backend) | ✅ |
@@ -61,13 +64,53 @@ MODEL=<path-to-checkpoint>/Qwen3.8-27B examples/vllm_neuron/models/qwen3_5/serve
 The script sets the required options:
 
 - `--tensor-parallel-size 4`: every head count divides by 4 and each rank holds one KV head.
-- `--gpu-memory-utilization 0.65` and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.15`: HBM is
-  24 GB per logical core and the 27B weights take 13.5 GB per rank. A larger KV budget is
-  filled with recurrent-state pages and the graph is rejected (`NCC_EVRF009`).
+- `--max-num-seqs 1` (`MAX_NUM_SEQS`): larger decode batches produce wrong output.
+- `--gpu-memory-utilization 0.65` (`GPU_MEM_UTIL`) and
+  `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.15` (`KV_CAP_FRACTION`): a small KV/state pool
+  that fits every configuration, including BF16 weights. For long contexts see
+  [Context length and KV capacity](#context-length-and-kv-capacity).
+- `--max-model-len 2048` (`MAX_MODEL_LEN`) and `--max-num-batched-tokens 1024`
+  (`PREFILL_BUCKET`, the prefill chunk).
 - `--no-enable-prefix-caching` unless `PREFIX_CACHING=1` (see below).
 - `--limit-mm-per-prompt '{"image": 0, "video": 0}'`: text-only serving.
+- Asynchronous scheduling (vLLM's default); `ASYNC_SCHEDULING=0` disables it.
 
 An offline example is in `examples/vllm_neuron/models/qwen3_5/run.py`.
+
+### Context length and KV capacity
+
+HBM is 24 GB per logical core (96 GB on the chip). The weights take 13.5 GB per rank in BF16
+and 7.0 GiB in FP8 (8.5 GiB with the MTP draft). The plugin sizes the KV/state pool per core
+as the smaller of the free HBM and `KV_CAP_FRACTION * GPU_MEM_UTIL * 24 GB`. With the
+defaults (0.15 and 0.65) that is 2.3 GB per core, so `neuron-top` shows about half the chip
+in use.
+
+The upper bound on the pool comes from the compiler, not from HBM. neuronx-cc rejects a
+graph whose input and output tensors add up to more than 24 GB (`NCC_EVRF009`). The KV and
+state views of the pool are graph inputs and outputs, and they count against that limit
+several times over. With FP8 weights and MTP:
+
+| `MAX_MODEL_LEN` | `GPU_MEM_UTIL` | `KV_CAP_FRACTION` | KV/state pool | Requests of `MAX_MODEL_LEN` |
+|---|---|---|---|---|
+| 32768 | 0.9 | 0.35 | 363,644 tokens (455 blocks of 1024) | 11.1 |
+| 32768 | 0.9 | 0.5 | rejected (`NCC_EVRF009`) | |
+
+```bash
+MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=$PWD/fp8_act_amax.json MTP_TOKENS=2 \
+    MAX_MODEL_LEN=32768 GPU_MEM_UTIL=0.9 KV_CAP_FRACTION=0.35 \
+    examples/vllm_neuron/models/qwen3_5/serve.sh
+```
+
+Per rank, a request uses 16 KB of attention KV per token (16 layers, one KV head of 256,
+K and V in BF16), plus one 1 MB state page per GDN layer for each of its `1 + k` state
+blocks, where `k` is the number of MTP draft tokens. Under prefix caching, each cached
+1024-token block also holds a state checkpoint. The pool is shared across requests, so at
+batch 1 most of a 32k pool goes unused. It is still the pool available to prefix caching.
+
+When parallel compilation fails with `NCC_EVRF009` after the pool size changes, the compile
+cache (`~/.cache/neuron_libtorch/neuron/compile_cache`) may still hold graphs captured for an
+earlier, larger pool. Remove the directories whose `example_inputs.txt` lists the old page
+count (for example `(650, 1024, 128)`).
 
 ### MTP speculative decoding
 
@@ -191,6 +234,22 @@ second (mean 1.85 and 2.4 tokens per step). With synchronous scheduling a step w
 tokens takes about 33 ms: 20.5 ms for the target's verify pass (3 tokens), 4.4 ms for the
 draft and about 7 ms on the host; asynchronous scheduling overlaps the host work.
 
+At `max_model_len` 32768 (FP8, MTP with 2 draft tokens, asynchronous scheduling, batch 1):
+
+| Prompt tokens | TTFT | TPOT |
+|---|---|---|
+| 1,000 | 0.82 s | 9.1 ms |
+| 8,000 | 6.5 s | 9.1 ms |
+| 16,000 | 13 s | 9.1 ms |
+| 30,000 | 24.5 s | 9.1 ms |
+
+Decode time does not depend on context length. Prefill does: it costs about 0.8 s per
+1024-token chunk at any position, compared with 0.4 s at `max_model_len` 2048. Each chunk's
+full-attention layers (the PyTorch fallback, see [Known limitations](#known-limitations))
+gather and score the whole `max_model_len` of KV, a `[6, 1024, 32768]` float32 score tensor
+per rank and layer (about 24 ms per layer). Prefill buckets by context length would bound
+this by the prompt length (see [Roadmap](#roadmap)).
+
 Cold compilation of the `max_model_len` 2048 configuration takes about 4 minutes in BF16 and
 12 minutes in FP8, and is cached afterwards.
 
@@ -203,12 +262,59 @@ on real activations, FP8 layer outputs have relative errors of 1-7% (GDN), 1-6% 
 1-2.5% (full attention). With all FP8 modules, greedy 64-token continuations of 12 prompts
 match BF16 exactly for 2-3 prompts, with a mean identical prefix of 29-31 tokens; divergent
 continuations remain coherent. The FP8 decode kernels quantize the same tensors with the same
-scales as the library kernels they replace and leave this agreement unchanged. A task-level evaluation is in progress (see [Roadmap](#roadmap)).
+scales as the library kernels they replace and leave this agreement unchanged. At
+`max_model_len` 32768 (FP8, batch 1), greedy continuations of the same 12 prompts are
+identical to those at `max_model_len` 2048 for 8 prompts; changing the graph shapes changes
+the reduction order. For the task-level evaluation see [Aider Polyglot](#aider-polyglot).
+
+## Aider Polyglot
+
+[Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark) (225 Exercism exercises in
+C++, Go, Java, JavaScript, Python and Rust, two tries each) runs the Aider benchmark harness
+in Docker against the OpenAI-compatible server. Use the 32k configuration from
+[Context length and KV capacity](#context-length-and-kv-capacity): Aider prompts with the
+exercise files, test output from the first try and the model's thinking can exceed 8k
+tokens.
+
+```bash
+git clone https://github.com/Aider-AI/aider && cd aider
+mkdir -p tmp.benchmarks
+git clone https://github.com/Aider-AI/polyglot-benchmark tmp.benchmarks/polyglot-benchmark
+./benchmark/docker_build.sh
+cp <vllm-neuron>/examples/vllm_neuron/models/qwen3_5/aider-model-settings.yml .
+docker run --rm --memory=12g --memory-swap=12g --add-host=host.docker.internal:host-gateway \
+    -v $PWD:/aider -v $PWD/tmp.benchmarks/.:/benchmarks \
+    -e OPENAI_API_KEY=none -e OPENAI_API_BASE=http://host.docker.internal:8000/v1 \
+    -e AIDER_DOCKER=1 -e AIDER_BENCHMARK_DIR=/benchmarks aider-benchmark \
+    bash -c "pip install -q -e .[dev] && ./benchmark/benchmark.py qwen3.8-27b-neuron \
+        --model openai/qwen3.8-27b --read-model-settings aider-model-settings.yml \
+        --edit-format diff --threads 2 --exercises-dir polyglot-benchmark"
+```
+
+`aider-model-settings.yml` selects thinking mode with Qwen's recommended sampling
+(temperature 0.6, top-p 0.95, top-k 20) and strips the thinking, which the server returns
+inline up to `</think>`. It sets no `max_tokens`: vLLM rejects requests whose prompt plus
+`max_tokens` exceeds `max_model_len`, and by default it allows the rest of the context.
+The server runs one request at a time; with `--threads 2` one exercise's tests run while the
+other's request is served. Pass `--num-tests N` for a subset.
+
+A 3-exercise smoke run took about 200 s per exercise, with 16k completion tokens per exercise
+(thinking included), all responses well formed and no exhausted context windows. At that rate
+the full benchmark takes about 13 hours.
 
 ## Known limitations
 
-- **Batch size 1 for the BF16 fused GDN decode kernel.** Larger BF16 decode batches fall back
-  to the PyTorch GDN path (the FP8 kernel supports up to 32 requests).
+- **Decode batches > 1 produce wrong output.** With `max_num_seqs` 2 or 4 the server's
+  outputs ignore the prompt, and FP8 + MTP at batch 4 fails with an out-of-bounds DMA in
+  the verify graph. The components agree with batch 1 when tested alone: the FP8 GDN decode
+  kernel exactly, and attention and a GDN / attention / FP8 MLP layer stack within BF16
+  rounding. The fault is in the serving path and is not yet located. Serve with
+  `max_num_seqs` 1. At batch > 1, BF16 decode would also fall back from the fused GDN
+  kernel to the PyTorch path.
+- **Prefill cost grows with `max_model_len`**, not with the prompt length (see
+  [Performance](#performance)).
+- **The KV/state pool is bounded by the compiler's graph I/O check** (`NCC_EVRF009`), at
+  about 360k tokens with FP8 weights and `max_model_len` 32768, not by HBM.
 - **Full-attention prefill falls back to PyTorch** when segmented prefill is active
   (`head_dim` 256 exceeds the segmented attention kernel's limit of 128).
 - **`on_device_sampling_config.all_greedy` returns invalid token ids** with this model;
@@ -246,12 +352,15 @@ rather than to propose a competing implementation.
 
 Before this work is proposed upstream:
 
-1. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
-2. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
+1. **Aider Polyglot** result for the 32k FP8 + MTP configuration (setup above).
+2. **Decode batches > 1**: locate the serving-path fault, then measure throughput.
+3. **Long-context prefill**: prefill context-length buckets so that a chunk attends only to
+   the KV it needs.
+4. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
+5. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
    draft's `lm_head`.
-3. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
-   reference and #54, including [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark)
-   for code generation, plus latency and throughput sweeps over context length and batch size.
+6. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
+   reference and #54, plus latency and throughput sweeps over context length and batch size.
 
 ## Tutorials
 
