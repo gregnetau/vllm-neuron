@@ -770,6 +770,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        # MTP (multi-token-prediction head of the target checkpoint) drafts through the
+        # EAGLE3 pipeline; the target returns its final hidden states as the aux state.
+        self.is_mtp_spec = False
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -779,8 +782,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.speculative_config:
             # TODO add more spec decode methods
-            if self.speculative_config.method == "eagle3":
+            if self.speculative_config.method in ("eagle3", "mtp"):
                 self.is_eagle3_spec = True
+                self.is_mtp_spec = self.speculative_config.method == "mtp"
                 self.drafter = EagleProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
@@ -1398,7 +1402,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Explicit call to force all buffers to use meta.
             self.model = self.model.to("meta")
 
-        if self.is_eagle3_spec:
+        if self.is_mtp_spec:
+            if not hasattr(self.model, "set_mtp_hidden_output"):
+                raise RuntimeError("Model does not support MTP speculative decoding")
+            self.model.set_mtp_hidden_output(True)
+        elif self.is_eagle3_spec:
             if supports_eagle3(self.model):
                 # First try to get aux_layers from draft model config, then fall back to model's default
                 aux_layers = self._get_eagle3_aux_layers_from_config()
@@ -1978,6 +1986,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._kv_clear_fn = torch.compile(_zero_kv_blocks, backend=get_compile_backend_name(),
                                           dynamic=False)
         self.model.set_runner_clears_kv_blocks(True)
+        drafter_model = getattr(self.drafter, "model", None) if self.drafter is not None else None
+        if drafter_model is not None and hasattr(drafter_model, "set_runner_clears_kv_blocks"):
+            drafter_model.set_runner_clears_kv_blocks(True)
 
     def warm_up_kv_block_clearing(self) -> None:
         """Compile the KV-clearing graph (clears the null block). Called after model warmup:
@@ -4424,6 +4435,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            state_in = None
+            if kv_cache_group_id in getattr(self, "_mamba_spec_groups", ()):
+                state_in = torch.zeros(padded_num_reqs, dtype=torch.int32)
+                for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
+                    state_in[i] = self._mamba_state_in.get(req_id, 0)
+                state_in = state_in.to(self.device)
             if kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
                 # Align mode: the running state's block only; token validity from the
                 # attention group's slots (state blocks before it may be the null block).
@@ -4452,6 +4469,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if state_in is not None:  # MTP: state block of the last accepted token per request
+                attn_metadata_i["state_in"] = state_in
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -4585,6 +4604,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             if (isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"):
                 max_num_blocks_per_req = full_max_blocks_per_req = 1  # see _mamba_align_state_table
+            elif isinstance(spec, MambaSpec):  # 1 + speculative blocks, as the runtime table
+                max_num_blocks_per_req = full_max_blocks_per_req = runtime_bt.max_num_blocks_per_req
             # Dummy block_table_tensor: [num_reqs, max_num_blocks_per_req]
             # Use sequential block IDs starting from 0
             block_table_tensor = (
@@ -4645,6 +4666,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if isinstance(spec, MambaSpec) and spec.num_speculative_blocks > 0:
+                attn_metadata_i["state_in"] = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -8399,16 +8422,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _update_states_after_model_execute(
         self,
-        scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update the cached states after model execution.
 
-        On GPU this handles MTP/EAGLE for hybrid models (linear attention
-        state shifting). Neuron does not support hybrid models yet, so this
-        is a no-op.
+        Recurrent-state models with MTP: a verify step wrote the state after each of its
+        tokens to its own state block; the next step starts from the state after the last
+        accepted token (block len(sampled) - 1).
         """
-        pass
+        if not getattr(self, "_mamba_spec_groups", None):
+            return
+        for req_id in scheduler_output.finished_req_ids:
+            self._mamba_state_in.pop(req_id, None)
+        for i, req_id in enumerate(self.input_batch.req_ids[:len(sampled_token_ids)]):
+            self._mamba_state_in[req_id] = max(len(sampled_token_ids[i]) - 1, 0)
 
     def _update_batch_state_with_samples(
         self,
@@ -8703,6 +8731,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             block_sizes,
         )
 
+        # Block-table widths: recurrent-state groups hold one block per request (one per state
+        # block in Mamba align mode) plus their speculative blocks (as in vLLM's GPU runner).
+        max_num_blocks = []
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            n = math.ceil(self.max_model_len / spec.block_size)
+            if isinstance(spec, MambaSpec):
+                n = (n if self.vllm_config.cache_config.enable_prefix_caching else 1) + spec.num_speculative_blocks
+            max_num_blocks.append(n)
+
         # Initialize InputBatch with block_sizes list matching the number of KV cache groups
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
@@ -8711,6 +8749,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device=self.device,
             vocab_size=self.vocab_size,
             block_sizes=block_sizes,
+            max_num_blocks_per_req=max_num_blocks,
             kernel_block_sizes=self._kernel_block_sizes(kv_cache_config),
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
@@ -8852,6 +8891,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.model.bind_state_cache(state_caches)
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
             self._setup_mamba_align(kv_cache_config, state_caches)
+            self._mamba_spec_groups = [
+                gi for gi, g in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.num_speculative_blocks > 0]
+            self._mamba_state_in: dict[str, int] = {}
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -8894,10 +8937,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         attention block, so state checkpoints line up with the attention prefix blocks.
         """
         cache_config = self.vllm_config.cache_config
+        num_spec_blocks = 0
         if self.speculative_config is not None:
-            raise NotImplementedError(
-                "Speculative decoding is not supported for models with recurrent state."
-            )
+            # MTP verify steps keep the state after each of the 1 + k tokens in its own block
+            # (state block j = state after token j); the next step starts from the last
+            # accepted one (see _update_states_after_model_execute).
+            if not self.is_mtp_spec:
+                raise NotImplementedError(
+                    "Only MTP speculative decoding is supported for models with recurrent state."
+                )
+            if cache_config.enable_prefix_caching:
+                raise NotImplementedError(
+                    "Prefix caching with speculative decoding is not supported for models "
+                    "with recurrent state; pass --no-enable-prefix-caching."
+                )
+            if self.use_async_scheduling:
+                raise NotImplementedError(
+                    "MTP for models with recurrent state needs synchronous scheduling; "
+                    "pass --no-async-scheduling."
+                )
+            num_spec_blocks = self.speculative_config.num_speculative_tokens
         attn_page = max((s.page_size_bytes for s in attn_specs.values()), default=1)
         # Pad the state page to a whole number of 256-token attention blocks: vLLM
         # enlarges the attention block to (state page / attention page) * block_size
@@ -8921,6 +8980,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 page_size_padded=page,
                 mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
                 mamba_cache_mode=mode,
+                num_speculative_blocks=num_spec_blocks,
             )
         return specs
 

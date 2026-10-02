@@ -5,7 +5,7 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM
-from .qwen3_5 import Qwen3_5ForCausalLM
+from .qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MTP
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 
 
@@ -28,6 +28,7 @@ def get_models() -> list[tuple[str, type]]:
         # architecture is the ConditionalGeneration name; both serve text only.
         ("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM),
         ("Qwen3_5ForConditionalGeneration", Qwen3_5ForCausalLM),
+        ("Qwen3_5MTP", Qwen3_5MTP),  # MTP head, draft model for speculative decoding
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

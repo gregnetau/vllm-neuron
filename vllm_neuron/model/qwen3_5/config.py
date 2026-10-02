@@ -56,6 +56,9 @@ class Qwen3_5Config:
     # Recurrent (temporal) state dtype; the conv state uses ``torch_dtype``.
     mamba_ssm_dtype: torch.dtype = torch.float32
 
+    # Multi-token-prediction head (draft model for speculative decoding)
+    mtp_num_hidden_layers: int = 1
+
     # Framework config
     neuron_config: NeuronConfig | None = None
 

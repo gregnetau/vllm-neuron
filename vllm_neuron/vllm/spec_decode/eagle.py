@@ -42,7 +42,9 @@ class EagleProposer:
 
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
-        assert self.method == "eagle3"
+        # "mtp": the target checkpoint's multi-token-prediction head (e.g. Qwen3.5), driven
+        # through the same propose interface as an EAGLE3 draft.
+        assert self.method in ("eagle3", "mtp")
 
         self.device = device
         self.on_device_sampling = on_device_sampling
@@ -106,7 +108,7 @@ class EagleProposer:
 
     def load_model(self, target_hidden_size: int) -> None:
         # Load draft model
-        target_num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        target_num_layers = self.vllm_config.model_config.hf_text_config.num_hidden_layers
         self.model = self.compile_and_load_draft_model(
             start_layer_idx=target_num_layers,
             target_hidden_size=target_hidden_size,
@@ -114,7 +116,10 @@ class EagleProposer:
         logger.info("Completed compilation for draft model.")
 
         # Set draft model attn layer names
-        draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
+        if self.method == "mtp":
+            draft_num_layers = getattr(self.draft_model_config.hf_config, "n_predict", None) or 1
+        else:
+            draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
         self.attn_layer_names = [
             f"layers.{i}.self_attn"
             for i in range(target_num_layers, target_num_layers + draft_num_layers)
@@ -153,8 +158,10 @@ class EagleProposer:
         # Uses safe position values (zeros) to avoid KV cache overflow during recurrent passes.
         target_positions = torch.zeros(num_tokens, dtype=torch.long).to(device)
 
+        # EAGLE3 drafts from three concatenated target layers; MTP from the final one.
+        num_aux = 1 if self.method == "mtp" else 3
         target_hidden_states = torch.ones(
-            num_tokens, hidden_size * 3, dtype=torch.bfloat16
+            num_tokens, hidden_size * num_aux, dtype=torch.bfloat16
         ).to(device)
 
         # last_token_indices: index of last token for each request
@@ -315,9 +322,10 @@ class EagleProposer:
 
         # Set padding config if target has different (padded) hidden_size
         # This allows draft model to work with padded hidden states from target model
-        draft_hf_config.unpadded_hidden_size = draft_hf_config.hidden_size
-        if target_hidden_size != draft_hf_config.hidden_size:
-            draft_hf_config.hidden_size = target_hidden_size
+        if self.method != "mtp":  # an MTP head shares the target's (text) config
+            draft_hf_config.unpadded_hidden_size = draft_hf_config.hidden_size
+            if target_hidden_size != draft_hf_config.hidden_size:
+                draft_hf_config.hidden_size = target_hidden_size
 
         # Override to greedy sampling for draft model.
         on_device_sampling_config = None

@@ -64,3 +64,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"tensor_parallel_size must equal num_key_value_heads "
                 f"({cfg.num_key_value_heads}) for Qwen3.5/3.8; got {tp}."
             )
+
+
+class Qwen3_5MTP(nn.Module):
+    """Factory for the MTP draft model (vLLM's ``mtp`` speculative method)."""
+
+    @classmethod
+    def from_configs(cls, config: PretrainedConfig, start_layer_idx: int,
+                     neuron_config: NeuronConfig | None = None) -> nn.Module:
+        from .mtp import Qwen3_5MTP as Model
+
+        return Model.from_configs(config, start_layer_idx, neuron_config)

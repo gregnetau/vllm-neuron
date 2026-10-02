@@ -210,7 +210,7 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
         for h in halves:
             h[PAGE].fill_(123.0)
 
-    logits = model(padded, torch.arange(T), attn_metadata=md_for(False),
+    logits = model(padded, positions=torch.arange(T), attn_metadata=md_for(False),
                    sampling_positions=torch.tensor([n_real - 1]))
     ref = ref_mod.Qwen3_5Reference(cfg, sd, prefix="model.language_model.", lm_head="lm_head.weight")
     ref_logits = ref.forward(ids)

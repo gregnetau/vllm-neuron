@@ -52,7 +52,7 @@ def test_prefill_and_gdn_decode_trace_on_meta():
         return out
 
     meta = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device="meta")
-    logits = model(meta(T, dtype=torch.long), torch.arange(T, device="meta"), attn_metadata=md(False),
+    logits = model(meta(T, dtype=torch.long), positions=torch.arange(T, device="meta"), attn_metadata=md(False),
                    sampling_positions=meta(1, dtype=torch.long))
     assert logits.device.type == "meta" and logits.shape == (1, 128)
 

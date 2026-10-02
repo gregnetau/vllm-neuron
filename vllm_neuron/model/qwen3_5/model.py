@@ -47,6 +47,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
@@ -657,7 +658,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         md = attn_metadata[f"layers.{self.layer_idx}.linear_attn"]
         is_decode = md["max_query_len"] <= md["decode_token_threshold"]
         if is_decode:
-            out = self._decode(hidden_states, md)
+            if "state_in" in md:  # MTP: 1 + k tokens per request, state per token
+                out = self._decode_spec(hidden_states, md)
+            else:
+                out = self._decode(hidden_states, md)
             if self.world_size > 1:  # >>> PARALLELISM: TP all-reduce <<<
                 self.tp_group.all_reduce(out)
             return out
@@ -818,6 +822,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if self.world_size > 1:  # >>> PARALLELISM: TP all-reduce <<<
             self.tp_group.all_reduce(out)
         return out
+
+    def _decode_spec(self, hidden_states, md):
+        """Speculative-decoding verify: S = 1 + k tokens per request (rows b*S .. b*S+S-1).
+        The state starts from block state_in[b] (the state after the last accepted token of
+        the previous step) and the state after token j is written to block j."""
+        bt = md["block_table_tensor"].long().clamp(min=0)  # [B, 1 + k]; -1 -> null block 0
+        B = bt.shape[0]
+        T = hidden_states.shape[0]
+        S = T // B
+        slots_in = bt.gather(1, md["state_in"].long().view(B, 1)).view(B)
+        hidden_states = hidden_states.to(self.dtype)
+
+        mixed, z, b, a = self._project(hidden_states)
+        mixed, b, a = mixed.view(B, S, -1), b.view(B, S, -1), a.view(B, S, -1)
+        conv, ssm = self._read_state(slots_in)  # [B, C, K-1], [B, Hv, Dk, Dv]
+        outs = []
+        for j in range(S):
+            m_j, conv = gdn_ops.causal_conv1d_step_batched(mixed[:, j], self.conv_weight, conv)
+            q, k, v = self._qkv_heads(m_j, B)
+            g, beta = gdn_ops.gdn_gating(a[:, j], b[:, j], self.A_log, self.dt_bias)
+            o, ssm = gdn_ops.gated_delta_step_batched(q, k, v, g, beta, ssm)
+            self._write_state(bt[:, j], conv, ssm)
+            outs.append(o)
+        o = torch.stack(outs, dim=1).reshape(T, self.Hv, self.Dv)
+        return self._finish(o, z, T)
 
     def _decode_torch(self, hidden_states, md):
         slots = md["block_table_tensor"][:, 0].long().clamp(min=0)  # [B]; padded rows (-1) -> null block 0
@@ -986,16 +1015,18 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         return output
 
 
-def _mixer_key(config: Qwen3_5Config, i: int) -> str:
-    kind = "self_attn" if config.layer_types[i] == FULL_ATTENTION else "linear_attn"
+def _mixer_key(config: Qwen3_5Config, i: int, layer_type: str | None = None) -> str:
+    kind = "self_attn" if (layer_type or config.layer_types[i]) == FULL_ATTENTION else "linear_attn"
     return f"layers.{i}.{kind}"
 
 
 class Qwen3_5DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3_5Config, layer_idx: int):
+    def __init__(self, config: Qwen3_5Config, layer_idx: int, layer_type: str | None = None):
+        """``layer_type`` overrides ``config.layer_types[layer_idx]`` (the MTP head's layer is
+        a full-attention layer numbered after the backbone)."""
         super().__init__()
         self.layer_idx = layer_idx
-        self.layer_type = config.layer_types[layer_idx]
+        self.layer_type = layer_type or config.layer_types[layer_idx]
         # Folded gamma; fp32 to avoid rounding (1 + w) to bf16 (computation is fp32 anyway).
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, config.rms_norm_eps, torch.float32)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, config.rms_norm_eps, torch.float32)
@@ -1005,7 +1036,7 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         self.mlp_fp8 = config.fp8_quantized(f"layers.{layer_idx}.mlp")
         self.mlp = Qwen3_5MLPStaticFP8(config) if self.mlp_fp8 else Qwen3_5MLP(config)
-        self.mixer_key = _mixer_key(config, layer_idx)
+        self.mixer_key = _mixer_key(config, layer_idx, self.layer_type)
 
     @property
     def mixer(self):
@@ -1016,7 +1047,8 @@ class Qwen3_5DecoderLayer(nn.Module):
         is_decode = md["max_query_len"] <= md["decode_token_threshold"]
 
         residual = hidden_states
-        if is_decode and self.layer_type != FULL_ATTENTION and self.linear_attn.use_fused_decode(hidden_states):
+        if (is_decode and self.layer_type != FULL_ATTENTION and "state_in" not in md
+                and self.linear_attn.use_fused_decode(hidden_states)):
             hidden_states = self.linear_attn.decode_fused(hidden_states, md, self.input_layernorm)
         else:
             hidden_states = self.input_layernorm(hidden_states)
@@ -1087,6 +1119,109 @@ class Qwen3_5Model(nn.Module):
         return hidden_states, []
 
 
+def _attach_layer_loaders(layer, cfg, tp: int) -> None:
+    """Per-parameter transforms (HF checkpoint tensors -> this rank's layout) for one decoder
+    layer; the checkpoint keys come from _layer_weight_mappings."""
+    fold = _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float())
+    set_weight_loader(layer.input_layernorm.weight, fold)
+    set_weight_loader(layer.post_attention_layernorm.weight, fold)
+    mlp = layer.mlp
+    if layer.mlp_fp8:
+        q = lambda dev: _loader(lambda t, r: W.fp8_quantize(dev(t[0], r, tp), W.fp8_weight_scale(t[0])))
+        scale = _loader(lambda t, r: W.fp8_scale_tile(W.fp8_weight_scale(t[0])))
+        set_weight_loader(mlp.gate_proj_weight, q(W.mlp_gate_up_device))
+        set_weight_loader(mlp.up_proj_weight, q(W.mlp_gate_up_device))
+        set_weight_loader(mlp.down_proj_weight, q(W.mlp_down_device))
+        for sname in ("gate_weight_scale", "up_weight_scale", "down_weight_scale"):
+            set_weight_loader(getattr(mlp, sname), scale)
+    else:
+        set_weight_loader(mlp.gate_proj_weight, _loader(lambda t, r: W.mlp_gate_up_device(t[0], r, tp)))
+        set_weight_loader(mlp.up_proj_weight, _loader(lambda t, r: W.mlp_gate_up_device(t[0], r, tp)))
+        set_weight_loader(mlp.down_proj_weight, _loader(lambda t, r: W.mlp_down_device(t[0], r, tp)))
+    if layer.layer_type == FULL_ATTENTION:
+        a = layer.self_attn
+        attn_qkv = lambda t, r: W.attention_qkv_device(t[0], t[1], t[2], cfg, r, tp)
+        gate_dev = lambda t, r: W.attention_gate_device(t, cfg, r, tp)
+        o_dev = lambda t, r: W.attention_o_device(t, cfg, r, tp)
+        if a.fp8:
+            parts = (a.q_size, a.kv_size, a.kv_size)
+            set_weight_loader(a.qkv_proj_weight, _loader(
+                lambda t, r, f=attn_qkv, parts=parts: W.fp8_quantize_parts(
+                    f(t, r), [W.fp8_weight_scale(x) for x in t], parts)))
+            set_weight_loader(a.qkv_proj_weight_scale, _loader(
+                lambda t, r: torch.cat([W.fp8_scale_tile(W.fp8_weight_scale(x)) for x in t], dim=1)))
+            wl, sl = _fp8_loaders(o_dev, 1)
+            set_weight_loader(a.o_proj_weight, wl)
+            set_weight_loader(a.o_proj_weight_scale, sl)
+        else:
+            set_weight_loader(a.qkv_proj_weight, _loader(attn_qkv))
+            set_weight_loader(a.o_proj_weight, _loader(lambda t, r, f=o_dev: f(t[0], r)))
+        set_weight_loader(a.gate_weight, _loader(lambda t, r, f=gate_dev: f(t[0], r)))
+        qk = _loader(lambda t, r: W.attention_qk_norm_device(t[0], cfg))
+        set_weight_loader(a.q_norm.weight, qk)
+        set_weight_loader(a.k_norm.weight, qk)
+    else:
+        g = layer.linear_attn
+        qkv_dev = lambda t, r: W.gdn_in_proj_qkv_device(t, cfg, r, tp)
+        heads_dev = lambda t, r: W.gdn_in_proj_heads_device(t, r, tp)
+        out_dev = lambda t, r: W.gdn_out_proj_device(t, cfg, r, tp)
+        if g.fp8:
+            for param, dev_fn, cols in (("in_proj_qkv", qkv_dev, 3), ("in_proj_z", heads_dev, 3),
+                                        ("out_proj", out_dev, 1)):
+                wl, sl = _fp8_loaders(dev_fn, cols)
+                set_weight_loader(getattr(g, f"{param}_weight"), wl)
+                set_weight_loader(getattr(g, f"{param}_weight_scale"), sl)
+        else:
+            set_weight_loader(g.in_proj_qkv_weight, _loader(lambda t, r, f=qkv_dev: f(t[0], r)))
+            set_weight_loader(g.in_proj_z_weight, _loader(lambda t, r, f=heads_dev: f(t[0], r)))
+            set_weight_loader(g.out_proj_weight, _loader(lambda t, r, f=out_dev: f(t[0], r)))
+        head_cols = _loader(lambda t, r, f=heads_dev: f(t[0], r))
+        for wp in (g.in_proj_b_weight, g.in_proj_a_weight):
+            set_weight_loader(wp, head_cols)
+        set_weight_loader(g.conv_weight, _loader(lambda t, r: W.gdn_conv_device(t[0], cfg, r, tp)))
+        vec = _loader(lambda t, r: W.gdn_head_vector_device(t[0], cfg, r, tp).float())
+        set_weight_loader(g.A_log, vec)
+        set_weight_loader(g.dt_bias, vec)
+
+
+def _layer_weight_mappings(layer, pre: str, ck: str) -> dict:
+    """Param name -> checkpoint key(s) for one decoder layer (param prefix ``pre``, checkpoint
+    prefix ``ck``)."""
+    m = {}
+    m[pre + "input_layernorm.weight"] = ck + "input_layernorm.weight"
+    m[pre + "post_attention_layernorm.weight"] = ck + "post_attention_layernorm.weight"
+    m[pre + "mlp.gate_proj_weight"] = ck + "mlp.gate_proj.weight"
+    m[pre + "mlp.up_proj_weight"] = ck + "mlp.up_proj.weight"
+    m[pre + "mlp.down_proj_weight"] = ck + "mlp.down_proj.weight"
+    if layer.mlp_fp8:
+        for part in ("gate", "up", "down"):
+            m[pre + f"mlp.{part}_weight_scale"] = ck + f"mlp.{part}_proj.weight"
+    if layer.layer_type == FULL_ATTENTION:
+        s, c = pre + "self_attn.", ck + "self_attn."
+        m[s + "qkv_proj_weight"] = [c + "q_proj.weight", c + "k_proj.weight", c + "v_proj.weight"]
+        m[s + "gate_weight"] = c + "q_proj.weight"
+        m[s + "o_proj_weight"] = c + "o_proj.weight"
+        if layer.self_attn.fp8:
+            m[s + "qkv_proj_weight_scale"] = m[s + "qkv_proj_weight"]
+            m[s + "o_proj_weight_scale"] = c + "o_proj.weight"
+        m[s + "q_norm.weight"] = c + "q_norm.weight"
+        m[s + "k_norm.weight"] = c + "k_norm.weight"
+    else:
+        s, c = pre + "linear_attn.", ck + "linear_attn."
+        for part in ("qkv", "z", "b", "a"):
+            m[s + f"in_proj_{part}_weight"] = c + f"in_proj_{part}.weight"
+        m[s + "conv_weight"] = c + "conv1d.weight"
+        m[s + "A_log"] = c + "A_log"
+        m[s + "dt_bias"] = c + "dt_bias"
+        m[s + "norm_weight"] = c + "norm.weight"
+        m[s + "out_proj_weight"] = c + "out_proj.weight"
+        if layer.linear_attn.fp8:
+            for part in ("in_proj_qkv", "in_proj_z", "out_proj"):
+                m[s + f"{part}_weight_scale"] = c + f"{part}.weight"
+    return m
+
+
+@async_speculative_decoding
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 dense hybrid text model + column-parallel LM head (untied)."""
 
@@ -1107,6 +1242,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype,
             gather_output=not self.on_device_sampling_config, tp_group=self.tp_group.device_group)
+        self._mtp_hidden_output = False
         set_weight_loader(
             self.lm_head.weight,
             sharding_weight_loader(shard_dim=0, shard_size=config.vocab_size // self.world_size,
@@ -1132,8 +1268,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         hidden_states, _ = self.model(input_ids, positions, attn_metadata=attn_metadata, rank=rank,
                                       inputs_embeds=inputs_embeds, is_token_ids=is_token_ids)
         logits = self.lm_head(torch.index_select(hidden_states, dim=0, index=sampling_positions))
+        # MTP drafts from the backbone's final-normed hidden state of every token.
+        mtp_hidden = hidden_states if self._mtp_hidden_output else None
         if self.on_device_sampling_config is None:
-            return logits
+            return (logits, mtp_hidden) if mtp_hidden is not None else logits
 
         sampled_tokens = self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank)
         gathered_logits = None
@@ -1142,8 +1280,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         if spec_decode_metadata is not None:
             from vllm_neuron.nn.rejection_sampler import rejection_sampler
 
-            return rejection_sampler(spec_decode_metadata, sampled_tokens)
+            sampled_tokens = rejection_sampler(spec_decode_metadata, sampled_tokens)
+            if mtp_hidden is None:
+                return sampled_tokens
+        if mtp_hidden is not None:
+            return sampled_tokens, mtp_hidden, gathered_logits
         return sampled_tokens, gathered_logits
+
+    def set_mtp_hidden_output(self, value: bool) -> None:
+        """Return the final hidden states with the samples (speculative method ``mtp``)."""
+        self._mtp_hidden_output = value
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
@@ -1207,69 +1353,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def _setup_weight_loaders(self):
         """Attach per-parameter transforms (HF checkpoint tensors -> this rank's layout)."""
-        cfg, tp = self.config, self.world_size
-        for i, layer in enumerate(self.model.layers):
-            p = f"{CKPT}layers.{i}."
-            fold = _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float())
-            set_weight_loader(layer.input_layernorm.weight, fold)
-            set_weight_loader(layer.post_attention_layernorm.weight, fold)
-            mlp = layer.mlp
-            if layer.mlp_fp8:
-                q = lambda dev: _loader(lambda t, r: W.fp8_quantize(dev(t[0], r, tp), W.fp8_weight_scale(t[0])))
-                scale = _loader(lambda t, r: W.fp8_scale_tile(W.fp8_weight_scale(t[0])))
-                set_weight_loader(mlp.gate_proj_weight, q(W.mlp_gate_up_device))
-                set_weight_loader(mlp.up_proj_weight, q(W.mlp_gate_up_device))
-                set_weight_loader(mlp.down_proj_weight, q(W.mlp_down_device))
-                for sname in ("gate_weight_scale", "up_weight_scale", "down_weight_scale"):
-                    set_weight_loader(getattr(mlp, sname), scale)
-            else:
-                set_weight_loader(mlp.gate_proj_weight, _loader(lambda t, r: W.mlp_gate_up_device(t[0], r, tp)))
-                set_weight_loader(mlp.up_proj_weight, _loader(lambda t, r: W.mlp_gate_up_device(t[0], r, tp)))
-                set_weight_loader(mlp.down_proj_weight, _loader(lambda t, r: W.mlp_down_device(t[0], r, tp)))
-            if layer.layer_type == FULL_ATTENTION:
-                a = layer.self_attn
-                attn_qkv = lambda t, r: W.attention_qkv_device(t[0], t[1], t[2], cfg, r, tp)
-                gate_dev = lambda t, r: W.attention_gate_device(t, cfg, r, tp)
-                o_dev = lambda t, r: W.attention_o_device(t, cfg, r, tp)
-                if a.fp8:
-                    parts = (a.q_size, a.kv_size, a.kv_size)
-                    set_weight_loader(a.qkv_proj_weight, _loader(
-                        lambda t, r, f=attn_qkv, parts=parts: W.fp8_quantize_parts(
-                            f(t, r), [W.fp8_weight_scale(x) for x in t], parts)))
-                    set_weight_loader(a.qkv_proj_weight_scale, _loader(
-                        lambda t, r: torch.cat([W.fp8_scale_tile(W.fp8_weight_scale(x)) for x in t], dim=1)))
-                    wl, sl = _fp8_loaders(o_dev, 1)
-                    set_weight_loader(a.o_proj_weight, wl)
-                    set_weight_loader(a.o_proj_weight_scale, sl)
-                else:
-                    set_weight_loader(a.qkv_proj_weight, _loader(attn_qkv))
-                    set_weight_loader(a.o_proj_weight, _loader(lambda t, r, f=o_dev: f(t[0], r)))
-                set_weight_loader(a.gate_weight, _loader(lambda t, r, f=gate_dev: f(t[0], r)))
-                qk = _loader(lambda t, r: W.attention_qk_norm_device(t[0], cfg))
-                set_weight_loader(a.q_norm.weight, qk)
-                set_weight_loader(a.k_norm.weight, qk)
-            else:
-                g = layer.linear_attn
-                qkv_dev = lambda t, r: W.gdn_in_proj_qkv_device(t, cfg, r, tp)
-                heads_dev = lambda t, r: W.gdn_in_proj_heads_device(t, r, tp)
-                out_dev = lambda t, r: W.gdn_out_proj_device(t, cfg, r, tp)
-                if g.fp8:
-                    for param, dev_fn, cols in (("in_proj_qkv", qkv_dev, 3), ("in_proj_z", heads_dev, 3),
-                                                ("out_proj", out_dev, 1)):
-                        wl, sl = _fp8_loaders(dev_fn, cols)
-                        set_weight_loader(getattr(g, f"{param}_weight"), wl)
-                        set_weight_loader(getattr(g, f"{param}_weight_scale"), sl)
-                else:
-                    set_weight_loader(g.in_proj_qkv_weight, _loader(lambda t, r, f=qkv_dev: f(t[0], r)))
-                    set_weight_loader(g.in_proj_z_weight, _loader(lambda t, r, f=heads_dev: f(t[0], r)))
-                    set_weight_loader(g.out_proj_weight, _loader(lambda t, r, f=out_dev: f(t[0], r)))
-                head_cols = _loader(lambda t, r, f=heads_dev: f(t[0], r))
-                for wp in (g.in_proj_b_weight, g.in_proj_a_weight):
-                    set_weight_loader(wp, head_cols)
-                set_weight_loader(g.conv_weight, _loader(lambda t, r: W.gdn_conv_device(t[0], cfg, r, tp)))
-                vec = _loader(lambda t, r: W.gdn_head_vector_device(t[0], cfg, r, tp).float())
-                set_weight_loader(g.A_log, vec)
-                set_weight_loader(g.dt_bias, vec)
+        for layer in self.model.layers:
+            _attach_layer_loaders(layer, self.config, self.world_size)
         set_weight_loader(self.model.norm.weight, _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float()))
 
     def _weight_mappings(self) -> dict:
@@ -1280,37 +1365,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             "lm_head.weight": "lm_head.weight",
         }
         for i, layer in enumerate(self.model.layers):
-            pre, ck = f"model.layers.{i}.", f"{CKPT}layers.{i}."
-            m[pre + "input_layernorm.weight"] = ck + "input_layernorm.weight"
-            m[pre + "post_attention_layernorm.weight"] = ck + "post_attention_layernorm.weight"
-            m[pre + "mlp.gate_proj_weight"] = ck + "mlp.gate_proj.weight"
-            m[pre + "mlp.up_proj_weight"] = ck + "mlp.up_proj.weight"
-            m[pre + "mlp.down_proj_weight"] = ck + "mlp.down_proj.weight"
-            if layer.mlp_fp8:
-                for part in ("gate", "up", "down"):
-                    m[pre + f"mlp.{part}_weight_scale"] = ck + f"mlp.{part}_proj.weight"
-            if layer.layer_type == FULL_ATTENTION:
-                s, c = pre + "self_attn.", ck + "self_attn."
-                m[s + "qkv_proj_weight"] = [c + "q_proj.weight", c + "k_proj.weight", c + "v_proj.weight"]
-                m[s + "gate_weight"] = c + "q_proj.weight"
-                m[s + "o_proj_weight"] = c + "o_proj.weight"
-                if layer.self_attn.fp8:
-                    m[s + "qkv_proj_weight_scale"] = m[s + "qkv_proj_weight"]
-                    m[s + "o_proj_weight_scale"] = c + "o_proj.weight"
-                m[s + "q_norm.weight"] = c + "q_norm.weight"
-                m[s + "k_norm.weight"] = c + "k_norm.weight"
-            else:
-                s, c = pre + "linear_attn.", ck + "linear_attn."
-                for part in ("qkv", "z", "b", "a"):
-                    m[s + f"in_proj_{part}_weight"] = c + f"in_proj_{part}.weight"
-                m[s + "conv_weight"] = c + "conv1d.weight"
-                m[s + "A_log"] = c + "A_log"
-                m[s + "dt_bias"] = c + "dt_bias"
-                m[s + "norm_weight"] = c + "norm.weight"
-                m[s + "out_proj_weight"] = c + "out_proj.weight"
-                if layer.linear_attn.fp8:
-                    for part in ("in_proj_qkv", "in_proj_z", "out_proj"):
-                        m[s + f"{part}_weight_scale"] = c + f"{part}.weight"
+            m.update(_layer_weight_mappings(layer, f"model.layers.{i}.", f"{CKPT}layers.{i}."))
         return m
 
     def _materialize_buffers(self) -> None:
