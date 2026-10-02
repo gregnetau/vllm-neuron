@@ -21,9 +21,13 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
 PREFILL_BUCKET=${PREFILL_BUCKET:-1024}
 
 export NEURON_SKIP_EFA_AFFINITY=1                   # trn2.3xlarge has no EFA
-export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.15  # caps the KV/state pool (24 GB HBM per core)
+# KV/state pool = min(free HBM, KV_CAP_FRACTION * GPU_MEM_UTIL * 24 GB) per logical core.
+export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP_FRACTION:-0.15}
 
-NEURON_CONFIG="\"num_batched_tokens_buckets\": [${PREFILL_BUCKET}], \"num_seqs_buckets\": [1]"
+NEURON_CONFIG="\"num_batched_tokens_buckets\": [${PREFILL_BUCKET}], \"num_seqs_buckets\": [${MAX_NUM_SEQS:-1}]"
+if [[ -n "${DECODE_CTX_BUCKETS:-}" ]]; then  # e.g. "4096, 16384, 32768": decode reads only the needed KV
+  NEURON_CONFIG="${NEURON_CONFIG}, \"decode_context_length_buckets\": [${DECODE_CTX_BUCKETS}]"
+fi
 if [[ -n "${HLO2TENSORIZER_OPTIONS+set}" ]]; then  # "" = whole-graph compilation (no modular flow)
   NEURON_CONFIG="${NEURON_CONFIG}, \"hlo2tensorizer_options\": \"${HLO2TENSORIZER_OPTIONS}\""
 fi
@@ -35,14 +39,15 @@ SPEC_ARGS=()
 if [[ -n "${MTP_TOKENS:-}" ]]; then
   SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}")
 fi
+[[ "${ASYNC_SCHEDULING:-1}" == 1 ]] || SPEC_ARGS+=(--no-async-scheduling)
 
 exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --served-model-name "${SERVED_MODEL_NAME:-$(basename "${MODEL}")}" \
   --tensor-parallel-size 4 \
   --max-model-len "${MAX_MODEL_LEN}" \
-  --max-num-seqs 1 \
+  --max-num-seqs "${MAX_NUM_SEQS:-1}" \
   --max-num-batched-tokens "${PREFILL_BUCKET}" \
-  --gpu-memory-utilization 0.65 \
+  --gpu-memory-utilization "${GPU_MEM_UTIL:-0.65}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE:-auto}" \
   --optimization-level "${OPTLEVEL:-1}" \
   "$( [[ "${PREFIX_CACHING:-0}" == 1 ]] && echo --enable-prefix-caching || echo --no-enable-prefix-caching )" \
