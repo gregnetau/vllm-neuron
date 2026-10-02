@@ -107,6 +107,20 @@ def _sigmoid(x, n):
     return r
 
 
+def _rows_load_t(src, nrows, offset, D):
+    """HBM rows src[offset + r*D : ... + D] for r < nrows -> [D, nrows] f32 (column r = row r).
+    One contiguous DMA plus an on-chip transpose instead of an element-strided DMA."""
+    raw = _sb((nrows, D), src.dtype)
+    nisa.dma_copy(dst=raw, src=src.ap(pattern=[[D, nrows], [1, D]], offset=offset))
+    f32 = _sb((nrows, D))
+    nisa.tensor_copy(dst=f32, src=raw)
+    ps = _ps((D, nrows))
+    nisa.nc_transpose(dst=ps, data=f32)
+    out = _sb((D, nrows))
+    nisa.tensor_copy(dst=out, src=ps)
+    return out
+
+
 def _silu(x, n):
     y = _sb((128, n))
     nisa.tensor_tensor(dst=y, data1=x, data2=_sigmoid(x, n), op=nl.multiply)
@@ -119,11 +133,11 @@ def gdn_decode_kernel(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, s
     """mixed [B, C] / z [B, Hv*D] / b, a [B, Hv] (bf16 projections); conv_w [C, K] bf16;
     A_log, dt_bias [Hv] f32; norm_w [D]; state_a/b [P, R, 128] f32 (updated in place);
     slots [B] int32. Returns (out [B, Hv*D] bf16, state_a, state_b)."""
-    # rev 10: the NKI compile cache keys on this function's source only; bump on helper edits.
+    # rev 11: the NKI compile cache keys on this function's source only; bump on helper edits.
     B, C = mixed.shape
     D = norm_w.shape[0]
     Hv = z.shape[1] // D
-    K = conv_w.shape[1]
+    K = conv_w.shape[1] * 128 // C if conv_w.shape[0] == 128 else conv_w.shape[1]
     Hk = (C - Hv * D) // (2 * D)
     rep = Hv // Hk
     P, R, W = state_a.shape
@@ -150,7 +164,10 @@ def gdn_decode_kernel(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, s
     ones = _sb((128, 128))
     nisa.memset(ones, 1.0)
     w_raw = _sb((128, NCB, K), conv_w.dtype)  # w[p, f, j] = conv_w[f*128 + p, j]
-    nisa.dma_copy(dst=w_raw, src=conv_w.ap(pattern=[[K, 128], [D * K, NCB], [1, K]], offset=0))
+    if conv_w.shape[0] == 128:  # pre-laid out [128, NCB * K] (contiguous per partition)
+        nisa.dma_copy(dst=w_raw, src=conv_w.reshape((128, NCB, K)))
+    else:
+        nisa.dma_copy(dst=w_raw, src=conv_w.ap(pattern=[[K, 128], [D * K, NCB], [1, K]], offset=0))
     w = _sb((128, NCB, K))
     nisa.tensor_copy(dst=w, src=w_raw)
     normw = _cols_load(norm_w, 1, 0, D)            # [128, 1]
@@ -176,10 +193,10 @@ def gdn_decode_kernel(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, s
         cs_rows = _sb((CR, D))
         nisa.dma_copy(dst=cs_rows, src=_page_ap(conv_view, slot, conv_off, [[D, CR], [1, D]]),
                       dge_mode=nisa.dge_mode.hwdge, oob_mode=oob_mode.skip)
-        x = _cols_load(mixed, NCB, bi * C, D)       # x[p, f] = mixed[bi, f*128 + p]
+        x = _rows_load_t(mixed, NCB, bi * C, D)     # x[p, f] = mixed[bi, f*128 + p]
         a_b = _bcast_load(a, hp, bi * Hv + h0)
         b_b = _bcast_load(b, hp, bi * Hv + h0)
-        zl = _cols_load(z, hp, bi * Hv * D + h0 * D, D)
+        zl = _rows_load_t(z, hp, bi * Hv * D + h0 * D, D)
 
         # ---- gating first (softplus table, then everything exp-based, then rsqrt):
         # decay = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b)
@@ -293,9 +310,13 @@ def gdn_decode_kernel(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, s
         on = _sb((128, hp))
         nisa.tensor_tensor(dst=on, data1=o, data2=rr, op=nl.multiply)
         nisa.tensor_scalar(dst=on, data=on, op0=nl.multiply, operand0=normw)
-        res = _sb((128, hp), out.dtype)
+        res = _sb((128, hp))
         nisa.tensor_tensor(dst=res, data1=on, data2=zs, op=nl.multiply)
-        nisa.dma_copy(dst=out.ap(pattern=[[1, D], [D, hp]], offset=bi * Hv * D + h0 * D), src=res)
+        res_ps = _ps((hp, 128))                     # rows = heads: one contiguous store
+        nisa.nc_transpose(dst=res_ps, data=res)
+        res_t = _sb((hp, 128), out.dtype)
+        nisa.tensor_copy(dst=res_t, src=res_ps)
+        nisa.dma_copy(dst=out.ap(pattern=[[D, hp], [1, D]], offset=bi * Hv * D + h0 * D), src=res_t)
 
     return out, state_a, state_b
 
