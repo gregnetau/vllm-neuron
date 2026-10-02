@@ -745,12 +745,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return self._finish(o, z, T)
 
     # -- decode: B requests x 1 token, each with its own state page ---------------------
-    def _use_decode_kernel(self, x: torch.Tensor) -> bool:
+    def _use_decode_kernel(self, x: torch.Tensor, max_requests: int = 1) -> bool:
         """Fused NKI decode (gdn_kernels.gdn_decode) needs the [pages, rows, 128] state view
         and head_dim == 128; NKI availability per can_run_kernel (VLLM_NEURON_DISABLE_NKI_KERNELS)."""
         if x.device.type == "cpu" or self.state_a is None or self.state_a.dim() != 3:
             return False
-        if x.shape[0] != 1:  # B > 1 needs a core barrier around the conv-state update
+        if x.shape[0] > max_requests:  # gdn_decode: B > 1 needs a core barrier around the conv-state update
             return False
         if not (self.Dk == self.Dv == self._STATE_ROW == self.state_a.shape[-1]):
             return False
@@ -771,6 +771,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         o = gdn_decode(mixed, z, b, a, self.conv_weight, self.A_log, self.dt_bias, self.norm_weight,
                        self.state_a, self.state_b, slots, self.config.rms_norm_eps)
         return self._out_proj(o)
+
+    def use_fused_decode(self, x: torch.Tensor) -> bool:
+        """Whole sub-layer decode kernel (gdn_kernels.gdn_decode_fp8: input norm, FP8 projections,
+        recurrence, out_proj) for up to fp8_kernels.MAX_TOKENS single-token requests."""
+        from .fp8_kernels import MAX_TOKENS
+
+        if not self.fp8 or x.shape[0] > MAX_TOKENS or self.Hk % 2 or (self.Hv // 2) % (self.Hv // self.Hk):
+            return False
+        if getattr(self, "ba_decode", None) is None:
+            return False
+        return self._use_decode_kernel(x, max_requests=MAX_TOKENS)
+
+    def prepare_decode_layout(self):
+        """Weights re-laid out for the fused decode kernel (after loading)."""
+        if self.fp8:
+            from .gdn_kernels import gdn_ba_decode_layout
+
+            self.ba_decode = gdn_ba_decode_layout(self.in_proj_b_weight.data, self.in_proj_a_weight.data)
+
+    def decode_fused(self, hidden_states, md, input_layernorm):
+        """hidden_states [B, H] pre-norm -> mixer output [B, H] (all-reduced)."""
+        from .gdn_kernels import gdn_decode_fp8
+
+        slots = md["block_table_tensor"][:, 0].clamp(min=0).to(torch.int32)  # padded rows (-1) -> null block 0
+        assert hidden_states.shape[0] == slots.shape[0], "GDN decode supports one token per request"
+        out = gdn_decode_fp8(
+            hidden_states.to(self.dtype), input_layernorm.weight, self.in_proj_qkv_weight, self.in_proj_z_weight,
+            self.ba_decode, self.in_proj_qkv_weight_scale,
+            self.in_proj_z_weight_scale, self.in_proj_input_scale, self.conv_weight, self.A_log, self.dt_bias,
+            self.norm_weight, self.state_a, self.state_b, slots, self.out_proj_weight, self.out_proj_weight_scale,
+            self.out_proj_input_scale, input_layernorm.variance_epsilon, self.config.rms_norm_eps,
+        ).to(self.dtype)
+        if self.world_size > 1:  # >>> PARALLELISM: TP all-reduce <<<
+            self.tp_group.all_reduce(out)
+        return out
 
     def _decode_torch(self, hidden_states, md):
         slots = md["block_table_tensor"][:, 0].long().clamp(min=0)  # [B]; padded rows (-1) -> null block 0
@@ -969,8 +1004,11 @@ class Qwen3_5DecoderLayer(nn.Module):
         is_decode = md["max_query_len"] <= md["decode_token_threshold"]
 
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.mixer(hidden_states, positions, position_embeddings, attn_metadata)
+        if is_decode and self.layer_type != FULL_ATTENTION and self.linear_attn.use_fused_decode(hidden_states):
+            hidden_states = self.linear_attn.decode_fused(hidden_states, md, self.input_layernorm)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.mixer(hidden_states, positions, position_embeddings, attn_metadata)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1283,6 +1321,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 rank_sharded[name] = tensor.to(target)
         self.load_state_dict(rank_sharded, strict=False, assign=True)
         self._load_fp8_activation_scales(checkpoint_path)
+        self._prepare_decode_layouts()
+
+    def _prepare_decode_layouts(self) -> None:
+        for layer in self.model.layers:
+            if layer.layer_type == LINEAR_ATTENTION:
+                layer.linear_attn.prepare_decode_layout()
 
     def _fp8_modules(self):
         """(layer index, module) for every static-FP8 module with input scales."""
@@ -1321,3 +1365,4 @@ class Qwen3_5ForCausalLM(nn.Module):
         """CPU-compile path: no KV-cache scales to load for BF16; only buffers need real data."""
         self._materialize_buffers()
         self._load_fp8_activation_scales(checkpoint_path)
+        self._prepare_decode_layouts()

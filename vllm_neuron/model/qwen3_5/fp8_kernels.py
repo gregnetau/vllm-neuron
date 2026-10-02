@@ -92,6 +92,62 @@ def _stream_pass(ps, subs, xq, wv, c0, KT, sw, wdtype):
                                moving=wt[:, kc - 1, n0:n0 + nb], accumulate=(k0 + kc - 1) > 0)
 
 
+def _bank_pieces(lc, width):
+    """[[col, n]] splitting columns [lc, lc + width) of a [*, banks, 512] PSUM tile at banks."""
+    out = []
+    c = lc
+    for _ in range(width):
+        if c >= lc + width:
+            break
+        n = min(lc + width, (c // _NB + 1) * _NB) - c
+        out.append([c, n])
+        c = c + n
+    return out
+
+
+def _matmul_tile(ps, lc, xq, wt, k0, kc, width):
+    """ps (flat columns over [TP, banks, 512]) [lc, lc + width) (+)= sum over k0 + [0, kc) of
+    xq[:, k, :].T @ wt[:, k - k0, :] (wt [P, kc, width] in SBUF; accumulates when k0 > 0)."""
+    pieces = _bank_pieces(lc, width)
+    for j in range(kc // 2):
+        for pi in range(len(pieces)):
+            col = pieces[pi][0]
+            n = pieces[pi][1]
+            nisa.nc_matmul(dst=ps[:, col // _NB, col % _NB:col % _NB + n],
+                           stationary=xq[:, k0 + 2 * j:k0 + 2 * j + 2, :],
+                           moving=wt[:, 2 * j:2 * j + 2, col - lc:col - lc + n],
+                           accumulate=(k0 + 2 * j) > 0, perf_mode=nisa.matmul_perf_mode.double_row)
+    if kc % 2 == 1:
+        for pi in range(len(pieces)):
+            col = pieces[pi][0]
+            n = pieces[pi][1]
+            nisa.nc_matmul(dst=ps[:, col // _NB, col % _NB:col % _NB + n], stationary=xq[:, k0 + kc - 1, :],
+                           moving=wt[:, kc - 1, col - lc:col - lc + n], accumulate=(k0 + kc - 1) > 0)
+
+
+def _stream_segment(ps, lc, xq, wv, c0, width, KT, wdtype):
+    """ps (flat columns over [TP, banks, 512]) [lc, lc + width) = xq.T @ wv[:, :, c0:c0 + width]:
+    weight DMAs cover the whole segment width (chunked along K), matmuls split at PSUM banks."""
+    kc_max = max(2, (_CHUNK_BYTES // (_P * width)) // 2 * 2)
+    chunks = _ranges(KT, kc_max)
+    for ci in range(len(chunks)):
+        k0 = chunks[ci][0]
+        kc = chunks[ci][1] - k0
+        wt = _sb((_P, kc, width), wdtype)
+        nisa.dma_copy(dst=wt, src=wv[:, k0:k0 + kc, nl.ds(c0, width)])
+        _matmul_tile(ps, lc, xq, wt, k0, kc, width)
+
+
+def _evacuate_segment(dst, ps, lc, width, osc, T):
+    """dst[T, lc:lc + width] = ps(flat columns)[0:T, lc:lc + width] * osc."""
+    pieces = _bank_pieces(lc, width)
+    for pi in range(len(pieces)):
+        col = pieces[pi][0]
+        n = pieces[pi][1]
+        nisa.tensor_scalar(dst=dst[:, col:col + n], data=ps[0:T, col // _NB, col % _NB:col % _NB + n],
+                           op0=nl.multiply, operand0=osc[0:T, :])
+
+
 def _evacuate(dst, ps, subs, osc, T):
     """dst[T, sw] = ps[0:T] * osc."""
     for si in range(len(subs)):
