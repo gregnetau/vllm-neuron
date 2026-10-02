@@ -98,6 +98,25 @@ def _fp8_linear(x, weight, weight_scale, input_scale, d_head: int = 128):
     ).squeeze(0)
 
 
+def _out_proj_tkg(x, weight, weight_scale=None, input_scale=None, d_head: int = 128):
+    """x [T, N*d_head] @ weight [N*d_head, H] with the token-generation output-projection kernel
+    (T <= 128; BF16, or static FP8 when scales are given). NF.o_proj always uses the context
+    kernel, which is slower for a few tokens. Returns None where the kernel does not apply."""
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    T, ND = x.shape
+    if T > 128 or ND % d_head or not can_run_kernel(x):
+        return None
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+    from nkilib.core.output_projection.output_projection_tkg import output_projection_tkg
+    from nkilib.core.utils.common_types import QuantizationType
+
+    attention = x.reshape(T, ND // d_head, d_head).permute(2, 0, 1).unsqueeze(-1)  # [D, B=T, N, S=1]
+    quant = QuantizationType.STATIC if weight_scale is not None else QuantizationType.NONE
+    return wrap_nki(output_projection_tkg)[2](attention.contiguous(), weight, None, quant,
+                                              weight_scale, input_scale)
+
+
 def _fp8_out_proj(x, weight, weight_scale, input_scale, n_heads: int, d_head: int):
     """x [T, n_heads*d_head] @ weight [n_heads*d_head, H] in static FP8 (output-projection kernel)."""
     from nkilib.core.utils.common_types import QuantizationType
@@ -250,10 +269,27 @@ class Qwen3_5Attention(nn.Module):
         gate = (hidden_states @ self.gate_weight).view(T, self.num_attention_heads_per_rank, self.head_dim)
         return torch.sigmoid(gate.float()).permute(1, 2, 0)
 
+    def _gate_proj_decode(self, hidden_states):
+        """Output-gate projection for decode: the BF16 projection kernel (TKG) streams the
+        weight faster than the XLA matmul for a few tokens."""
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        if can_run_kernel(hidden_states):
+            return NF.qkv_proj(hidden=hidden_states.unsqueeze(0), qkv_weights=self.gate_weight, bias=None,
+                               d_head=128, num_q_heads=self.gate_weight.shape[1] // 128 - 2,
+                               num_kv_heads=1).squeeze(0)
+        return hidden_states @ self.gate_weight
+
     def _o_proj(self, attn):
         """attn [B, Nh, Dh, S] -> [B, S, H]. Viewed as [B, Nh*Dh/128, 128, S] (same contraction)
         so the output-projection kernel applies at head_dim 256."""
         B, Nh, Dh, S = attn.shape
+        if B * S <= 128 and Dh % 128 == 0:  # decode: token-generation kernel on [B*S, Nh*Dh]
+            flat = attn.permute(0, 3, 1, 2).reshape(B * S, Nh * Dh)
+            y = _out_proj_tkg(flat, self.o_proj_weight, self.o_proj_weight_scale if self.fp8 else None,
+                              self.o_input_scale if self.fp8 else None)
+            if y is not None:
+                return y.reshape(B, S, -1)
         if Dh > 128 and Dh % 128 == 0:
             attn = attn.reshape(B, Nh * Dh // 128, 128, S)
         if self.fp8:
@@ -453,7 +489,7 @@ class Qwen3_5Attention(nn.Module):
             **self._decode_quant_kwargs(),
         )
 
-        gate = (hidden_states @ self.gate_weight).view(
+        gate = self._gate_proj_decode(hidden_states).view(
             B, S_decode, self.num_attention_heads_per_rank, self.head_dim
         ).permute(0, 2, 3, 1)  # [B, Nh, Dh, S]
         attn = (attn.float() * torch.sigmoid(gate.float()) / self.v_scale_float).to(self.dtype)
@@ -618,6 +654,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _out_proj(self, o):
         if self.fp8:
+            y = _out_proj_tkg(o, self.out_proj_weight, self.out_proj_weight_scale, self.out_proj_input_scale)
+            if y is not None:
+                return y
             return _fp8_out_proj(o, self.out_proj_weight, self.out_proj_weight_scale,
                                  self.out_proj_input_scale, self.Hv, self.Dv)
         return o @ self.out_proj_weight
