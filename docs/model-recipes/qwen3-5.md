@@ -101,6 +101,18 @@ for example `["layers.30.linear_attn", "layers.59.mlp"]`. For prefills above 128
 FP8 MLP runs as two kernel calls over halves of the intermediate dimension, since the full
 width exceeds the kernel's limit for this model.
 
+### Compilation
+
+`OPTLEVEL` (`--optimization-level`, default 1) and `HLO2TENSORIZER_OPTIONS` (`""` compiles the
+whole graph instead of modular flow) are exposed by `serve.sh`. Measured in BF16 at
+`max_model_len` 2048:
+
+| Compile settings | TTFT | TPOT | Cold compile |
+|---|---|---|---|
+| `-O1`, modular flow (default) | 368 ms | 27.2 ms | 4 min |
+| `-O3`, modular flow | 355 ms | 26.7 ms | 40 min |
+| `-O3`, whole graph | 353 ms | 26.7 ms | 39 min |
+
 ## Performance
 
 `trn2.3xlarge`, TP=4, batch 1, greedy, measured with
@@ -146,16 +158,20 @@ the hybrid KV-cache-group plumbing for this plugin, the per-core HBM sizing for 
 prefill, and the latency methodology this recipe follows. This implementation was developed
 in parallel on the same base and is measured against #54 as the reference:
 
-| Same instance and client; 27B BF16, TP=4, `max_model_len` 2048, 1024 / 128 tokens | #54 | This implementation |
-|---|---|---|
-| TTFT | 277 ms | 350 ms |
-| TPOT | 48.6 ms | 41.6 ms |
-| Cold compile | 37 min | 4 min |
+| Same instance and client; 27B, TP=4, `max_model_len` 2048, 1024 / 128 tokens | #54 (BF16) | This implementation (BF16) | This implementation (FP8) |
+|---|---|---|---|
+| TTFT | 277 ms | 368 ms | 395 ms |
+| TPOT | 48.6 ms | 27.2 ms | 21.8 ms |
+| Cold compile | 37 min | 4 min | 12 min |
 
 The decode and compile differences come from the GDN state-page layout and DMA pattern, the
-fused NKI decode kernel, and compiling at the default optimization level with modular flow
-enabled. #54 has the faster prefill. The intent is to converge with #54 rather than to
-propose a competing implementation.
+fused NKI decode kernel, clearing recycled KV blocks in the runner rather than in the decode
+graph, and compiling at the default optimization level with modular flow enabled. #54 has the
+faster prefill: its prefill graph executes in 267 ms against 357 ms here, with more matmul
+instructions, and the difference persists with this implementation compiled the same way
+(`-O3`, whole graph). Both implementations replaced the power-series intra-chunk inverse with
+blocked inversion after finding it unstable on device. The intent is to converge with #54
+rather than to propose a competing implementation.
 
 ## Roadmap
 
