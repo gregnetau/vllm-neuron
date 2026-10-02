@@ -121,7 +121,7 @@ whole graph instead of modular flow) are exposed by `serve.sh`. Measured in BF16
 | Configuration | Prompt / output tokens | TTFT | TPOT |
 |---|---|---|---|
 | BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 368 ms | 27.2 ms |
-| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 21.8 ms |
+| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 20.9 ms |
 | FP8 + FP8 KV cache, same | 1024 / 128 | 407 ms | 23.1 ms |
 
 
@@ -161,7 +161,7 @@ in parallel on the same base and is measured against #54 as the reference:
 | Same instance and client; 27B, TP=4, `max_model_len` 2048, 1024 / 128 tokens | #54 (BF16) | This implementation (BF16) | This implementation (FP8) |
 |---|---|---|---|
 | TTFT | 277 ms | 368 ms | 395 ms |
-| TPOT | 48.6 ms | 27.2 ms | 21.8 ms |
+| TPOT | 48.6 ms | 27.2 ms | 20.9 ms |
 | Cold compile | 37 min | 4 min | 12 min |
 
 The decode and compile differences come from the GDN state-page layout and DMA pattern, the
