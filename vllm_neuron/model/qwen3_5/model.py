@@ -278,6 +278,15 @@ class Qwen3_5Attention(nn.Module):
         gate = (hidden_states @ self.gate_weight).view(T, self.num_attention_heads_per_rank, self.head_dim)
         return torch.sigmoid(gate.float()).permute(1, 2, 0)
 
+    def _attention_block_kernel(self):
+        """Vendored attention_block_tkg returning the new K token as [B*S, Dh] rows (one KV head
+        per rank, head_dim > 128); the library kernel writes it one element per descriptor."""
+        if self.num_key_value_heads_per_rank != 1 or self.head_dim <= 128:
+            return None
+        from .attention_block_tkg import attention_block_tkg_k_rows_kernel
+
+        return attention_block_tkg_k_rows_kernel
+
     def _gate_proj_decode(self, hidden_states):
         """Output-gate projection for decode: the BF16 projection kernel (TKG) streams the
         weight faster than the XLA matmul for a few tokens."""
@@ -500,7 +509,7 @@ class Qwen3_5Attention(nn.Module):
             W_out=None, bias_out=None, transposed_out=False, out_in_sb=False,
             k_scale=self.k_scale, v_scale=self.v_scale,
             attention_dp=1, attention_dp_group=None, attention_dp_rank=0, kv_needs_a2a=False,
-            **self._decode_quant_kwargs(),
+            block_kernel=self._attention_block_kernel(), **self._decode_quant_kwargs(),
         )
 
         gate = self._gate_proj_decode(hidden_states).view(
@@ -513,8 +522,11 @@ class Qwen3_5Attention(nn.Module):
         block_indices = slot_mapping // block_size
         position_indices = slot_mapping % block_size
         num_tokens = slot_mapping.shape[0]
-        k_new = (K_new.permute(1, 2, 0).reshape(B, nkh, S_decode, self.head_dim)
-                 .transpose(0, 1).reshape(nkh, B * S_decode, self.head_dim))
+        if K_new.dim() == 2:  # [B*S, Dh] rows (kv heads == 1)
+            k_new = K_new.reshape(nkh, B * S_decode, self.head_dim)
+        else:  # [Dh, B, S] / [Dh, B, nkh, S]
+            k_new = (K_new.permute(1, 2, 0).reshape(B, nkh, S_decode, self.head_dim)
+                     .transpose(0, 1).reshape(nkh, B * S_decode, self.head_dim))
         v_new = V_new.transpose(0, 1).reshape(-1, self.head_dim)
         head_idx = torch.arange(nkh, dtype=torch.long, device=hidden_states.device
                                 ).repeat_interleave(num_tokens)
