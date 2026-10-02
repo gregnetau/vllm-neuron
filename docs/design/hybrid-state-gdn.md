@@ -60,7 +60,11 @@ program's heads.
 - **Decode**: `gdn_kernels.gdn_decode` runs the conv step, q/k L2 norm, gating, the gated
   delta rule, the gated RMSNorm and the in-place page update in one NKI kernel. Heads are
   split across the two programs of a logical core; page DMAs use a runtime page offset with
-  hardware descriptor generation. Other cases use the PyTorch ops in `gdn_ops`.
+  hardware descriptor generation. With static FP8, `gdn_kernels.gdn_decode_fp8` runs the
+  whole sub-layer instead (input RMSNorm, projections, the step above, `out_proj`): each
+  program owns half the value heads and the key heads they read, and updates only its own
+  state and conv rows, so it needs no core barrier and supports up to 32 requests. Other cases
+  use the PyTorch ops in `gdn_ops`.
 - State writes are in place (`index_copy_` on the bound views, or the kernel's aliased
   outputs). The runner's block tables use `-1` for unused entries; the model maps them to
   the null block before indexing.
@@ -101,13 +105,21 @@ With `neuron_config.quantization="fp8"`, weights are quantized per tensor at loa
 activations use static scales from an offline calibration file
 (`neuron_config.fp8_activation_scales_path`).
 
-| Module | Kernel |
-|---|---|
-| MLP | `NF.mlp` STATIC, post-attention RMSNorm fused (as in the Llama static-FP8 path) |
-| GDN `in_proj_qkv`, `in_proj_z` | `NF.qkv_proj` STATIC as a generic projection (one scale for all parts) |
-| GDN `out_proj` | `NF.o_proj` STATIC |
-| Attention q / k / v | `NF.qkv_proj` STATIC (prefill), `NF.attention_decode` STATIC QKV (decode); one scale per part |
-| Attention `o_proj` | `NF.o_proj` STATIC on `[B, Nh*Dh/128, 128, S]` (head_dim 256 exceeds the kernel's 128) |
+| Module | Prefill | Decode (<= 32 tokens) |
+|---|---|---|
+| MLP | `NF.mlp` STATIC, post-attention RMSNorm fused (as in the Llama static-FP8 path) | `fp8_kernels.fp8_mlp_decode` |
+| GDN `in_proj_qkv`, `in_proj_z` | `NF.qkv_proj` STATIC as a generic projection (one scale for all parts) | `gdn_kernels.gdn_decode_fp8` |
+| GDN `out_proj` | `NF.o_proj` STATIC | `gdn_kernels.gdn_decode_fp8` |
+| Attention q / k / v | `NF.qkv_proj` STATIC; one scale per part | `NF.attention_decode` STATIC QKV |
+| Attention `o_proj` | `NF.o_proj` STATIC on `[B, Nh*Dh/128, 128, S]` (head_dim 256 exceeds the kernel's 128) | `fp8_kernels.fp8_matvec` |
+
+The decode kernels keep the activation as the stationary matmul operand (one column per token,
+zero-padded to 32) and stream the weights as the moving operand in FP8 double-row mode, which
+consumes 256 contraction rows per Tensor Engine cycle; for a single token that rate, about
+300 GB/s of FP8 weight per physical core, is the bound rather than HBM. Weight DMAs cover
+whole rows of each PSUM pass and are chunked along the contraction so matmuls start early;
+weights a later stage needs (GDN `in_proj_z`, `out_proj`) are loaded while the recurrence
+runs.
 
 The attention output gate stays BF16. `NF.mlp` falls back to PyTorch, without quantization,
 where its kernel does not apply (CTE with intermediate size per rank above 4096 and hidden

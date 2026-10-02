@@ -37,7 +37,8 @@ rotary). This recipe serves the text tower; the vision tower and the MTP head ar
 | | FP8 KV cache (unit KV scales) | ✅ |
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
 | | Pipeline / context parallelism | ❌ |
-| **Performance** | Fused NKI GDN decode kernel (batch 1) | ✅ |
+| **Performance** | Fused NKI GDN decode kernel (BF16: batch 1; FP8: whole sub-layer, batch <= 32) | ✅ |
+| | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
 | | Segmented prefill (`max_model_len` > prefill bucket) | ✅ |
 | | Prefix caching | ❌ |
 | | Multi-token prediction (MTP) | ❌ |
@@ -101,6 +102,22 @@ for example `["layers.30.linear_attn", "layers.59.mlp"]`. For prefills above 128
 FP8 MLP runs as two kernel calls over halves of the intermediate dimension, since the full
 width exceeds the kernel's limit for this model.
 
+Decode (up to 32 tokens) uses the model's own NKI kernels (`fp8_kernels.py`,
+`gdn_kernels.py`), which stream FP8 weights through the Tensor Engine in double-row mode with
+the activation quantized in the kernel:
+
+| Kernel | Fuses |
+|---|---|
+| `fp8_mlp_decode` | post-attention RMSNorm, gate / up, SiLU-mul, down |
+| `gdn_decode_fp8` | input RMSNorm, `in_proj` (q / k / v / z, b / a), conv, delta rule, state update, gated norm, `out_proj` |
+| `fp8_matvec` | attention `o_proj` |
+
+Each kernel splits its work over the two logical-core programs by output columns or by heads,
+so no core barrier is needed. `examples/vllm_neuron/models/qwen3_5/check_fp8_kernels.py`
+compares them against a PyTorch FP8 emulation on device. Decode attention uses a vendored copy
+of the library `attention_block_tkg` (`attention_block_tkg.py`) that returns the new K token
+as rows; the library writes it one element per DMA descriptor at `head_dim` 256.
+
 ### Compilation
 
 `OPTLEVEL` (`--optimization-level`, default 1) and `HLO2TENSORIZER_OPTIONS` (`""` compiles the
@@ -116,13 +133,19 @@ whole graph instead of modular flow) are exposed by `serve.sh`. Measured in BF16
 ## Performance
 
 `trn2.3xlarge`, TP=4, batch 1, greedy, measured with
-`examples/vllm_neuron/models/qwen3_5/benchmark_serve.py` (mean of 3 rounds after a warmup).
+`examples/vllm_neuron/models/qwen3_5/benchmark_serve.py` (mean of 5 rounds after a warmup).
 
 | Configuration | Prompt / output tokens | TTFT | TPOT |
 |---|---|---|---|
-| BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 368 ms | 27.2 ms |
-| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 20.9 ms |
-| FP8 + FP8 KV cache, same | 1024 / 128 | 407 ms | 23.1 ms |
+| BF16, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 369 ms | 26.6 ms |
+| FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 17.7 ms |
+
+FP8 decode per token on device: 48 GDN layers at 0.099 ms, 64 MLPs at 0.123 ms, 16 attention
+layers at 0.140 ms, 1.0 ms for the BF16 `lm_head` and 1.7 ms for the 132 TP all-reduces. The
+FP8 kernels stream weights at about 600 GB/s per logical core, close to the rate the Tensor
+Engine consumes FP8 weights for a single token; the attention layer and the per-layer
+collectives are the remaining overheads. FP8 KV cache (`KV_CACHE_DTYPE=fp8`) was measured at
+23.1 ms before the FP8 decode kernels and has not been re-measured.
 
 
 Cold compilation of the `max_model_len` 2048 configuration takes about 4 minutes in BF16 and
@@ -135,13 +158,14 @@ Hugging Face reference with cosine similarity >= 0.9999. Static FP8 MLP outputs 
 BF16 reference with cosine similarity >= 0.998 per layer. Against the Hugging Face reference
 on real activations, FP8 layer outputs have relative errors of 1-7% (GDN), 1-6% (MLP) and
 1-2.5% (full attention). With all FP8 modules, greedy 64-token continuations of 12 prompts
-match BF16 exactly for 3 prompts, with a mean identical prefix of 31 tokens; divergent
-continuations remain coherent. A task-level evaluation is in progress (see [Roadmap](#roadmap)).
+match BF16 exactly for 2-3 prompts, with a mean identical prefix of 29-31 tokens; divergent
+continuations remain coherent. The FP8 decode kernels quantize the same tensors with the same
+scales as the library kernels they replace and leave this agreement unchanged. A task-level evaluation is in progress (see [Roadmap](#roadmap)).
 
 ## Known limitations
 
-- **Batch size 1 for the fused GDN decode kernel.** Larger decode batches fall back to the
-  PyTorch GDN path.
+- **Batch size 1 for the BF16 fused GDN decode kernel.** Larger BF16 decode batches fall back
+  to the PyTorch GDN path (the FP8 kernel supports up to 32 requests).
 - **Full-attention prefill falls back to PyTorch** when segmented prefill is active
   (`head_dim` 256 exceeds the segmented attention kernel's limit of 128).
 - **`on_device_sampling_config.all_greedy` returns invalid token ids** with this model;
@@ -160,8 +184,8 @@ in parallel on the same base and is measured against #54 as the reference:
 
 | Same instance and client; 27B, TP=4, `max_model_len` 2048, 1024 / 128 tokens | #54 (BF16) | This implementation (BF16) | This implementation (FP8) |
 |---|---|---|---|
-| TTFT | 277 ms | 368 ms | 395 ms |
-| TPOT | 48.6 ms | 27.2 ms | 20.9 ms |
+| TTFT | 277 ms | 369 ms | 395 ms |
+| TPOT | 48.6 ms | 26.6 ms | 17.7 ms |
 | Cold compile | 37 min | 4 min | 12 min |
 
 The decode and compile differences come from the GDN state-page layout and DMA pattern, the
