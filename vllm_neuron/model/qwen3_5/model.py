@@ -790,7 +790,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def use_fused_decode(self, x: torch.Tensor) -> bool:
         """Whole sub-layer decode kernel (gdn_kernels.gdn_decode_fp8: input norm, FP8 projections,
-        recurrence, out_proj) for up to fp8_kernels.MAX_TOKENS single-token requests."""
+        recurrence, out_proj) for up to fp8_kernels.MAX_TOKENS tokens (requests x tokens each)."""
         from .fp8_kernels import MAX_TOKENS
 
         if not self.fp8 or x.shape[0] > MAX_TOKENS or self.Hk % 2 or (self.Hv // 2) % (self.Hv // self.Hk):
@@ -807,17 +807,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.ba_decode = gdn_ba_decode_layout(self.in_proj_b_weight.data, self.in_proj_a_weight.data)
 
     def decode_fused(self, hidden_states, md, input_layernorm):
-        """hidden_states [B, H] pre-norm -> mixer output [B, H] (all-reduced)."""
+        """hidden_states [B*S, H] pre-norm (S tokens per request; S > 1 with MTP, where the
+        state starts from block state_in and the state after token j goes to block j) ->
+        mixer output [B*S, H] (all-reduced)."""
         from .gdn_kernels import gdn_decode_fp8
 
-        slots = md["block_table_tensor"][:, 0].clamp(min=0).to(torch.int32)  # padded rows (-1) -> null block 0
-        assert hidden_states.shape[0] == slots.shape[0], "GDN decode supports one token per request"
+        bt = md["block_table_tensor"].clamp(min=0).to(torch.int32)  # padded rows (-1) -> null block 0
+        B = bt.shape[0]
+        S = hidden_states.shape[0] // B
+        assert hidden_states.shape[0] == B * S, "GDN decode: the same number of tokens per request"
+        slots_out = bt[:, :S].contiguous()
+        if "state_in" in md:
+            slots_in = bt.gather(1, md["state_in"].long().view(B, 1)).view(B)
+        else:
+            slots_in = bt[:, 0].contiguous()
         out = gdn_decode_fp8(
             hidden_states.to(self.dtype), input_layernorm.weight, self.in_proj_qkv_weight, self.in_proj_z_weight,
             self.ba_decode, self.in_proj_qkv_weight_scale,
             self.in_proj_z_weight_scale, self.in_proj_input_scale, self.conv_weight, self.A_log, self.dt_bias,
-            self.norm_weight, self.state_a, self.state_b, slots, self.out_proj_weight, self.out_proj_weight_scale,
-            self.out_proj_input_scale, input_layernorm.variance_epsilon, self.config.rms_norm_eps,
+            self.norm_weight, self.state_a, self.state_b, slots_in, slots_out, self.out_proj_weight,
+            self.out_proj_weight_scale, self.out_proj_input_scale, input_layernorm.variance_epsilon,
+            self.config.rms_norm_eps,
         ).to(self.dtype)
         if self.world_size > 1:  # >>> PARALLELISM: TP all-reduce <<<
             self.tp_group.all_reduce(out)
@@ -1047,8 +1057,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         is_decode = md["max_query_len"] <= md["decode_token_threshold"]
 
         residual = hidden_states
-        if (is_decode and self.layer_type != FULL_ATTENTION and "state_in" not in md
-                and self.linear_attn.use_fused_decode(hidden_states)):
+        if is_decode and self.layer_type != FULL_ATTENTION and self.linear_attn.use_fused_decode(hidden_states):
             hidden_states = self.linear_attn.decode_fused(hidden_states, md, self.input_layernorm)
         else:
             hidden_states = self.input_layernorm(hidden_states)
