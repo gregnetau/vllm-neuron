@@ -40,7 +40,7 @@ rotary). This recipe serves the text tower; the vision tower and the MTP head ar
 | **Performance** | Fused NKI GDN decode kernel (BF16: batch 1; FP8: whole sub-layer, batch <= 32) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
 | | Segmented prefill (`max_model_len` > prefill bucket) | ✅ |
-| | Prefix caching | ❌ |
+| | Prefix caching (1024-token blocks, Mamba `align` mode) | ✅ |
 | | Multi-token prediction (MTP) | ❌ |
 | **Compilation** | torch.compile (XLA backend) | ✅ |
 | | CPU mode (unit tests) | ✅ |
@@ -64,10 +64,30 @@ The script sets the required options:
 - `--gpu-memory-utilization 0.65` and `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.15`: HBM is
   24 GB per logical core and the 27B weights take 13.5 GB per rank. A larger KV budget is
   filled with recurrent-state pages and the graph is rejected (`NCC_EVRF009`).
-- `--no-enable-prefix-caching`: GDN layers have no reusable prefix state.
+- `--no-enable-prefix-caching` unless `PREFIX_CACHING=1` (see below).
 - `--limit-mm-per-prompt '{"image": 0, "video": 0}'`: text-only serving.
 
 An offline example is in `examples/vllm_neuron/models/qwen3_5/run.py`.
+
+### Prefix caching
+
+`PREFIX_CACHING=1` (`--enable-prefix-caching`) caches prompt prefixes in 1024-token blocks: the
+attention KV blocks and a checkpoint of every GDN layer's state at each block boundary (vLLM's
+Mamba cache mode `align`; see [the design note](../design/hybrid-state-gdn.md#prefix-caching)).
+Prefills are scheduled in 1024-token chunks, so `PREFILL_BUCKET` must be at least 1024. A
+request reuses the longest cached prefix that ends on a block boundary, below the prompt
+length.
+
+| FP8, `max_model_len` 4096 | Prompt tokens (cached) | TTFT |
+|---|---|---|
+| First request | 2,500 (0) | 1,242 ms |
+| Same prompt again | 2,500 (2,048) | 430 ms |
+| First request | 3,500 (0) | 1,607 ms |
+| Same prompt again | 3,500 (3,072) | 420 ms |
+
+Greedy outputs are identical with and without prefix caching. Each cached block holds a GDN
+state page per GDN layer as well as the attention KV (per rank and 1024 tokens: 48 MB of
+state, 16 MB of KV), so fewer prefixes fit in the KV pool than with an attention-only model.
 
 ### FP8
 

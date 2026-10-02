@@ -1268,6 +1268,7 @@ class NeuronWorker(WorkerBase):
 
         # Graphs that execute on device must not run before the parallel-trace forks.
         self.model_runner.warm_up_kv_block_clearing()
+        self.model_runner.warm_up_mamba_align()
 
         num_batched_tokens_buckets = (
             self.model_runner.neuron_config.num_batched_tokens_buckets

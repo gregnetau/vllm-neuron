@@ -23,8 +23,8 @@ how it is laid out in device memory, and how the model reads and writes it on Ne
 
 The model reports GDN layers through `KVSpec.state_layers` (`StateLayerSpec`: shapes and
 dtypes per layer, see `model/kv_cache.py`). The runner emits one `MambaSpec` per GDN layer
-with `mamba_cache_mode="none"`, so vLLM allocates one state page per request per GDN layer
-group. A request's page is the first block id of the group's block table; no extra
+with `mamba_cache_mode="none"` (see [Prefix caching](#prefix-caching) for `align`), so vLLM
+allocates one state page per request per GDN layer group. A request's page is the first block id of the group's block table; no extra
 scheduler input is needed.
 
 vLLM unifies page sizes across groups by enlarging the attention block size. The runner pads
@@ -33,6 +33,33 @@ the attention metadata splits each manager block back into kernel-sized blocks
 (`block_size` 32). With one KV head per rank, a manager block is a pure reshape of its kernel
 blocks. The runner logs the result, for example
 `KV cache block_size resolved: cache_config=32, per_group=[1024, 2048, 2048, 2048]`.
+
+## Prefix caching
+
+With `--enable-prefix-caching` the platform selects vLLM's Mamba cache mode `align`, and the
+runner emits each `MambaSpec` with a block of as many tokens as the enlarged attention block
+(1024 for Qwen3.8-27B at TP=4), so the per-group block sizes are equal
+(`per_group=[1024, 1024, 1024, 1024]`) and a state block lines up with an attention prefix
+block. vLLM then keeps a request's running state in the state block of its last scheduled
+token, schedules prefills in block-aligned chunks, and caches each block whose state ends on
+the block boundary; earlier non-cached state blocks are released.
+
+The runner implements the parts of align mode that vLLM's GPU runner does in
+`mamba_utils.preprocess_mamba`:
+
+- Before each step, when a request's running state moves to a new block (a prefill chunk or
+  a decode step crossing a boundary, or a new request resuming from a cached prefix), the
+  previous block's page is copied to the new one for every GDN layer, in one small compiled
+  graph over `[pages, rows, 128]` views (`_preprocess_mamba_align`).
+- The GDN metadata carries only the running state's block (`[B, 1]`), at warmup and at run
+  time, and the attention group's slot mapping (state blocks before the running one can be
+  the null block, which would mark their tokens as padding).
+- KV-block clearing skips the blocks of a new or resumed request below `num_computed_tokens`,
+  which are prefix-cache hits.
+
+A prefill with a cached prefix reads its initial GDN state from the copied page (as for any
+chunk after the first) and attends to the cached KV blocks. Prefix-cache granularity is the
+1024-token block, and the prefill chunk (`max_num_batched_tokens`) must be at least one block.
 
 ## Page layout
 

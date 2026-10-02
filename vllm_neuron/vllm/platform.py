@@ -305,27 +305,38 @@ class NeuronPlatform(Platform):
                 "variable or set VLLM_USE_V2_MODEL_RUNNER=0."
             )
 
-    # Architectures with per-request recurrent state (Gated DeltaNet layers). Prefix
-    # caching would need per-block state checkpoints, which are not implemented.
+    # Architectures with per-request recurrent state (Gated DeltaNet layers). With prefix
+    # caching their state is checkpointed per KV block in vLLM's Mamba "align" mode.
     _STATEFUL_ARCHITECTURES = frozenset(
         {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
     )
 
     @classmethod
-    def _disable_prefix_caching_for_stateful_models(
+    def _configure_prefix_caching_for_stateful_models(
         cls, vllm_config: "VllmConfig"
     ) -> None:
+        """Recurrent-state models cache prefixes in Mamba "align" mode: the state is kept
+        per KV-manager block and copied to the next block when a request crosses into it
+        (NeuronModelRunner._preprocess_mamba_align), and prefills are scheduled in
+        block-aligned chunks. The block (the attention block enlarged to the state page)
+        must not exceed the prefill chunk (max_num_batched_tokens)."""
         archs = set(getattr(vllm_config.model_config, "architectures", None) or [])
         if not (archs & cls._STATEFUL_ARCHITECTURES):
             return
         cache_config = vllm_config.cache_config
-        if cache_config.enable_prefix_caching:
-            logger.warning(
-                "Prefix caching is not supported for models with recurrent state "
-                "(%s); disabling it.",
+        if not cache_config.enable_prefix_caching:
+            return
+        if cache_config.mamba_cache_mode != "align":
+            logger.info(
+                "Prefix caching for %s uses Mamba cache mode 'align' (was '%s').",
                 ", ".join(sorted(archs)),
+                cache_config.mamba_cache_mode,
             )
-            cache_config.enable_prefix_caching = False
+            cache_config.mamba_cache_mode = "align"
+        if not vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "Prefix caching for models with recurrent state needs chunked prefill."
+            )
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -369,7 +380,7 @@ class NeuronPlatform(Platform):
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
-        cls._disable_prefix_caching_for_stateful_models(vllm_config)
+        cls._configure_prefix_caching_for_stateful_models(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         # TODO: Implement a CPU fallback based on the value from DeviceConfig

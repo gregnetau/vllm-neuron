@@ -10,6 +10,8 @@
 #   MODEL=... OPTLEVEL=3 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # FP8 KV cache (unit KV scales):
 #   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen3_5/serve.sh
+#   # Prefix caching (state checkpoints per 1024-token block; PREFILL_BUCKET >= 1024):
+#   MODEL=... PREFIX_CACHING=1 examples/vllm_neuron/models/qwen3_5/serve.sh
 set -euo pipefail
 
 MODEL=${MODEL:?set MODEL to the checkpoint directory}
@@ -36,6 +38,6 @@ exec vllm serve "${MODEL}" \
   --gpu-memory-utilization 0.65 \
   --kv-cache-dtype "${KV_CACHE_DTYPE:-auto}" \
   --optimization-level "${OPTLEVEL:-1}" \
-  --no-enable-prefix-caching \
+  "$( [[ "${PREFIX_CACHING:-0}" == 1 ]] && echo --enable-prefix-caching || echo --no-enable-prefix-caching )" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --additional-config "{\"neuron_config\": {${NEURON_CONFIG}}}"

@@ -7,6 +7,7 @@ ModelRunnerOutput with proper request tracking, output reordering, and persisten
 state management.
 """
 
+import itertools
 import logging
 import math
 import os
@@ -115,6 +116,18 @@ def _zero_kv_blocks(caches: list[torch.Tensor], kernel_blocks: torch.Tensor) -> 
                             dtype=cache.dtype, device=cache.device)
         cache.index_put_((kernel_blocks,), zeros)
     return kernel_blocks.sum()
+
+
+# State-page copies per call of the compiled Mamba-align copy graph (fixed shape).
+_STATE_COPY_CHUNK = 8
+
+
+def _copy_state_pages(pages: list[torch.Tensor], groups: list[int], src: torch.Tensor,
+                      dst: torch.Tensor) -> torch.Tensor:
+    """pages[i][dst[g]] = pages[i][src[g]] in place, g = groups[i]; src / dst [G, N]."""
+    for page, g in zip(pages, groups):
+        page.index_copy_(0, dst[g], page.index_select(0, src[g]))
+    return src.sum()
 
 
 def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
@@ -1943,7 +1956,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the model it need not clear them itself."""
         self._kv_clear_groups: list[int] = []
         if (not hasattr(self.model, "set_runner_clears_kv_blocks") or self.device.type == "cpu"
-                or self.vllm_config.cache_config.enable_prefix_caching
                 or os.environ.get("VLLM_NEURON_HYBRID_RUNNER_KV_CLEAR") == "0"):
             return
         from vllm_neuron.envs import get_compile_backend_name
@@ -1960,6 +1972,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not groups or len(ratios) != 1:
             return
         self._kv_clear_groups = groups
+        self._kv_clear_block_tokens = kv_cache_config.kv_cache_groups[groups[0]].kv_cache_spec.block_size
         self._kv_clear_ratio = ratios.pop()
         self._kv_clear_caches = caches
         self._kv_clear_fn = torch.compile(_zero_kv_blocks, backend=get_compile_backend_name(),
@@ -1983,17 +1996,109 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _clear_new_attention_blocks(self, scheduler_output: "SchedulerOutput") -> None:
         if not getattr(self, "_kv_clear_groups", None):
             return
+        # Blocks before num_computed_tokens of a new or resumed request are prefix-cache
+        # hits holding valid KV; only the rest are fresh.
+        bt = self._kv_clear_block_tokens
         new_blocks: set[int] = set()
         for req in scheduler_output.scheduled_new_reqs:
             for gi in self._kv_clear_groups:
-                new_blocks.update(req.block_ids[gi])
-        for block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
+                new_blocks.update(req.block_ids[gi][req.num_computed_tokens // bt:])
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, block_ids, n_computed in zip(cached.req_ids, cached.new_block_ids,
+                                                 cached.num_computed_tokens):
             if block_ids is not None:
+                skip = n_computed // bt if req_id in cached.resumed_req_ids else 0
                 for gi in self._kv_clear_groups:
-                    new_blocks.update(block_ids[gi])
+                    new_blocks.update(block_ids[gi][skip:])
         new_blocks.discard(0)
         if new_blocks:
             self._clear_kv_blocks(sorted(new_blocks))
+
+    def _setup_mamba_align(self, kv_cache_config, state_caches) -> None:
+        """Prefix caching for recurrent-state models (vLLM Mamba "align" mode): a request's
+        running state lives in the state block of its last scheduled token; when a step
+        moves it to a new block, the previous block's page is copied there first and keeps
+        the state at its block boundary, which the KV manager caches (see
+        vllm.v1.worker.mamba_utils.preprocess_mamba)."""
+        self._mamba_align_groups: list[int] = [
+            gi for gi, g in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.mamba_cache_mode == "align"]
+        self._mamba_state_idx: dict[str, int] = {}
+        if not self._mamba_align_groups:
+            return
+        from vllm_neuron.envs import get_compile_backend_name
+
+        groups = kv_cache_config.kv_cache_groups
+        self._mamba_align_block_size = groups[self._mamba_align_groups[0]].kv_cache_spec.block_size
+        self._mamba_attn_group = next(
+            (gi for gi, g in enumerate(groups) if isinstance(g.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec))),
+            None)
+        pages, page_groups = [], []
+        for k, gi in enumerate(self._mamba_align_groups):
+            for name in groups[gi].layer_names:
+                for half in state_caches[name]:
+                    # [pages, rows, 128] views: a single [pages, half] row would be copied with
+                    # per-element descriptors.
+                    if half.shape[1] % 128 == 0:
+                        half = half.view(half.shape[0], half.shape[1] // 128, 128)
+                    pages.append(half)
+                    page_groups.append(k)
+        self._state_copy_pages, self._state_copy_page_groups = pages, page_groups
+        self._state_copy_fn = torch.compile(_copy_state_pages, backend=get_compile_backend_name(),
+                                            dynamic=False)
+
+    def warm_up_mamba_align(self) -> None:
+        """Compile the state-copy graph (copies the null block onto itself); after model warmup."""
+        if getattr(self, "_mamba_align_groups", None):
+            self._copy_state_blocks([[(0, 0)] for _ in self._mamba_align_groups])
+
+    def _copy_state_blocks(self, copies: list[list[tuple[int, int]]]) -> None:
+        """copies[k]: (src, dst) state blocks of the k-th align-mode group."""
+        n = max(len(c) for c in copies)
+        for start in range(0, n, _STATE_COPY_CHUNK):
+            src = torch.zeros(len(copies), _STATE_COPY_CHUNK, dtype=torch.long)
+            dst = torch.zeros_like(src)
+            for k, c in enumerate(copies):
+                for j, (a, b) in enumerate(c[start:start + _STATE_COPY_CHUNK]):
+                    src[k, j], dst[k, j] = a, b
+            self._state_copy_fn(self._state_copy_pages, self._state_copy_page_groups,
+                                src.to(self.device), dst.to(self.device))
+
+    def _preprocess_mamba_align(self, scheduler_output: "SchedulerOutput") -> None:
+        if not getattr(self, "_mamba_align_groups", None):
+            return
+        bs = self._mamba_align_block_size
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id in itertools.chain(scheduler_output.finished_req_ids,
+                                      scheduler_output.preempted_req_ids or (), cached.resumed_req_ids):
+            self._mamba_state_idx.pop(req_id, None)
+        copies: list[list[tuple[int, int]]] = [[] for _ in self._mamba_align_groups]
+        for req_id in self.input_batch.req_ids:
+            if req_id not in scheduler_output.num_scheduled_tokens:
+                continue
+            req = self.requests[req_id]
+            prev = self._mamba_state_idx.get(req_id)
+            if prev is None:  # new / resumed: the state of the last computed token (-1: none)
+                prev = (req.num_computed_tokens - 1) // bs
+            n_sched = scheduler_output.num_scheduled_tokens[req_id]
+            curr = (req.num_computed_tokens + n_sched + bs - 1) // bs - 1
+            self._mamba_state_idx[req_id] = curr
+            if prev != -1 and prev != curr:
+                for k, gi in enumerate(self._mamba_align_groups):
+                    ids = req.block_ids[gi]
+                    copies[k].append((ids[prev], ids[curr]))
+        if copies[0]:
+            self._copy_state_blocks(copies)
+
+    def _mamba_align_state_table(self, padded_num_reqs: int, kv_cache_group_id: int) -> torch.Tensor:
+        """[padded_num_reqs, 1] state block of each request's running state (0 for padding)."""
+        cpu = self.input_batch.block_table[kv_cache_group_id].get_cpu_tensor()
+        col = torch.zeros(padded_num_reqs, 1, dtype=cpu.dtype)
+        for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
+            idx = self._mamba_state_idx.get(req_id)
+            if idx is not None:
+                col[i, 0] = cpu[i, idx]
+        return col.to(self.device)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -4319,6 +4424,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            if kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
+                # Align mode: the running state's block only; token validity from the
+                # attention group's slots (state blocks before it may be the null block).
+                blk_table_tensor = self._mamba_align_state_table(padded_num_reqs, kv_cache_group_id)
+                full_blk_table_tensor = blk_table_tensor.clone()
+                if self._mamba_attn_group is not None:
+                    slot_mapping = self.input_batch.block_table[self._mamba_attn_group].slot_mapping.gpu[
+                        :total_num_scheduled_tokens]
+
             attn_metadata_i = {
                 "block_table_tensor": blk_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4469,6 +4583,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     num_reqs, dtype=torch.int32, device=device
                 )
 
+            if (isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"):
+                max_num_blocks_per_req = full_max_blocks_per_req = 1  # see _mamba_align_state_table
             # Dummy block_table_tensor: [num_reqs, max_num_blocks_per_req]
             # Use sequential block IDs starting from 0
             block_table_tensor = (
@@ -5523,6 +5639,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Update cached states (includes sequence ID management)
         with record_function_or_nullcontext("neuron_model_runner: update_states"):
             self._update_states(scheduler_output)
+            self._preprocess_mamba_align(scheduler_output)
 
         # Register new requests for tensor replacement prompt matching.
         self._register_requests_for_replacement(scheduler_output)
@@ -8734,6 +8851,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if state_caches:
             self.model.bind_state_cache(state_caches)
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
+            self._setup_mamba_align(kv_cache_config, state_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -8767,16 +8885,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _build_state_cache_specs(
         self, state_layers, attn_specs: dict[str, KVCacheSpec]
     ) -> dict[str, KVCacheSpec]:
-        """MambaSpec per recurrent-state layer (prefix caching / spec decode off).
+        """MambaSpec per recurrent-state layer (spec decode off).
 
         The state page is padded to an integral multiple of the attention page so
         vLLM's page-size unification can scale the attention block size to match.
+        Without prefix caching a request keeps one state page for its whole context;
+        with it (Mamba "align" mode) the state block spans as many tokens as the enlarged
+        attention block, so state checkpoints line up with the attention prefix blocks.
         """
-        if self.vllm_config.cache_config.enable_prefix_caching:
-            raise NotImplementedError(
-                "Prefix caching is not supported for models with recurrent state; "
-                "pass --no-enable-prefix-caching."
-            )
+        cache_config = self.vllm_config.cache_config
         if self.speculative_config is not None:
             raise NotImplementedError(
                 "Speculative decoding is not supported for models with recurrent state."
@@ -8790,16 +8907,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         specs = {}
         for layer in state_layers:
             layout = _state_page_layout(layer.shapes, layer.dtypes)
-            specs[layer.name] = MambaSpec(
+            page = _padded_state_page_bytes(layout.page_bytes, attn_page, align_pages)
+            if cache_config.enable_prefix_caching:
+                block_size = page // attn_page * kernel_block
+                mode = "align"
+            else:
                 # One state page per request: a single block spans the whole context.
-                block_size=self.max_model_len,
+                block_size, mode = self.max_model_len, "none"
+            specs[layer.name] = MambaSpec(
+                block_size=block_size,
                 shapes=tuple(layer.shapes),
                 dtypes=tuple(layer.dtypes),
-                page_size_padded=_padded_state_page_bytes(
-                    layout.page_bytes, attn_page, align_pages
-                ),
+                page_size_padded=page,
                 mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-                mamba_cache_mode="none",
+                mamba_cache_mode=mode,
             )
         return specs
 

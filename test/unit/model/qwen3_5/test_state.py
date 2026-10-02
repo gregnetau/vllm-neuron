@@ -60,3 +60,12 @@ def test_state_half_elems_rejects_overflow(state_cache):
     with pytest.raises(AssertionError):
         state_cache.state_half_elems(
             state_cache.page_layout(((4,),), (torch.bfloat16,)), 64)
+
+
+def test_prefix_cache_state_block_tp4(state, state_cache, cfg):
+    """With prefix caching the state block spans the tokens of one enlarged attention block:
+    the runner pads the page to whole 256-token attention blocks (8 kernel blocks of 32)."""
+    lay = state.gdn_page_layout(cfg, 4)
+    attn_page = 2 * 1 * 256 * 2 * 32
+    padded = state_cache.padded_state_page_bytes(lay.page_bytes, attn_page, align_pages=8)
+    assert padded // attn_page * 32 == 1024
