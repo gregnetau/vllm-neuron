@@ -98,6 +98,15 @@ def _fp8_linear(x, weight, weight_scale, input_scale, d_head: int = 128):
     ).squeeze(0)
 
 
+def _use_fp8_matvec(x, weight) -> bool:
+    """Decode-sized static-FP8 projection: the streaming mat-vec kernel (fp8_kernels)."""
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+    from .fp8_kernels import can_use_fp8_matvec
+
+    return can_run_kernel(x) and can_use_fp8_matvec(x, weight)
+
+
 def _out_proj_tkg(x, weight, weight_scale=None, input_scale=None, d_head: int = 128):
     """x [T, N*d_head] @ weight [N*d_head, H] with the token-generation output-projection kernel
     (T <= 128; BF16, or static FP8 when scales are given). NF.o_proj always uses the context
@@ -286,6 +295,11 @@ class Qwen3_5Attention(nn.Module):
         B, Nh, Dh, S = attn.shape
         if B * S <= 128 and Dh % 128 == 0:  # decode: token-generation kernel on [B*S, Nh*Dh]
             flat = attn.permute(0, 3, 1, 2).reshape(B * S, Nh * Dh)
+            if self.fp8 and _use_fp8_matvec(flat, self.o_proj_weight):
+                from .fp8_kernels import fp8_matvec
+
+                return fp8_matvec(flat, self.o_proj_weight, self.o_proj_weight_scale,
+                                  self.o_input_scale).reshape(B, S, -1)
             y = _out_proj_tkg(flat, self.o_proj_weight, self.o_proj_weight_scale if self.fp8 else None,
                               self.o_input_scale if self.fp8 else None)
             if y is not None:
@@ -645,6 +659,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     # -- helpers -------------------------------------------------------------
     def _project(self, hidden_states):
         b, a = hidden_states @ self.in_proj_b_weight, hidden_states @ self.in_proj_a_weight
+        if self.fp8 and _use_fp8_matvec(hidden_states, self.in_proj_qkv_weight):
+            from .fp8_kernels import fp8_matvec
+
+            return (fp8_matvec(hidden_states, self.in_proj_qkv_weight, self.in_proj_qkv_weight_scale,
+                               self.in_proj_input_scale),
+                    fp8_matvec(hidden_states, self.in_proj_z_weight, self.in_proj_z_weight_scale,
+                               self.in_proj_input_scale), b, a)
         if self.fp8:
             return (_fp8_linear(hidden_states, self.in_proj_qkv_weight, self.in_proj_qkv_weight_scale,
                                 self.in_proj_input_scale, self.Dk),
@@ -653,6 +674,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return hidden_states @ self.in_proj_qkv_weight, hidden_states @ self.in_proj_z_weight, b, a
 
     def _out_proj(self, o):
+        if self.fp8 and _use_fp8_matvec(o, self.out_proj_weight):
+            from .fp8_kernels import fp8_matvec
+
+            return fp8_matvec(o, self.out_proj_weight, self.out_proj_weight_scale, self.out_proj_input_scale)
         if self.fp8:
             y = _out_proj_tkg(o, self.out_proj_weight, self.out_proj_weight_scale, self.out_proj_input_scale)
             if y is not None:
@@ -837,6 +862,13 @@ class Qwen3_5MLPStaticFP8(nn.Module):
             torch.empty((n_tokens, H), device="meta"), torch.empty((H, n_inter), device="meta"),
             quantization_type=QuantizationType.STATIC)
 
+    def _decode_kernel_ok(self, hidden_states: torch.Tensor) -> bool:
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+        from .fp8_kernels import can_use_fp8_mlp_decode
+
+        return can_run_kernel(hidden_states) and can_use_fp8_mlp_decode(hidden_states, self.gate_proj_weight)
+
     def _forward_dequant(self, hidden_states, is_prefill: bool, ln_w: torch.Tensor):
         """BF16 MLP over dequantized FP8 weights (weight-only FP8) with the fused norm."""
         x = hidden_states.float()
@@ -852,6 +884,14 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         from nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
         from nkilib.core.utils.common_types import NormType, QuantizationType
 
+        if not is_prefill and self._decode_kernel_ok(hidden_states):
+            from .fp8_kernels import fp8_mlp_decode
+
+            output = fp8_mlp_decode(
+                hidden_states.to(torch.bfloat16), ln_w, self.gate_proj_weight, self.up_proj_weight,
+                self.down_proj_weight, self.gate_weight_scale, self.up_weight_scale, self.down_weight_scale,
+                self.gate_up_input_scale, self.down_input_scale, self.eps)
+            return self._reduce(output.to(torch.bfloat16), is_prefill)
         n_tokens = hidden_states.shape[0] * (self.world_size if is_prefill else 1)
         inter = self.gate_proj_weight.shape[1]
         if self._kernel_ok(hidden_states, n_tokens, inter):
