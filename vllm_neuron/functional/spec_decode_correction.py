@@ -97,6 +97,10 @@ def correct_spec_decode_positions_and_slot_mapping(
         )
         new_meta = dict(meta)
         new_meta["slot_mapping"] = slot_mapping
+        if "state_in" in meta:
+            # Recurrent-state layers (MTP verify): the previous step wrote the state after
+            # each of its tokens to its own state block; resume from the last accepted one.
+            new_meta["state_in"] = (valid_count - 1).clamp(min=0).to(meta["state_in"].dtype)
         new_attn_metadata[layer_name] = new_meta
     return positions, new_attn_metadata
 

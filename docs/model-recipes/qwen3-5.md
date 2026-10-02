@@ -73,8 +73,7 @@ An offline example is in `examples/vllm_neuron/models/qwen3_5/run.py`.
 
 `MTP_TOKENS=1` or `2` serves with vLLM's `mtp` speculative method: the checkpoint's
 multi-token-prediction head (one full-attention decoder layer on top of the backbone's last
-hidden state) drafts tokens, and the target verifies them in one decode pass. The script adds
-`--no-async-scheduling`, which MTP needs for this model.
+hidden state) drafts tokens, and the target verifies them in one decode pass.
 
 ```bash
 MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=$PWD/fp8_act_amax.json MTP_TOKENS=2 \
@@ -177,6 +176,7 @@ whole graph instead of modular flow) are exposed by `serve.sh`. Measured in BF16
 | FP8, `max_model_len` 2048, prefill bucket 1024 | 1024 / 128 | 395 ms | 17.7 ms |
 | FP8 + MTP, 1 draft token, same | 1024 / 128 | 398 ms | 14.2 ms |
 | FP8 + MTP, 2 draft tokens, same | 1024 / 128 | 401 ms | 10.5 ms |
+| FP8 + MTP, 2 draft tokens, asynchronous scheduling (default), same | 1024 / 128 | 396 ms | 8.4 ms |
 
 FP8 decode per token on device: 48 GDN layers at 0.099 ms, 64 MLPs at 0.123 ms, 16 attention
 layers at 0.140 ms, 1.0 ms for the BF16 `lm_head` and 1.7 ms for the 132 TP all-reduces. The
@@ -187,9 +187,9 @@ collectives are the remaining overheads. FP8 KV cache (`KV_CACHE_DTYPE=fp8`) was
 
 
 With MTP the draft acceptance rate is about 86% for the first draft token and 62% for the
-second (mean 1.85 and 2.4 tokens per step). A step with 2 draft tokens takes about 33 ms:
-20.5 ms for the target's verify pass (3 tokens), 4.4 ms for the draft and about 7 ms on the
-host, which synchronous scheduling does not overlap.
+second (mean 1.85 and 2.4 tokens per step). With synchronous scheduling a step with 2 draft
+tokens takes about 33 ms: 20.5 ms for the target's verify pass (3 tokens), 4.4 ms for the
+draft and about 7 ms on the host; asynchronous scheduling overlaps the host work.
 
 Cold compilation of the `max_model_len` 2048 configuration takes about 4 minutes in BF16 and
 12 minutes in FP8, and is cached afterwards.
@@ -214,9 +214,8 @@ scales as the library kernels they replace and leave this agreement unchanged. A
 - **`on_device_sampling_config.all_greedy` returns invalid token ids** with this model;
   use the default on-device sampling configuration.
 - **`logprobs` requests fail.** The sampler output does not include top log-probabilities.
-- **MTP needs synchronous scheduling and supports at most 2 draft tokens**, and it is not
-  combined with prefix caching. With 3 draft tokens the verify pass produced invalid indices;
-  this is not resolved.
+- **MTP supports at most 2 draft tokens** and is not combined with prefix caching. With 3
+  draft tokens the verify pass produced invalid indices; this is not resolved.
 
 ## Related work
 
@@ -248,8 +247,8 @@ rather than to propose a competing implementation.
 Before this work is proposed upstream:
 
 1. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
-2. **MTP**: asynchronous scheduling (the GDN state block of the last accepted token computed
-   on device), prefix caching together with MTP, and more than 2 draft tokens.
+2. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
+   draft's `lm_head`.
 3. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, including [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark)
    for code generation, plus latency and throughput sweeps over context length and batch size.

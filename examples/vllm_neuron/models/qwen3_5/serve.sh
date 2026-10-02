@@ -12,7 +12,7 @@
 #   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Prefix caching (state checkpoints per 1024-token block; PREFILL_BUCKET >= 1024):
 #   MODEL=... PREFIX_CACHING=1 examples/vllm_neuron/models/qwen3_5/serve.sh
-#   # MTP speculative decoding with N draft tokens (synchronous scheduling):
+#   # MTP speculative decoding with N (1 or 2) draft tokens:
 #   MODEL=... MTP_TOKENS=1 examples/vllm_neuron/models/qwen3_5/serve.sh
 set -euo pipefail
 
@@ -33,8 +33,7 @@ fi
 
 SPEC_ARGS=()
 if [[ -n "${MTP_TOKENS:-}" ]]; then
-  SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}"
-             --no-async-scheduling)
+  SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}")
 fi
 
 exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \

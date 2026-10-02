@@ -1739,7 +1739,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         if use_real_prev:
-            prev_sampled = self._remap_prev_sampled_by_req_id(
+            prev_sampled, dummy_rows = self._remap_prev_sampled_by_req_id(
                 prev_future, num_reqs_padded
             )
             # When the previous future has shape [bs, num_spec+1], the previous
@@ -1747,26 +1747,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # num_spec directly: it's always the scheduled draft count for
             # that step (we never mid-trim draft counts — NeuronAsyncScheduler
             # clears spec_token_ids entirely near max_model_len instead).
-            prev_num_draft_tokens_tensor = torch.full(
-                (num_reqs_padded,), num_spec, dtype=torch.int32, device=device
-            )
+            # Rows of requests new to the batch carry a dummy (see below).
+            draft_counts = [0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)]
+            prev_num_draft_tokens_tensor = torch.tensor(
+                draft_counts, dtype=torch.int32
+            ).to(device)
         else:
-            # First decode step after prefill, or shape mismatch. Pass an
-            # all-zero (= all-valid) dummy so valid_count == num_spec + 1.
-            # Pair with num_draft == num_spec so:
-            #   num_rejected = 1 + num_spec - (num_spec + 1) = 0
-            # → correction is a no-op.
-            prev_sampled = torch.zeros(
-                num_reqs_padded,
-                num_spec + 1,
-                dtype=torch.int32,
-                device=device,
-            )
-            prev_num_draft_tokens_tensor = torch.full(
-                (num_reqs_padded,), num_spec, dtype=torch.int32, device=device
+            # First decode step after prefill, or shape mismatch. Pass a dummy
+            # with one valid token and no drafts, so valid_count == 1 and
+            #   num_rejected = 1 + 0 - 1 = 0
+            # → correction is a no-op (and the last accepted token is the
+            # step's first: recurrent-state models resume from state block 0).
+            prev_sampled = self._dummy_prev_sampled(num_reqs_padded, num_spec, device)
+            prev_num_draft_tokens_tensor = torch.zeros(
+                (num_reqs_padded,), dtype=torch.int32, device=device
             )
 
         return prev_sampled, prev_num_draft_tokens_tensor
+
+    @staticmethod
+    def _dummy_prev_sampled(num_reqs_padded: int, num_spec: int, device) -> torch.Tensor:
+        """[num_reqs_padded, num_spec+1] previous-step sample rows with one valid token."""
+        row = torch.full((num_spec + 1,), -1, dtype=torch.int32)
+        row[0] = 0
+        return row.repeat(num_reqs_padded, 1).to(device)
 
     def _build_async_spec_kwargs(
         self,
@@ -2398,8 +2402,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``input_batch.req_ids``.
 
         For current rows whose request didn't exist in the previous step
-        (newly-added), the row is replaced with an all-valid dummy so
-        num_rejected = 0 (no-op). Padded rows are left untouched: they are
+        (newly-added), the row is replaced with a one-valid-token dummy (and
+        the caller passes no drafts for it) so num_rejected = 0 (no-op). Padded rows are left untouched: they are
         not live, and overwriting their previous sampled-token rows
         wedges the async worker-side sample_tokens path.
 
@@ -2410,12 +2414,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         Returns:
             Device tensor ``[num_reqs_padded, num_spec+1]`` reordered to the
-            current batch's compacted slot order.
+            current batch's compacted slot order, and the set of dummy rows.
         """
         prev_req_ids_ordered = self.async_execution_buffer.get("prev_req_ids_ordered")
         curr_req_ids = list(self.input_batch.req_ids[: self.input_batch.num_reqs])
         if prev_req_ids_ordered is None:
-            return prev_future
+            return prev_future, set()
 
         prev_id_to_idx = {req_id: i for i, req_id in enumerate(prev_req_ids_ordered)}
 
@@ -2437,7 +2441,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         needs_remap = any(old_idx != cur_idx for cur_idx, old_idx in enumerate(perm))
         needs_dummy_rows = bool(missing_indices)
         if not needs_remap and not needs_dummy_rows:
-            return prev_future
+            return prev_future, set()
 
         if needs_remap:
             perm_tensor = torch.tensor(
@@ -2459,10 +2463,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Avoid in-place row writes here. On Neuron those writes can yield
             # intermittent non-contiguous inputs for the downstream NEFF.
             prev_sampled = torch.where(
-                dummy_mask, torch.zeros_like(prev_sampled), prev_sampled
+                dummy_mask,
+                self._dummy_prev_sampled(num_reqs_padded, prev_sampled.shape[1] - 1, prev_sampled.device),
+                prev_sampled,
             ).contiguous()
 
-        return prev_sampled
+        return prev_sampled, set(missing_indices)
 
     def _save_block_table_to_device(self) -> None:
         """
@@ -8429,9 +8435,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         Recurrent-state models with MTP: a verify step wrote the state after each of its
         tokens to its own state block; the next step starts from the state after the last
-        accepted token (block len(sampled) - 1).
+        accepted token (block len(sampled) - 1), passed as ``state_in``.
         """
-        if not getattr(self, "_mamba_spec_groups", None):
+        if not getattr(self, "_mamba_spec_groups", None) or self.use_async_scheduling:
+            # Async scheduling: the target graph derives it from the previous step's
+            # samples (functional.spec_decode_correction).
             return
         for req_id in scheduler_output.finished_req_ids:
             self._mamba_state_in.pop(req_id, None)
@@ -8950,11 +8958,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise NotImplementedError(
                     "Prefix caching with speculative decoding is not supported for models "
                     "with recurrent state; pass --no-enable-prefix-caching."
-                )
-            if self.use_async_scheduling:
-                raise NotImplementedError(
-                    "MTP for models with recurrent state needs synchronous scheduling; "
-                    "pass --no-async-scheduling."
                 )
             num_spec_blocks = self.speculative_config.num_speculative_tokens
             if num_spec_blocks > 2:

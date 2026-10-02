@@ -102,16 +102,18 @@ With vLLM's `mtp` speculative method and `k` draft tokens, each `MambaSpec` gets
 `num_speculative_blocks = k`, so a request holds `1 + k` state blocks per GDN layer group
 (`block_table_tensor` is `[B, 1 + k]`). A verify step runs `1 + k` tokens per request through
 the GDN layers in order (`gdn_kernels.gdn_decode_fp8` keeps the state in SBUF between them)
-and writes the state after token `j` to block `j`. The runner records, from the sampled
-tokens, which block holds the state after the last accepted token and passes it as
-`state_in` in the GDN metadata of the next step, where the state is read from that block.
-Prefills and single-token steps read `state_in` (0 after a prefill) and write block 0.
+and writes the state after token `j` to block `j`. The next step reads the state from the
+block of the last accepted token, passed as `state_in` in the GDN metadata. Prefills and
+single-token steps read `state_in` (0 after a prefill) and write block 0.
 
-Because `state_in` comes from the previous step's sampled tokens on the host, MTP runs with
-synchronous scheduling. Selecting the accepted state inside the target graph instead (copying
-it to block 0 after rejection sampling) was tried and rejected: in-place copies on the bound
-state buffers after the kernels that write them gave wrong results and cost about 13 ms per
-step.
+With synchronous scheduling the runner sets `state_in` from the previous step's sampled
+tokens. With asynchronous scheduling the target graph derives it from the previous step's
+rejection-sampler output, in the same on-device correction that adjusts positions and slot
+mappings for rejected drafts (`functional.spec_decode_correction`); the "no previous step"
+placeholder rows carry one valid token and no drafts, so they resume from block 0. Selecting
+the accepted state inside the verify graph instead (copying it to block 0 after rejection
+sampling) was tried and rejected: in-place copies on the bound state buffers after the
+kernels that write them gave wrong results and cost about 13 ms per step.
 
 ## Recycled blocks
 
