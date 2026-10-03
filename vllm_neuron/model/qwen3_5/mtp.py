@@ -24,7 +24,7 @@ from vllm.distributed.parallel_state import get_tp_group
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
-from vllm_neuron.model.llama3.eagle3_model import compute_slot_mapping, extract_accepted_tokens
+from vllm_neuron.model.llama3.eagle3_model import extract_accepted_tokens
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -43,6 +43,16 @@ from .model import (
 )
 
 MTP = "mtp."
+
+
+def _slot_mapping(positions, block_table, block_size):
+    """KV slot per position (as eagle3_model.compute_slot_mapping). Padded batch rows can
+    carry negative corrected positions: their block index is clamped into the table and the
+    -1 (unused) result is mapped to slot 0, the null block."""
+    blocks = (positions // block_size).clamp(0, block_table.shape[1] - 1)
+    ids = block_table.gather(1, blocks.view(-1, 1).long()).view(-1)
+    slot = ids * block_size + positions % block_size
+    return torch.where(ids < 0, torch.zeros_like(slot), slot)
 
 
 class Qwen3_5MTPModel(nn.Module):
@@ -148,7 +158,7 @@ class Qwen3_5MTP(nn.Module):
         base = attn_metadata[layer_name]
         for step in range(1, self.num_speculative_tokens):
             cur_positions = cur_positions + 1
-            slot_mapping = compute_slot_mapping(cur_positions, base["block_table_tensor"], base["block_size"])
+            slot_mapping = _slot_mapping(cur_positions, base["block_table_tensor"], base["block_size"])
             md = {ln: {"block_table_tensor": base["block_table_tensor"], "slot_mapping": slot_mapping,
                        "max_query_len": 1, "block_size": base["block_size"],
                        "max_blocks_per_seq": base["max_blocks_per_seq"], "decode_token_threshold": 1}

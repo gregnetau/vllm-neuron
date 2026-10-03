@@ -7260,10 +7260,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 first_meta = next(iter(attn_metadata.values()))
                 bt_rows = first_meta["block_table_tensor"].shape[0]
                 if sampling_params_tensor.shape[0] < bt_rows:
+                    # Padded rows get neutral sampling params (top_k=-1, top_p=1, temperature 0)
+                    # rather than top_k = top_p = 0.
                     pad_rows = bt_rows - sampling_params_tensor.shape[0]
-                    sampling_params_tensor = torch.nn.functional.pad(
-                        sampling_params_tensor, (0, 0, 0, pad_rows), value=0
-                    )
+                    pad = torch.tensor([[-1.0, 1.0, 0.0]], dtype=sampling_params_tensor.dtype,
+                                       device=sampling_params_tensor.device).expand(pad_rows, 3)
+                    sampling_params_tensor = torch.cat([sampling_params_tensor, pad], dim=0)
 
             # Replicate sampling params for spec-decode verify step
             # (no-op when speculative decoding is not active).

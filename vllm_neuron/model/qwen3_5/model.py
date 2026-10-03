@@ -423,7 +423,8 @@ class Qwen3_5Attention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         md = attn_metadata[f"layers.{self.layer_idx}.self_attn"]
-        slot_mapping, block_size = md["slot_mapping"], md["block_size"]
+        # -1 (PAD_SLOT_ID: e.g. padded draft rows) -> slot 0 of the null block, a write sink.
+        slot_mapping, block_size = md["slot_mapping"].clamp(min=0), md["block_size"]
         if not self.runner_clears_kv_blocks:
             # Blocks starting at/after the cached prefix hold no valid data yet -> clear them.
             # Unused table entries are the -1 read sentinel (runner); map them to the null block.
@@ -461,7 +462,8 @@ class Qwen3_5Attention(nn.Module):
 
     def forward_decode(self, hidden_states, positions, position_embeddings, attn_metadata):
         md = attn_metadata[f"layers.{self.layer_idx}.self_attn"]
-        slot_mapping, block_size = md["slot_mapping"], md["block_size"]
+        # -1 (PAD_SLOT_ID: e.g. padded draft rows) -> slot 0 of the null block, a write sink.
+        slot_mapping, block_size = md["slot_mapping"].clamp(min=0), md["block_size"]
         block_table = md["block_table_tensor"]
         B = block_table.shape[0]
         tokens, hidden = hidden_states.shape
@@ -640,7 +642,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 ssm.reshape(B, self.Hv, self.Dk, self.Dv))
 
     def _write_state(self, slots: torch.Tensor, conv: torch.Tensor, ssm: torch.Tensor):
+        """slots [B] (may hold -1 for padded batch rows: their state goes to the null page as
+        zeros, which attention may read as KV and must stay finite)."""
         B = slots.shape[0]
+        pad = (slots < 0).view(B, *([1] * (ssm.dim() - 1)))
+        conv = torch.where(pad.view(B, *([1] * (conv.dim() - 1))), torch.zeros((), dtype=conv.dtype, device=conv.device), conv)
+        ssm = torch.where(pad, torch.zeros((), dtype=ssm.dtype, device=ssm.device), ssm)
+        slots = slots.clamp(min=0)
         if self.state_a.dim() == 3:
             R, rows = self._STATE_ROW, self.state_a.shape[1]
             conv = conv.transpose(1, 2).float()  # stored [K-1, C]
@@ -812,13 +820,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mixer output [B*S, H] (all-reduced)."""
         from .gdn_kernels import gdn_decode_fp8
 
-        bt = md["block_table_tensor"].clamp(min=0).to(torch.int32)  # padded rows (-1) -> null block 0
+        # Padded batch rows keep -1: the kernel's page DMAs skip them (out of bounds), so the
+        # null block, which attention may read, never receives float32 state.
+        bt = md["block_table_tensor"].to(torch.int32)
         B = bt.shape[0]
         S = hidden_states.shape[0] // B
         assert hidden_states.shape[0] == B * S, "GDN decode: the same number of tokens per request"
         slots_out = bt[:, :S].contiguous()
         if "state_in" in md:
-            slots_in = bt.gather(1, md["state_in"].long().view(B, 1)).view(B)
+            slots_in = bt.gather(1, md["state_in"].long().view(B, 1).clamp(min=0)).view(B)
         else:
             slots_in = bt[:, 0].contiguous()
         out = gdn_decode_fp8(
@@ -837,7 +847,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """Speculative-decoding verify: S = 1 + k tokens per request (rows b*S .. b*S+S-1).
         The state starts from block state_in[b] (the state after the last accepted token of
         the previous step) and the state after token j is written to block j."""
-        bt = md["block_table_tensor"].long().clamp(min=0)  # [B, 1 + k]; -1 -> null block 0
+        bt_raw = md["block_table_tensor"].long()  # [B, 1 + k]; -1: padded batch row
+        bt = bt_raw.clamp(min=0)                   # reads from the null block 0
         B = bt.shape[0]
         T = hidden_states.shape[0]
         S = T // B
@@ -853,13 +864,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             q, k, v = self._qkv_heads(m_j, B)
             g, beta = gdn_ops.gdn_gating(a[:, j], b[:, j], self.A_log, self.dt_bias)
             o, ssm = gdn_ops.gated_delta_step_batched(q, k, v, g, beta, ssm)
-            self._write_state(bt[:, j], conv, ssm)
+            self._write_state(bt_raw[:, j], conv, ssm)
             outs.append(o)
         o = torch.stack(outs, dim=1).reshape(T, self.Hv, self.Dv)
         return self._finish(o, z, T)
 
     def _decode_torch(self, hidden_states, md):
-        slots = md["block_table_tensor"][:, 0].long().clamp(min=0)  # [B]; padded rows (-1) -> null block 0
+        slots_raw = md["block_table_tensor"][:, 0].long()  # [B]; padded rows: -1
+        slots = slots_raw.clamp(min=0)                      # reads from the null block 0
         B = slots.shape[0]
         assert hidden_states.shape[0] == B, "GDN decode supports one token per request"
         hidden_states = hidden_states.to(self.dtype)
@@ -871,7 +883,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g, beta = gdn_ops.gdn_gating(a, b, self.A_log, self.dt_bias)
         o, new_ssm = gdn_ops.gated_delta_step_batched(q, k, v, g, beta, ssm0)
 
-        self._write_state(slots, new_conv, new_ssm)
+        self._write_state(slots_raw, new_conv, new_ssm)
         return self._finish(o, z, B)
 
 
@@ -1119,9 +1131,18 @@ class Qwen3_5Model(nn.Module):
         hidden_states = NF.merge_prompt_embeds(hidden_states, inputs_embeds, is_token_ids)
 
         position_embeddings = self.rotary_emb(positions, device=hidden_states.device, dtype=hidden_states.dtype)
+        # Padded decode rows (block table row -1) read the null block and can turn non-finite;
+        # zero them after every layer so no kernel mixes them into real rows.
+        bt0 = md0["block_table_tensor"]
+        real = None
+        if not is_prefill and bt0.shape[0] > 1:
+            real = (bt0[:, 0] >= 0).repeat_interleave(hidden_states.shape[0] // bt0.shape[0]).view(-1, 1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, positions=positions,
                                   position_embeddings=position_embeddings, attn_metadata=attn_metadata)
+            if real is not None:
+                hidden_states = torch.where(real, hidden_states, torch.zeros((), dtype=hidden_states.dtype,
+                                                                             device=hidden_states.device))
         hidden_states = self.norm(hidden_states)
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
