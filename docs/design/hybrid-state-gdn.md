@@ -3,7 +3,7 @@
 <!-- meta: description: Design of per-request recurrent state (Gated DeltaNet) alongside paged
 KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-01 -->
+<!-- meta: date_updated: 2026-10-03 -->
 
 ## Overview
 
@@ -33,6 +33,22 @@ the attention metadata splits each manager block back into kernel-sized blocks
 (`block_size` 32). With one KV head per rank, a manager block is a pure reshape of its kernel
 blocks. The runner logs the result, for example
 `KV cache block_size resolved: cache_config=32, per_group=[1024, 2048, 2048, 2048]`.
+
+## Dedicated state pool
+
+Without prefix caching, the runner allocates the state in its own pool per GDN layer instead of
+using the shared raw KV buffers (`NeuronModelRunner._state_pool_pages`): the null page 0 plus
+`1 + num_speculative_blocks` pages for each of the `max_num_seqs` batch slots. The GDN groups'
+block tables are translated on the host (`_state_pool_table`): a request takes a slot on its
+first step and keeps it until it finishes or is preempted, including steps where the
+scheduler leaves it out of the persistent batch (during another request's prefill). The pool
+is taken out of the KV budget (`NeuronWorker.determine_available_memory`).
+
+In the shared layout every raw buffer is a graph input twice, as attention K/V views and as
+state views, and neuronx-cc's graph I/O check (`NCC_EVRF009`, 24 GB per logical core) counts
+both; that capped the KV pool at about half the free HBM. vLLM still allocates the state
+groups' blocks from the shared pool; they stay unused. Prefix caching (state checkpoints
+are cached blocks) keeps the shared layout, as does `VLLM_NEURON_SHARED_STATE_POOL=1`.
 
 ## Prefix caching
 
@@ -114,6 +130,21 @@ placeholder rows carry one valid token and no drafts, so they resume from block 
 the accepted state inside the verify graph instead (copying it to block 0 after rejection
 sampling) was tried and rejected: in-place copies on the bound state buffers after the
 kernels that write them gave wrong results and cost about 13 ms per step.
+
+## Decode batches
+
+Decode buckets above one request pad the batch with rows whose block-table entries are `-1`.
+Padded rows write their K/V to slot 0 of the null block, their GDN state DMAs are skipped
+(out-of-bounds page index), and their hidden state is zeroed after every layer, so the null
+block (read, masked, for unused table entries) stays finite. Padded sampling rows get neutral
+parameters. Two device issues were specific to batches:
+
+- The library `attention_block_tkg` with `head_dim` > 128 wrote the transposed Q heads
+  head-major while RoPE and attention read them batch-major, mixing the heads of different
+  requests; the vendored copy writes them batch-major.
+- `index_select` of the final hidden states by the sampling positions returned NaN rows when
+  the same hidden states were also a graph output (the MTP draft input). Decode samples every
+  row in order, so the gather is skipped there.
 
 ## Recycled blocks
 
