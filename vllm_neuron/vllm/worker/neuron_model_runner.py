@@ -7263,8 +7263,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # Padded rows get neutral sampling params (top_k=-1, top_p=1, temperature 0)
                     # rather than top_k = top_p = 0.
                     pad_rows = bt_rows - sampling_params_tensor.shape[0]
-                    pad = torch.tensor([[-1.0, 1.0, 0.0]], dtype=sampling_params_tensor.dtype,
-                                       device=sampling_params_tensor.device).expand(pad_rows, 3)
+                    pad = torch.tensor([[-1.0, 1.0, 0.0]] * pad_rows, dtype=sampling_params_tensor.dtype,
+                                       device=sampling_params_tensor.device)
                     sampling_params_tensor = torch.cat([sampling_params_tensor, pad], dim=0)
 
             # Replicate sampling params for spec-decode verify step

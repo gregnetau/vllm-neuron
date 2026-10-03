@@ -13,12 +13,16 @@
 # limitations under the License.
 
 # Vendored from nkilib.experimental.transformer.attention_block_tkg (the nkilib shipped with
-# vllm-neuron 0.24.0.1.1.0) with one change for Qwen3.5 / Qwen3.8 decode: without the
-# in-kernel cache update, with one KV head and d_head > 128, the new K token is returned as
-# [B*S, d_head] rows (PE transpose + one DMA per d-tile) instead of the [d_head, B, S] layout,
-# which the library writes one 2-byte element per descriptor (~30 us per call). Relative
-# imports are made absolute and attention_block_tkg_k_rows_kernel (end of file) is the
-# torch-compatible entry point; everything else is unchanged.
+# vllm-neuron 0.24.0.1.1.0) with two changes for Qwen3.5 / Qwen3.8 decode:
+# - Without the in-kernel cache update, with one KV head and d_head > 128, the new K token is
+#   returned as [B*S, d_head] rows (PE transpose + one DMA per d-tile) instead of the
+#   [d_head, B, S] layout, which the library writes one 2-byte element per descriptor
+#   (~30 us per call).
+# - For d_head > 128, _process_head_group writes the transposed Q heads batch-major
+#   ([pmax, B, n_heads, S] per d-tile), the layout RoPE and attention read; the library writes
+#   them head-major, which mixes the heads of different requests when B > 1.
+# Relative imports are made absolute and attention_block_tkg_k_rows_kernel (end of file) is
+# the torch-compatible entry point; everything else is unchanged.
 
 """
 Attention Block TKG Kernel
@@ -1567,15 +1571,21 @@ def _process_head_group(
     """
     if n_d_tiles > 1:
         out = d_tiled_out
+        pmax = nl.tile_size.pmax
+        BnS = B * n_heads * S
         # Transpose heads from [B*S, n_heads*d] into out, tiling d into n_d_tiles free-dim chunks.
+        # Each d-tile is [pmax, B, n_heads, S] (batch outer, as RoPE and attention read it): the
+        # transposed head [pmax, B*S] goes to the strided columns of its head. (The library
+        # kernel writes it contiguously at head_idx * B * S, i.e. [n_heads, B, S], which
+        # interleaves the heads of different requests when B > 1.)
         for head_idx in range(n_heads):
             for i_d in range(n_d_tiles):
-                psum = nl.ndarray((nl.tile_size.pmax, B * S), dtype=QKV.dtype, buffer=nl.psum)
+                psum = nl.ndarray((pmax, B * S), dtype=QKV.dtype, buffer=nl.psum)
                 nisa.nc_transpose(
-                    psum, QKV[:, nl.ds(qkv_offset + head_idx * d + i_d * nl.tile_size.pmax, nl.tile_size.pmax)]
+                    psum, QKV[:, nl.ds(qkv_offset + head_idx * d + i_d * pmax, pmax)]
                 )
-                dst_offset = i_d * (B * n_heads * S) + head_idx * (B * S)
-                nisa.tensor_copy(out[:, nl.ds(dst_offset, B * S)], psum)
+                tile = out[:, nl.ds(i_d * BnS, BnS)].reshape((pmax, B, n_heads, S))
+                nisa.tensor_copy(tile[:, :, head_idx, :], psum.reshape((pmax, B, S)))
         out_2d = out  # already [pmax, n_d_tiles*B*n_heads*S]
     else:
         d, B, n_heads, S = dst_4d.shape
@@ -2779,6 +2789,7 @@ def attention_block_tkg_k_rows_kernel(
     """Copy of functional.attention.attention_decode._torch_compatible_attention_block_tkg_kernel
     calling the vendored attention_block_tkg above (a separate function, so the NKI compile
     cache keys it separately)."""
+    # rev 2: the NKI compile cache keys on this function's source only; bump on helper edits.
 
     sbm = _maybe_build_sbm(
         sbm_lower_bound, sbm_upper_bound, sbm_use_auto_alloc, sbm_default_stack_alloc
