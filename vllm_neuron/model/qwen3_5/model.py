@@ -1297,7 +1297,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         hidden_states, _ = self.model(input_ids, positions, attn_metadata=attn_metadata, rank=rank,
                                       inputs_embeds=inputs_embeds, is_token_ids=is_token_ids)
-        logits = self.lm_head(torch.index_select(hidden_states, dim=0, index=sampling_positions))
+        if is_prefill:
+            logits = self.lm_head(torch.index_select(hidden_states, dim=0, index=sampling_positions))
+        else:
+            # Decode samples every row in order (one per request, or 1 + k per request in an MTP
+            # verify), so the gather is skipped. With the hidden states also returned for the MTP
+            # draft, index_select gave NaN for all rows but the first on device (batch > 1).
+            logits = self.lm_head(hidden_states)
         # MTP drafts from the backbone's final-normed hidden state of every token.
         mtp_hidden = hidden_states if self._mtp_hidden_output else None
         if self.on_device_sampling_config is None:
