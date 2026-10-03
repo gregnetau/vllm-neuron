@@ -1057,10 +1057,17 @@ class NeuronWorker(WorkerBase):
         """
         gpu_mem_util = self.cache_config.gpu_memory_utilization
         if envs.VLLM_NEURON_CPU_COMPILE:
-            return self._estimate_available_memory_neuron(gpu_mem_util)
-        if envs.VLLM_NEURON_CPU_MODE:
-            return self._determine_available_memory_cpu(gpu_mem_util)
-        return self._determine_available_memory_neuron(gpu_mem_util)
+            available = self._estimate_available_memory_neuron(gpu_mem_util)
+        elif envs.VLLM_NEURON_CPU_MODE:
+            available = self._determine_available_memory_cpu(gpu_mem_util)
+        else:
+            available = self._determine_available_memory_neuron(gpu_mem_util)
+        # Recurrent-state models may keep their state in dedicated pools outside the KV cache.
+        state_pool = self.model_runner.state_pool_bytes() if self.model_runner is not None else 0
+        if state_pool:
+            logger.info("Dedicated recurrent-state pools: %.2f GiB per rank (outside the KV cache)",
+                        state_pool / (1024**3))
+        return max(available - state_pool, 0)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """

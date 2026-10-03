@@ -2029,6 +2029,63 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if new_blocks:
             self._clear_kv_blocks(sorted(new_blocks))
 
+    def _state_pool_pages(self, spec: "MambaSpec") -> int:
+        """Pages per recurrent-state layer in a dedicated pool, or 0 to keep the state in
+        vLLM's shared KV pool.
+
+        In the shared pool each raw tensor is bound twice (attention K/V views and state
+        views), and neuronx-cc's graph I/O check (NCC_EVRF009) counts it twice, which caps
+        the pool at about half of the free HBM. Without prefix caching a request holds its
+        1 + num_speculative_blocks state blocks for its whole life, so a dedicated pool of
+        one set per batch slot (plus the null page 0) suffices; GDN block tables are
+        translated to it (_state_pool_table). The state blocks vLLM still allocates in the
+        shared pool stay unused. Prefix caching keeps cached state blocks, so it uses the
+        shared pool."""
+        if self.vllm_config.cache_config.enable_prefix_caching or spec.mamba_cache_mode != "none":
+            return 0
+        if os.environ.get("VLLM_NEURON_SHARED_STATE_POOL") == "1":  # keep state in the KV pool
+            return 0
+        return 1 + self.max_num_reqs * (1 + spec.num_speculative_blocks)
+
+    def state_pool_bytes(self) -> int:
+        """HBM per rank of the dedicated recurrent-state pools (0 without any), to keep out of
+        the KV cache budget."""
+        total = 0
+        for spec in self.get_kv_cache_spec().values():
+            if isinstance(spec, MambaSpec):
+                total += self._state_pool_pages(spec) * spec.page_size_bytes
+        return total
+
+    def _state_pool_table(self, padded_num_reqs: int, n_blocks: int) -> torch.Tensor:
+        """[padded_num_reqs, n_blocks] dedicated-pool pages of each request's state blocks
+        (-1 for padded rows). A request keeps its slot (pages 1 + slot * n_blocks + j) from
+        its first step until it finishes or is preempted (_release_state_pool_slots); running
+        requests can be out of the persistent batch for a step (e.g. during another request's
+        prefill) and keep their state."""
+        slots = self._state_pool_slots
+        for req_id in [r for r in slots if r not in self.requests]:
+            self._state_pool_free.append(slots.pop(req_id))
+        table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
+        for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
+            if req_id is None:
+                continue
+            if req_id not in slots:
+                if not self._state_pool_free:
+                    raise RuntimeError("Recurrent-state pool exhausted: more live requests than max_num_seqs")
+                slots[req_id] = self._state_pool_free.pop(0)
+            table[i] = 1 + slots[req_id] * n_blocks + torch.arange(n_blocks, dtype=torch.int32)
+        return table.to(self.device)
+
+    def _release_state_pool_slots(self, scheduler_output: "SchedulerOutput") -> None:
+        """Free the state-pool slots of finished and preempted requests (a preempted request
+        is recomputed from zero state when it resumes)."""
+        slots = getattr(self, "_state_pool_slots", None)
+        if not slots:
+            return
+        for req_id in set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ()):
+            if req_id in slots:
+                self._state_pool_free.append(slots.pop(req_id))
+
     def _setup_mamba_align(self, kv_cache_config, state_caches) -> None:
         """Prefix caching for recurrent-state models (vLLM Mamba "align" mode): a request's
         running state lives in the state block of its last scheduled token; when a step
@@ -2130,6 +2187,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         self._clear_new_attention_blocks(scheduler_output)
+        self._release_state_pool_slots(scheduler_output)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -4447,6 +4505,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
                     state_in[i] = self._mamba_state_in.get(req_id, 0)
                 state_in = state_in.to(self.device)
+            if kv_cache_group_id in getattr(self, "_state_pool_groups", ()):
+                blk_table_tensor = self._state_pool_table(padded_num_reqs, blk_table_tensor.shape[1])
+                full_blk_table_tensor = blk_table_tensor.clone()
             if kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
                 # Align mode: the running state's block only; token validity from the
                 # attention group's slots (state blocks before it may be the null block).
@@ -8885,10 +8946,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 layout = _state_page_layout(kv_cache_spec.shapes, kv_cache_spec.dtypes)
                 page_bytes = kv_cache_spec.page_size_bytes
                 _state_half_elems(layout, page_bytes)  # validates fit
+                n_pages = self._state_pool_pages(kv_cache_spec)
                 for layer_name in group.layer_names:
-                    state_caches[layer_name] = list(
-                        _paired_half_views(kv_cache_raw_tensors[layer_name], page_bytes)
-                    )
+                    if n_pages:
+                        # Dedicated pool (see _state_pool_pages): the shared raw tensor is
+                        # bound only as attention KV, so graphs see each pool byte once.
+                        state_caches[layer_name] = [
+                            torch.zeros(n_pages, page_bytes // 8, dtype=torch.float32, device=self.device)
+                            for _ in range(2)]
+                    else:
+                        state_caches[layer_name] = list(
+                            _paired_half_views(kv_cache_raw_tensors[layer_name], page_bytes))
 
             else:
                 raise NotImplementedError(
@@ -8898,6 +8966,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
         if state_caches:
+            self._state_pool_groups = [
+                gi for gi, g in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, MambaSpec) and self._state_pool_pages(g.kv_cache_spec)]
+            self._state_pool_slots: dict[str, int] = {}
+            self._state_pool_free = list(range(self.max_num_reqs))
             self.model.bind_state_cache(state_caches)
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
             self._setup_mamba_align(kv_cache_config, state_caches)
