@@ -944,9 +944,17 @@ def attention_block_tkg(
         _n_d_tiles = d_head // nl.tile_size.pmax
         if _rows_out:
             k_free = K_tkg_sb.shape[1] // _n_d_tiles
+            # The PE does not transpose FP8: an FP8 K tile (FP8 KV cache) goes through bf16, exact
+            # for values that are already FP8.
+            k_fp8 = K_tkg_sb.dtype != X.dtype
             for i_d in range(_n_d_tiles):
-                k_ps = nl.ndarray((k_free, nl.tile_size.pmax), dtype=K_tkg_sb.dtype, buffer=nl.psum)
-                nisa.nc_transpose(k_ps, K_tkg_sb[:, nl.ds(i_d * k_free, k_free)])
+                k_src = K_tkg_sb[:, nl.ds(i_d * k_free, k_free)]
+                if k_fp8:
+                    k_bf = sbm.alloc_stack((nl.tile_size.pmax, k_free), dtype=X.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(k_bf, k_src)
+                    k_src = k_bf
+                k_ps = nl.ndarray((k_free, nl.tile_size.pmax), dtype=k_src.dtype, buffer=nl.psum)
+                nisa.nc_transpose(k_ps, k_src)
                 k_rows = sbm.alloc_stack((k_free, nl.tile_size.pmax), dtype=K_tkg_sb.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(k_rows, k_ps)
                 nisa.dma_copy(K_tkg_hbm[:, nl.ds(i_d * nl.tile_size.pmax, nl.tile_size.pmax)], k_rows)
@@ -2789,7 +2797,7 @@ def attention_block_tkg_k_rows_kernel(
     """Copy of functional.attention.attention_decode._torch_compatible_attention_block_tkg_kernel
     calling the vendored attention_block_tkg above (a separate function, so the NKI compile
     cache keys it separately)."""
-    # rev 2: the NKI compile cache keys on this function's source only; bump on helper edits.
+    # rev 3: the NKI compile cache keys on this function's source only; bump on helper edits.
 
     sbm = _maybe_build_sbm(
         sbm_lower_bound, sbm_upper_bound, sbm_use_auto_alloc, sbm_default_stack_alloc

@@ -9051,6 +9051,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for layer in state_layers:
             layout = _state_page_layout(layer.shapes, layer.dtypes)
             page = _padded_state_page_bytes(layout.page_bytes, attn_page, align_pages)
+            # Power-of-two attention pages per state page, so the enlarged attention block
+            # divides max_model_len (FP8 KV at Qwen3.8 sizes would otherwise give 1792-token
+            # blocks, block tables of 1064 entries, and odd-stride FP8 DMAs neuronx-cc rejects).
+            page = attn_page * (1 << (page // attn_page - 1).bit_length())
             if cache_config.enable_prefix_caching:
                 block_size = page // attn_page * kernel_block
                 mode = "align"
