@@ -31,7 +31,8 @@ export NEURON_SKIP_EFA_AFFINITY=1                   # trn2.3xlarge has no EFA
 # KV/state pool = min(free HBM, KV_CAP_FRACTION * GPU_MEM_UTIL * 24 GB) per logical core.
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP_FRACTION:-0.15}
 
-NEURON_CONFIG="\"num_batched_tokens_buckets\": [${PREFILL_BUCKET}], \"num_seqs_buckets\": [${MAX_NUM_SEQS:-1}]"
+# Decode batch buckets (each is a compiled graph); e.g. SEQS_BUCKETS="1, 4, 8" with MAX_NUM_SEQS=8.
+NEURON_CONFIG="\"num_batched_tokens_buckets\": [${PREFILL_BUCKET}], \"num_seqs_buckets\": [${SEQS_BUCKETS:-${MAX_NUM_SEQS:-1}}]"
 if [[ -n "${DECODE_CTX_BUCKETS:-}" ]]; then  # e.g. "4096, 16384, 32768": decode reads only the needed KV
   NEURON_CONFIG="${NEURON_CONFIG}, \"decode_context_length_buckets\": [${DECODE_CTX_BUCKETS}]"
 fi
