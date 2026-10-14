@@ -38,6 +38,7 @@ Models listed below are tested end-to-end on Neuron hardware with correctness va
 | GPT-OSS | 20B, 120B | Text | Trn2, Trn3 | ✅ | ✅ | In progress |
 | Qwen3-VL | 32B (Dense) | Multimodal | Trn2, Trn3 | ✅ | ✅ | In progress |
 | Qwen3-Embedding | 8B | Embedding | Trn2, Trn3 | ✅ | ✅ | In progress |
+| Qwen3.5 / Qwen3.8 | 27B (Dense, hybrid Gated DeltaNet) | Text | Trn2 | ✅ | ✅ | In progress |
 
 - **Correctness** — Accuracy validation passing (logit comparison, dataset accuracy validation)
 - **Perf Test** — Performance benchmark tests tracked across releases

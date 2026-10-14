@@ -3,7 +3,7 @@
 <!-- meta: description: Design of per-request recurrent state (Gated DeltaNet) alongside paged
 KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-03 -->
+<!-- meta: date_updated: 2026-10-14 -->
 
 ## Overview
 
@@ -30,8 +30,9 @@ scheduler input is needed.
 vLLM unifies page sizes across groups by enlarging the attention block size. The runner pads
 the state page so the enlarged attention block is a whole number of 256-token blocks, and
 the attention metadata splits each manager block back into kernel-sized blocks
-(`block_size` 32). With one KV head per rank, a manager block is a pure reshape of its kernel
-blocks. The runner logs the result, for example
+(`--block-size`, 32 by default; 128 is recommended with an FP8 KV cache, see
+[Full-attention prefill](#full-attention-prefill)). With one KV head per rank, a manager block
+is a pure reshape of its kernel blocks. The runner logs the result, for example
 `KV cache block_size resolved: cache_config=32, per_group=[1024, 2048, 2048, 2048]`.
 
 ## Dedicated state pool
@@ -146,6 +147,36 @@ parameters. Two device issues were specific to batches:
   the same hidden states were also a graph output (the MTP draft input). Decode samples every
   row in order, so the gather is skipped there.
 
+With `decode_context_length_buckets`, the runner trims each attention group's block table to
+the bucket's block count. The GDN groups' tables (`1 + k` state blocks, block size as large as
+`max_model_len`) are not trimmed: they do not grow with the context, and warmup compiles them
+whole.
+
+## Full-attention prefill
+
+Under segmented prefill (prompt longer than `max_num_batched_tokens`) the 16 full-attention
+layers attend each chunk to the cached prefix and to the chunk itself, already written to the
+cache. They run the nkilib `attention_segmented_cte` kernel through `NF.segmented_attention`,
+which iterates over the prefix with dynamic loops, so a chunk's cost depends on the cached
+length and not on `max_model_len` (the previous PyTorch path gathered and scored the whole
+block table, a `[6, 1024, max_model_len]` float32 score tensor per layer). Kernel constraints
+and how the plugin meets them:
+
+| Kernel constraint | Handling |
+|---|---|
+| `head_dim` <= 512, tiled over 128 partitions | 256 is supported; the wrapper's former 128 limit was stale |
+| K tile of 512 tokens: block size divides 512 | blocks viewed as sub-blocks (below) |
+| DMA-transpose K load: 2-byte dtype, blocks per segment a multiple of 16 | BF16 cache viewed as 64-token blocks (16 per 1024-token segment) |
+| Per-block K load (otherwise): block size <= 128 | FP8 cache viewed as 128-token blocks |
+| FP8 K only pre-transposed or packed | vendored `attention_segmented_cte.py`: 1-byte K takes the per-block load, widened to bf16 for the PE transpose |
+| `prior_tokens` a multiple of the block size | prefills are isolated and chunked by `max_num_batched_tokens`; cached prefixes are block aligned |
+
+With one KV head per rank a block `[1, B, Dh]` is contiguous, so the cache viewed as
+`[nb * r, 1, B / r, Dh]` is a reshape and block `b` becomes sub-blocks `b*r .. b*r+r-1`
+(`_split_kv_blocks`); unused table entries (-1) become the null block's sub-blocks. The
+packed FP8 K layout that the library kernel reads directly is not used: the decode kernel
+reads it only at `head_dim` <= 128.
+
 ## Recycled blocks
 
 Block ids are global across groups, so a KV block can previously have held float32 state.
@@ -174,6 +205,7 @@ The model avoids patterns that lower incorrectly or slowly on Neuron:
 | A page moved as one `[B, half]` row | `[B, rows, 128]` gathers and scatters |
 | `solve_triangular` | matmul-only unit-lower inverse |
 | Writing the KV cache ahead of `attention_decode` | clear only when required |
+| Gathering the whole block table for prefill attention | segmented attention kernel over the cached prefix |
 
 ## Static FP8
 
