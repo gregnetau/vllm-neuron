@@ -4476,7 +4476,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     block_size=block_size,
                     max_num_draft_tokens=max_num_draft_tokens,
                 )
-                if bucket_blocks < blk_table_tensor.shape[1]:
+                # Recurrent-state tables (1 + speculative blocks) do not grow with the
+                # context; warmup keeps them whole (see the dummy metadata builder).
+                if bucket_blocks < blk_table_tensor.shape[1] and not isinstance(spec, MambaSpec):
                     # index_select rather than a slice: dynamo guards check
                     # the literal stride of the input, and a slice
                     # (`blk_table_tensor[:, :bucket_blocks]`) only changes
