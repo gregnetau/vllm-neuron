@@ -81,6 +81,52 @@ _wrapped_attention_kv_parallel_segmented_cte = wrap_nki(
 
 # Maximum head dimension supported by the NKI kernel (SBUF partition constraint).
 _MAX_HEAD_DIM = 128
+# attention_segmented_cte tiles head_dim over 128-partition chunks: up to 512, and
+# head_dim > 256 only with prior_seg_size <= 2048 (mirrors the kernel's asserts).
+_MAX_SEGMENTED_HEAD_DIM = 512
+_MAX_SEG_SIZE_ABOVE_256 = 2048
+# The kernel loads K in 512-token tiles and needs block_size to divide the tile.
+_KERNEL_K_TILE = 512
+# Preferred kernel block per K dtype (head_dim 256, 1024-token segments, 31k prior): 2-byte K
+# with 64-token blocks takes the DMA-transpose load (blocks per segment a multiple of 16; 6.8 ms
+# vs 8.4 at 32 and 10.8 at 128). 1-byte K loads per block (<= 128 tokens; a model kernel, see
+# segmented_attention(kernel=)), fastest with the largest block (10.3 ms vs 24.8 at 32).
+_PREFERRED_BLOCK = {2: 64, 1: 128}
+
+
+def _split_kv_blocks(
+    k_cache: Tensor, v_cache: Tensor, block_tables: Tensor, block_size: int
+) -> tuple[Tensor, Tensor, Tensor, int]:
+    """View blocks larger than the preferred kernel block (64 tokens for 2-byte K, 128 for
+    1-byte K) as ``r = block_size // preferred`` sub-blocks.
+
+    With one KV head the cache ``[nb, 1, block_size, D]`` is contiguous per block, so
+    ``[nb * r, 1, preferred, D]`` is a view and block ``b`` becomes sub-blocks
+    ``b*r .. b*r+r-1``. Unused table entries (-1) map to the sub-blocks of the null block 0.
+    With several KV heads blocks are passed through, up to what the kernel loads (512 tokens;
+    128 for 1-byte K).
+    """
+    one_byte = k_cache.element_size() == 1
+    sub = _PREFERRED_BLOCK[1 if one_byte else 2]
+    if block_size <= sub:
+        return k_cache, v_cache, block_tables, block_size
+    if block_size % sub or k_cache.dim() != 4 or k_cache.shape[1] != 1:
+        max_block = 128 if one_byte else _KERNEL_K_TILE
+        if block_size <= max_block:
+            return k_cache, v_cache, block_tables, block_size
+        raise ValueError(
+            f"segmented attention with block_size={block_size} > {max_block} needs "
+            f"block_size % {sub} == 0 and an unpacked cache with one KV head "
+            f"(got k_cache shape {tuple(k_cache.shape)})."
+        )
+    r = block_size // sub
+    nb, _, _, d = k_cache.shape
+    k_cache = k_cache.reshape(nb * r, 1, sub, d)
+    v_cache = v_cache.reshape(nb * r, 1, sub, v_cache.shape[-1])
+    bt = block_tables.clamp(min=0) * r
+    offsets = torch.arange(r, dtype=bt.dtype, device=bt.device)
+    block_tables = (bt.unsqueeze(-1) + offsets).reshape(bt.shape[0], -1)
+    return k_cache, v_cache, block_tables, sub
 
 
 def _decode_packed_to_unpacked(k_cache: Tensor) -> Tensor:
@@ -670,6 +716,7 @@ def segmented_attention(
     fp8_packed: bool = False,
     k_scale: Optional[Tensor] = None,
     v_scale: Optional[Tensor] = None,
+    kernel=None,
 ) -> Tensor:
     """
     Segmented Attention API using the attention_segmented_cte NKI kernel.
@@ -690,7 +737,7 @@ def segmented_attention(
     Dimensions:
         Nh: Number of Q heads on this TP rank
         S_q: Query sequence length
-        D: Head dimension (max 128)
+        D: Head dimension (max 512; max 256 for kv_segment_size > 2048)
 
     Args:
         q: Query tensor
@@ -712,13 +759,15 @@ def segmented_attention(
             is never packed. Default: False
         k_scale: FP8 K dequant scale [PMAX, 1], applied in-kernel. Default: None
         v_scale: FP8 V dequant scale [PMAX, 1], applied in-kernel. Default: None
+        kernel: Optional @nki.jit entry point with the signature of attention_segmented_cte
+            (e.g. a model's vendored variant) instead of the library kernel. Default: None
 
     Returns:
         Output tensor with attention results.
 
     Raises:
         ValueError: If any kernel constraint is violated:
-            - head_dim > 128
+            - head_dim > 512, or head_dim > 256 with kv_segment_size > 2048
             - kv_segment_size not in SUPPORTED_KV_SEGMENT_SIZES
             - kv_segment_size not divisible by block_size
             - sliding_window not divisible by block_size (when set)
@@ -780,12 +829,15 @@ def segmented_attention(
     seqlen_q = q.shape[1] if tp_q else q.shape[2]
     d_head = q.shape[2] if tp_q else q.shape[1]
 
-    # 1. head_dim must fit in a single SBUF partition (128 elements)
-    if d_head > _MAX_HEAD_DIM:
+    # 1. head_dim is tiled over 128-partition chunks (kernel limits)
+    if d_head > _MAX_SEGMENTED_HEAD_DIM or (
+        d_head > 256 and kv_segment_size > _MAX_SEG_SIZE_ABOVE_256
+    ):
         raise ValueError(
-            f"head_dim={d_head} exceeds maximum supported head dimension "
-            f"({_MAX_HEAD_DIM}). The segmented attention kernel requires "
-            f"head_dim <= {_MAX_HEAD_DIM}."
+            f"head_dim={d_head} with kv_segment_size={kv_segment_size} is not "
+            f"supported by the segmented attention kernel (head_dim <= "
+            f"{_MAX_SEGMENTED_HEAD_DIM}, and kv_segment_size <= "
+            f"{_MAX_SEG_SIZE_ABOVE_256} for head_dim > 256)."
         )
 
     # 2. kv_segment_size must be a supported size
@@ -846,7 +898,13 @@ def segmented_attention(
             "ships the segmented packed FP8 read path."
         )
 
-    result = _wrapped_attention_segmented_cte[2](
+    if not fp8_packed:
+        k_cache, v_cache, block_tables, block_size = _split_kv_blocks(
+            k_cache, v_cache, block_tables, block_size
+        )
+
+    wrapped = wrap_nki(kernel) if kernel is not None else _wrapped_attention_segmented_cte
+    result = wrapped[2](
         q=q_seg,
         k_cache=k_cache,
         v_cache=v_cache,

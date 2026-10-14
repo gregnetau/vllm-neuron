@@ -201,8 +201,8 @@ class Qwen3_5Attention(nn.Module):
     """GQA attention with output gate, per-head QK-norm, partial rotary.
 
     >>> PARALLELISM: TP <<< Q/K/V/gate heads sharded; o_proj row-parallel.
-    <-- MODEL-SPECIFIC: head_dim 256 (> 128: flash/o_proj kernels fall back to PyTorch;
-        # attention_decode is called with d_head=256).
+    <-- MODEL-SPECIFIC: head_dim 256 (o_proj viewed as 128-wide heads; segmented prefill and
+        # attention_decode run at d_head=256).
     """
 
     # Static-FP8 input scales: buffer -> calibration modules (relative to the layer).
@@ -376,6 +376,24 @@ class Qwen3_5Attention(nn.Module):
         self.k_cache.index_put_((blocks,), zeros)
         self.v_cache.index_put_((blocks,), zeros.to(self.v_cache.dtype))
 
+    def _segmented_kernel_ok(self, block_size: int) -> bool:
+        """The segmented prefill kernel reads only the cached context in use (cost bounded by the
+        prompt, not max_model_len). With one KV head per rank any block size works (larger
+        blocks are viewed as sub-blocks); otherwise blocks up to what it loads (512 tokens; 128
+        for an FP8 K cache)."""
+        if self.num_key_value_heads_per_rank != 1:
+            return block_size <= (128 if self.kv_fp8 else 512)
+        return True
+
+    def _segmented_kernel(self):
+        """Vendored segmented prefill kernel that reads an unpacked FP8 K cache (the library
+        needs the packed layout, which the decode kernel cannot read at head_dim > 128)."""
+        if not self.kv_fp8:
+            return None
+        from .attention_segmented_cte import attention_segmented_cte_fp8_kernel
+
+        return attention_segmented_cte_fp8_kernel
+
     def _attend_cached_torch(self, q, md, block_size):
         """Prefill attention over the request's cached context + this chunk (already written to
         the cache), in torch. q [Nh, T, Dh] -> [Nh, Dh, T]. One request per prefill step.
@@ -435,16 +453,19 @@ class Qwen3_5Attention(nn.Module):
         self._write_kv(k, v, slot_mapping, block_size)
 
         kv_segment_size = md.get("kv_segment_size")
-        if kv_segment_size and self.head_dim > 128:
-            # The segmented attention kernel needs head_dim <= 128 (27B: 256).
+        if kv_segment_size and not self._segmented_kernel_ok(block_size):
             attn_output = self._attend_cached_torch(q, md, block_size)
         elif kv_segment_size:
+            # FP8 KV stores x * (1/s): K dequant folds into the softmax scale, V's divides out.
             attn_output = NF.segmented_attention(
                 q, k_cache=self.k_cache, v_cache=self.v_cache,
                 block_tables=md["block_table_tensor"], prior_tokens=md.get("cached_seq_len"),
                 block_size=block_size, kv_segment_size=kv_segment_size,
-                scale=self.scaling, tp_q=True, tp_out=True,
+                scale=self.scaling / self.k_scale_float, tp_q=True, tp_out=True,
+                kernel=self._segmented_kernel(),
             )
+            if self.v_scale_float != 1.0:
+                attn_output = attn_output / self.v_scale_float
         else:
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
             v = v.repeat_interleave(self.num_key_value_groups, dim=0)
