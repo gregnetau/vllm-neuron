@@ -5,7 +5,7 @@
 checkpoints, feature support, FP8 calibration, performance and known limitations. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.5, Qwen3.8, Qwen3.8-27B, Gated DeltaNet, hybrid,
 linear attention, FP8, model recipe, model card, LLM serving, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-10-03 -->
+<!-- meta: date_updated: 2026-10-14 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -41,9 +41,8 @@ multi-token-prediction (MTP) head is loaded as a speculative-decoding draft when
 | | Pipeline / context parallelism | ❌ |
 | **Performance** | Fused NKI GDN decode kernel (BF16: one token; FP8: whole sub-layer, up to 32 tokens) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
-| | Segmented prefill (`max_model_len` > prefill bucket) | ✅ |
-| | Long context (`max_model_len` 32768; about 600k tokens of KV in BF16, 1.2M in FP8) | ✅ |
-| | `max_model_len` above 32768 | ❌ (prefill, see [Known limitations](#known-limitations)) |
+| | Segmented prefill (`max_model_len` > prefill bucket), NKI kernel at `head_dim` 256, BF16 and FP8 KV | ✅ |
+| | Long context up to the native `max_model_len` 262144 (KV pool about 640k tokens in BF16, 1.19M in FP8) | ✅ |
 | | Prefix caching (1024-token blocks, Mamba `align` mode) | ✅ |
 | | Multi-token prediction (MTP) speculative decoding, 1-2 draft tokens | ✅ |
 | **Compilation** | torch.compile (XLA backend) | ✅ |
@@ -238,7 +237,56 @@ second (mean 1.85 and 2.4 tokens per step). With synchronous scheduling a step w
 tokens takes about 33 ms: 20.5 ms for the target's verify pass (3 tokens), 4.4 ms for the
 draft and about 7 ms on the host; asynchronous scheduling overlaps the host work.
 
-At `max_model_len` 32768 (FP8, MTP with 2 draft tokens, asynchronous scheduling, batch 1):
+### Long context (native 262144)
+
+Prefill attention runs the nkilib segmented attention kernel (`NF.segmented_attention`), which
+loops over the cached context actually in use, so a chunk's cost depends on its position, not
+on `max_model_len`. The kernel tiles `head_dim` 256 over two 128-partition tiles. With one KV
+head per rank the plugin views the KV blocks as the kernel's preferred block (64 tokens for a
+BF16 cache: DMA-transpose load; 128 for FP8), without a copy. An FP8 K cache uses the vendored
+`attention_segmented_cte.py`, which loads 1-byte K per block with a PE transpose (the library
+reads FP8 K only in the packed layout, and the decode kernel cannot read that layout at
+`head_dim` 256). `examples/vllm_neuron/models/qwen3_5/check_segmented_attention.py` compares the
+kernel with a float32 reference on device (cosine >= 0.99996 at every prior length up to 256k).
+
+Per layer and rank, one 1024-token chunk after a cached prefix (6 query heads, `head_dim` 256):
+
+| Cached prefix | Kernel, BF16 KV | Kernel, FP8 KV (block 128) | PyTorch fallback (before) |
+|---|---|---|---|
+| 0 | 0.9 ms | 0.9 ms | 15 ms (32k), 108 ms (128k), out of memory (256k) |
+| 31k | 6.8 ms | 10.3 ms | same |
+| 130k | 23.6 ms | | same |
+| 261k | 46.9 ms | | |
+
+FP8 weights, MTP with 2 draft tokens, FP8 KV, 4 sequences, `BLOCK_SIZE=128`, decode context
+buckets 16k / 64k / 262k (each bucket is a set of compiled decode graphs; cold compile about
+28 minutes, then cached):
+
+```bash
+MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=$PWD/fp8_act_amax.json MTP_TOKENS=2 \
+    KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 MAX_MODEL_LEN=262144 MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" \
+    DECODE_CTX_BUCKETS="16384, 65536" GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 \
+    examples/vllm_neuron/models/qwen3_5/serve.sh
+```
+
+vLLM reports a KV cache of 1,190,172 tokens (4.5 requests of 262144). Measured with
+`benchmark_serve.py` and `check_long_context.py` (passkey retrieval, greedy):
+
+| Prompt tokens | TTFT | TPOT | Passkey retrieval |
+|---|---|---|---|
+| 1,024 | 0.39 s | 8.9 ms | |
+| 28,856 | 13.3 s | 10.0 ms | depths 0.25, 0.75: correct |
+| 115,256 | 75 s | 15.0 ms (262k decode bucket) | depths 0.25, 0.75: correct |
+| 240,056 | 226 s | | depth 0.5: correct |
+
+With a BF16 KV cache (640k-token pool, block 32, no decode buckets) TTFT is 31 s at 61k,
+76 s at 123k and 199 s at 240k, and retrieval is correct at the same depths. Four concurrent
+19k-token requests all retrieve correctly; their prefills run one at a time (8.2 s each).
+Prefill time is about half attention (quadratic in the prompt) and half the dense layers
+(about 0.4 s per 1024-token chunk at any position).
+
+At `max_model_len` 32768 before the segmented prefill kernel (FP8, MTP with 2 draft tokens,
+asynchronous scheduling, batch 1; PyTorch attention fallback):
 
 | Prompt tokens | TTFT | TPOT |
 |---|---|---|
@@ -247,12 +295,10 @@ At `max_model_len` 32768 (FP8, MTP with 2 draft tokens, asynchronous scheduling,
 | 16,000 | 13 s | 9.1 ms |
 | 30,000 | 24.5 s | 9.1 ms |
 
-Decode time does not depend on context length. Prefill does: it costs about 0.8 s per
-1024-token chunk at any position, compared with 0.4 s at `max_model_len` 2048. Each chunk's
-full-attention layers (the PyTorch fallback, see [Known limitations](#known-limitations))
-gather and score the whole `max_model_len` of KV, a `[6, 1024, 32768]` float32 score tensor
-per rank and layer (about 24 ms per layer). A prefill attention kernel that reads only the
-context in use would bound this by the prompt length (see [Roadmap](#roadmap)).
+With the PyTorch fallback each chunk gathered and scored the whole `max_model_len` of KV
+(about 0.8 s per 1024-token chunk at any position); with the kernel the 28,856-token prompt
+takes 11.8 s instead of about 23 s (BF16 weights) and `max_model_len` is no longer bounded by
+the score tensor.
 
 Several concurrent requests at `max_model_len` 32768 (FP8, MTP with 2 draft tokens,
 `MAX_NUM_SEQS=8`, `SEQS_BUCKETS="1, 8"`; 1,000-token prompts, greedy, measured with a streaming
@@ -324,18 +370,19 @@ the full benchmark takes about 13 hours.
 
 ## Known limitations
 
-- **Prefill cost grows with `max_model_len`**, not with the prompt length (see
-  [Performance](#performance)), and `max_model_len` well above 32768 does not fit: the
-  PyTorch attention fallback materializes a `[6, 1024, max_model_len]` float32 score tensor
-  per layer (6.4 GB at 256k). Long contexts need a flash-attention prefill kernel for
-  `head_dim` 256 over the paged KV cache.
+- **Long-prompt prefill is compute bound**: about 0.4 s per 1024-token chunk in the dense
+  layers plus attention that grows with the position (47 ms per layer for the last chunk of a
+  256k prompt, about 20% of the Tensor Engine peak), so a 240k prompt takes 3-4 minutes.
+  Prefills run one request at a time and pause the other requests' decoding.
+- **FP8 KV prefill attention** loads K per 128-token block (PE transpose), about 1.5x the
+  BF16 kernel time at long prefixes.
 - **BF16 decode at batch > 1** uses the PyTorch GDN path (the fused BF16 GDN kernel is
   single-request); use FP8 for batched serving.
 - **vLLM allocates state blocks in the shared KV pool** that the dedicated state pool does
   not use: `3 (1 + k)` blocks per request (see
   [Context length and KV capacity](#context-length-and-kv-capacity)).
-- **Full-attention prefill falls back to PyTorch** when segmented prefill is active
-  (`head_dim` 256 exceeds the segmented attention kernel's limit of 128).
+- **Packed FP8 KV (`fp8_packed_kv`) is not supported**: the library decode kernel reads the
+  packed layout only at `head_dim` <= 128.
 - **`on_device_sampling_config.all_greedy` returns invalid token ids** with this model;
   use the default on-device sampling configuration.
 - **`logprobs` requests fail.** The sampler output does not include top log-probabilities.
@@ -371,8 +418,10 @@ rather than to propose a competing implementation.
 
 Before this work is proposed upstream:
 
-1. **Long-context prefill**: a flash-attention prefill kernel for `head_dim` 256 over the
-   paged KV cache that reads only the context in use, for `max_model_len` up to 256k.
+1. **Long-context prefill** (done: segmented prefill kernel at `head_dim` 256, BF16 and FP8
+   KV, `max_model_len` 262144). Next: dense-layer prefill throughput, the attention kernel's
+   efficiency at long prefixes (one K/V load for the 6 query heads of a KV head), and a DMA
+   transpose load for FP8 K.
 2. **KV pool**: stop allocating unused state blocks in the shared pool; dedicated state pool
    with prefix caching.
 3. **Aider Polyglot** and serving benchmarks at the target context length and concurrency.

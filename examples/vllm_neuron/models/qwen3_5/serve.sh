@@ -18,9 +18,9 @@
 #   MODEL=... FP8_SCALES=... MTP_TOKENS=2 MAX_MODEL_LEN=32768 GPU_MEM_UTIL=0.9 KV_CAP_FRACTION=0.35 \
 #       examples/vllm_neuron/models/qwen3_5/serve.sh
 #
-# Other knobs: PREFILL_BUCKET (default 1024), MAX_NUM_SEQS (default 1; larger batches produce
-# wrong output, see the recipe), DECODE_CTX_BUCKETS, ASYNC_SCHEDULING (default 1),
-# SERVED_MODEL_NAME (default: the checkpoint directory name).
+# Other knobs: PREFILL_BUCKET (default 1024), MAX_NUM_SEQS (default 1), SEQS_BUCKETS,
+# DECODE_CTX_BUCKETS, BLOCK_SIZE (attention kernel block, vLLM's default if unset),
+# ASYNC_SCHEDULING (default 1), SERVED_MODEL_NAME (default: the checkpoint directory name).
 set -euo pipefail
 
 MODEL=${MODEL:?set MODEL to the checkpoint directory}
@@ -48,6 +48,7 @@ if [[ -n "${MTP_TOKENS:-}" ]]; then
   SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}")
 fi
 [[ "${ASYNC_SCHEDULING:-1}" == 1 ]] || SPEC_ARGS+=(--no-async-scheduling)
+[[ -z "${BLOCK_SIZE:-}" ]] || SPEC_ARGS+=(--block-size "${BLOCK_SIZE}")
 
 exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --served-model-name "${SERVED_MODEL_NAME:-$(basename "${MODEL}")}" \
