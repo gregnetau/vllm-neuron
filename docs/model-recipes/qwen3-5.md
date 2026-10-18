@@ -379,9 +379,40 @@ which the server returns inline up to `</think>`. They set no `max_tokens`: vLLM
 requests whose prompt plus `max_tokens` exceeds `max_model_len`, and by default it allows the
 rest of the context.
 
-Results: in progress (see the run log). A 3-exercise smoke run at `max_model_len` 32768 with
-one sequence took about 200 s per exercise, with 16k completion tokens per exercise (thinking
-included), all responses well formed and no exhausted context windows.
+### Results
+
+Full run, 2026-10-14 to 2026-10-16 (Aider 0.86.3.dev, commit `5dc9490`; the throughput
+configuration above; diff edit format, 2 tries, 8 threads):
+
+| | |
+|---|---|
+| Pass rate, 2 tries | **73.8%** (166 / 225) |
+| Pass rate, first try | 30.2% (68) |
+| Well-formed responses | 97.3% (6 malformed) |
+| Exhausted context windows | 3 |
+| Prompt / completion tokens | 3.19M / 3.22M |
+| Wall time | about 47.5 hours |
+
+| Language | Exercises | Pass, 2 tries | Pass, first try | Timed-out requests |
+|---|---|---|---|---|
+| JavaScript | 49 | 87.8% | 24.5% | 18 |
+| Python | 34 | 82.4% | 26.5% | 33 |
+| Rust | 30 | 73.3% | 46.7% | 44 |
+| Go | 39 | 71.8% | 38.5% | 47 |
+| C++ | 26 | 69.2% | 15.4% | 15 |
+| Java | 47 | 57.4% | 29.8% | 48 |
+
+The per-language first-try split is tallied from the per-exercise result files. The client
+timed out 196 requests (`litellm.Timeout`; 205 error outputs): thinking responses of tens of
+thousands of tokens at batch 8 outlast the default request timeout, and Aider retries them
+from the start. That wasted generation accounts for most of the wall time, and timed-out
+requests may also have cost passes, so the score is a lower bound for this configuration.
+Raise the client timeout before rerunning.
+
+On the server side the run was clean: one server process for the whole run, no tracebacks,
+recompiles or engine errors; 801 of 804 requests returned HTTP 200, and the 3 HTTP 400s match
+the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 tokens/s (about
+270 tokens/s with 8 requests decoding); MTP accepted 2.65-2.69 tokens per step.
 
 ## Known limitations
 
@@ -452,7 +483,8 @@ Before this work is proposed upstream:
    a KV head), and a DMA-transpose load for FP8 K.
 2. **Scheduling**: interleave prefill chunks with decode steps so a long prefill does not pause
    the other requests.
-3. **Aider Polyglot**: the full 225-exercise result (in progress), then at long context.
+3. **Aider Polyglot**: rerun with a longer client request timeout (the first run, 73.8%, lost
+   196 requests to client timeouts), then at long context.
 4. **KV pool**: stop allocating unused state blocks in the shared pool; dedicated state pool
    with prefix caching; re-validate prefix caching with the segmented prefill kernel.
 5. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
