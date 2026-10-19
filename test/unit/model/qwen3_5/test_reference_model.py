@@ -5,7 +5,7 @@ import pytest
 import torch
 
 hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 
 @pytest.fixture(scope="module")

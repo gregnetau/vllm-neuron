@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=None, help="delta-rule chunk (default gdn_ops')")
     args = ap.parse_args()
     import libtorch_neuronx_lite  # noqa: F401
+
     from vllm_neuron.envs import get_compile_backend_name
     from vllm_neuron.model.qwen3_5 import gdn_ops
 

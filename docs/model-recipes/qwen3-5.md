@@ -42,9 +42,11 @@ multi-token-prediction (MTP) head is loaded as a speculative-decoding draft when
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
 | | Decode batches > 1 (`max_num_seqs` > 1), with and without MTP | ✅ |
 | | Pipeline / context parallelism | ❌ |
-| **Context** | Native `max_model_len` 262144 (KV pool about 640k tokens in BF16, 1.19M in FP8) | ✅ |
+| **Context** | Native `max_model_len` 262144 (KV pool about 640k tokens in BF16, 1.26M in FP8) | ✅ |
 | | Segmented (chunked) prefill: NKI attention kernel at `head_dim` 256, BF16 and FP8 KV | ✅ |
+| | Several prefill buckets with matching segment sizes (`PREFILL_BUCKETS`) | ✅ |
 | | Decode context-length buckets (`DECODE_CTX_BUCKETS`) | ✅ |
+| | Decode steps between the chunks of a long prefill (`DECODE_INTERLEAVE`) | ✅ |
 | | Prefix caching (Mamba `align` mode) | ✅ (not re-validated with the segmented prefill kernel) |
 | **Performance** | Fused NKI GDN decode kernel (BF16: one token; FP8: whole sub-layer, up to 32 tokens) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
@@ -71,8 +73,8 @@ python examples/vllm_neuron/models/qwen3_5/calibrate_fp8.py \
 # 2. Serve (recommended long-context configuration, see below)
 MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=<path-to-checkpoint>/Qwen3.8-27B/fp8_act_amax.json \
     MTP_TOKENS=2 KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 MAX_MODEL_LEN=262144 MAX_NUM_SEQS=4 \
-    SEQS_BUCKETS="1, 4" DECODE_CTX_BUCKETS="16384, 65536" GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 \
-    examples/vllm_neuron/models/qwen3_5/serve.sh
+    SEQS_BUCKETS="1, 4" DECODE_CTX_BUCKETS="16384, 65536, 131072" DECODE_INTERLEAVE=1 \
+    GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 examples/vllm_neuron/models/qwen3_5/serve.sh
 ```
 
 ### Recommended configurations
@@ -80,14 +82,19 @@ MODEL=<path-to-checkpoint>/Qwen3.8-27B FP8_SCALES=<path-to-checkpoint>/Qwen3.8-2
 All with FP8 weights (`FP8_SCALES`), MTP with 2 draft tokens (`MTP_TOKENS=2`), FP8 KV
 (`KV_CACHE_DTYPE=fp8`), `BLOCK_SIZE=128`, `GPU_MEM_UTIL=0.95`, `KV_CAP_FRACTION=0.48`:
 
-| Use | `MAX_MODEL_LEN` | `MAX_NUM_SEQS` / `SEQS_BUCKETS` | `DECODE_CTX_BUCKETS` | Cold compile |
-|---|---|---|---|---|
-| Long documents, native context | 262144 | 4 / `"1, 4"` | `"16384, 65536"` | about 28 min |
-| Agentic coding, throughput (Aider) | 65536 | 8 / `"1, 8"` | `"16384"` | |
-| Lowest latency, short prompts | 2048 | 1 / `"1"` | | about 12 min |
+| Use | `MAX_MODEL_LEN` | `MAX_NUM_SEQS` / `SEQS_BUCKETS` | `DECODE_CTX_BUCKETS` | Other | Cold compile |
+|---|---|---|---|---|---|
+| Native context, mixed prompt lengths | 262144 | 4 / `"1, 4"` | `"16384, 65536, 131072"` | `DECODE_INTERLEAVE=1` | about 40 min |
+| Native context, mostly 100k+ prompts | 262144 | 4 / `"1, 4"` | `"16384, 65536, 131072"` | `DECODE_INTERLEAVE=1 PREFILL_BUCKETS="1024, 4096"` | about 65 min |
+| Agentic coding, throughput (Aider) | 65536 | 8 / `"1, 8"` | `"16384"` | `DECODE_INTERLEAVE=1` | about 30 min |
+| Lowest latency, short prompts | 2048 | 1 / `"1"` | | | about 12 min |
 
-Compiled graphs are cached in `~/.cache/neuron_libtorch/neuron/compile_cache`; a restart with
-the same configuration takes about 10 minutes (weight loading and warmup).
+The 4096-token prefill bucket cuts the TTFT of a 240k-token prompt from 226 s to 174 s but
+raises it for prompts below about 100k tokens (29k: 13.3 s to 16.6 s); see
+[Long-context prefill](#long-context-prefill). Compiled graphs are cached in
+`~/.cache/neuron_libtorch/neuron/compile_cache`; a restart with the same configuration takes
+about 10 minutes (weight loading and warmup). Changing the KV pool size (`GPU_MEM_UTIL`,
+`KV_CAP_FRACTION`, `KV_CACHE_DTYPE`, `BLOCK_SIZE`, `MAX_NUM_SEQS`) recompiles every graph.
 
 ## Serving
 
@@ -101,9 +108,11 @@ model needs, controlled by environment variables:
 | | `--tensor-parallel-size 4` | | every head count divides by 4; one KV head per rank |
 | `MAX_MODEL_LEN` | `--max-model-len` | 2048 | up to 262144 |
 | `PREFILL_BUCKET` | `--max-num-batched-tokens` | 1024 | prefill chunk; segmented prefill above it |
+| `PREFILL_BUCKETS` | `num_batched_tokens_buckets`, `kv_segment_size_buckets` | `PREFILL_BUCKET` | e.g. `"1024, 4096"`: short prompts pad to the smallest, long prompts are chunked by the largest |
 | `MAX_NUM_SEQS` | `--max-num-seqs` | 1 | |
 | `SEQS_BUCKETS` | `num_seqs_buckets` | `MAX_NUM_SEQS` | decode batch buckets, one compiled decode graph each |
 | `DECODE_CTX_BUCKETS` | `decode_context_length_buckets` | none | below `MAX_MODEL_LEN` (the implicit last bucket); decode reads only the bucket's KV |
+| `DECODE_INTERLEAVE` | `decode_steps_between_prefill_chunks` | 0 | decode steps for the other requests after each prefill chunk |
 | `BLOCK_SIZE` | `--block-size` | vLLM's (32) | attention kernel block; 128 for FP8 KV prefill |
 | `GPU_MEM_UTIL` | `--gpu-memory-utilization` | 0.65 | |
 | `KV_CAP_FRACTION` | `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` | 0.15 | KV/state pool cap, see [KV capacity](#context-length-and-kv-capacity) |
@@ -113,6 +122,8 @@ model needs, controlled by environment variables:
 | `PREFIX_CACHING` | `--enable-prefix-caching` | 0 | see [Prefix caching](#prefix-caching) |
 | `ASYNC_SCHEDULING` | `--no-async-scheduling` when 0 | 1 | |
 | `OPTLEVEL`, `HLO2TENSORIZER_OPTIONS` | compiler options | 1, modular flow | see [Compilation](#compilation) |
+| `PROFILE_DIR`, `PROFILE_DELAY`, `PROFILE_STEPS` | `--profiler-config`, `neuron_profiler` | none | NRT device profiles between `POST /start_profile` and `/stop_profile` |
+| `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | | 3600 | seconds a rank waits for another rank's compilation |
 
 The script also passes `--limit-mm-per-prompt '{"image": 0, "video": 0}'` (text only) and
 sets `NEURON_SKIP_EFA_AFFINITY=1` (trn2.3xlarge has no EFA). An offline example is in
@@ -140,14 +151,17 @@ FP8 weights, MTP with 2 draft tokens, `GPU_MEM_UTIL=0.95`, `KV_CAP_FRACTION=0.48
 | BF16 | 32768 | 8 | 469,941 tokens (14.3 requests of 32k) |
 | FP8 | 32768 | 8 | 770,703 tokens (23.5 requests of 32k) |
 | BF16 | 262144 | 1 | 640,027 tokens (2.4 requests of 262k) |
-| FP8 | 262144 | 4 | 1,190,172 tokens (4.5 requests of 262k) |
+| FP8 | 262144 | 4 | 1,263,772 tokens (4.8 requests of 262k) |
 
-vLLM still allocates the state groups' blocks from the shared pool (unused there), `3 (1 + k)`
-blocks per request, which is why its reported capacity is below the pool at short
-`max_model_len`. Prefix caching keeps the state in the shared pool (state checkpoints are
-cached blocks), where the compiler's double count limits the pool to about 360k tokens
-(`KV_CAP_FRACTION=0.35`, `GPU_MEM_UTIL=0.9`). `VLLM_NEURON_SHARED_STATE_POOL=1` selects the
-shared pool without prefix caching.
+The 32k and BF16 rows were measured before the placeholder state page described next (the
+262k FP8 row was 1,190,172 tokens before it). vLLM still allocates `1 + k` blocks per request
+for each of the 3 state groups from the shared pool, unused with the dedicated state pool. The
+runner reports those groups with a placeholder page of one 256-token attention block (the
+real page is kept for the dedicated pool), so each such block costs 256 tokens of KV instead of
+an attention block enlarged to the state page (2048 tokens with FP8 KV). Prefix caching keeps
+the state in the shared pool (state checkpoints are cached blocks), where the compiler's double
+count limits the pool to about 360k tokens (`KV_CAP_FRACTION=0.35`, `GPU_MEM_UTIL=0.9`).
+`VLLM_NEURON_SHARED_STATE_POOL=1` selects the shared pool without prefix caching.
 
 When parallel compilation fails after the pool size or KV dtype changes, the compile cache may
 hold graphs captured for the earlier configuration, which parallel compilation picks up again.
@@ -176,9 +190,32 @@ Per layer and rank, one 1024-token chunk after a cached prefix:
 | 130k | 23.6 ms | | |
 | 261k | 46.9 ms | | |
 
-A prefill chunk also costs about 0.4 s in the dense layers at any position, so long prompts
+A 1024-token chunk also costs about 0.4 s in the dense layers at any position, so long prompts
 spend about half their prefill in attention (quadratic in the prompt) and half in the dense
 layers (linear).
+
+Larger chunks make the attention cheaper per token (the kernel's segment equals the chunk).
+Per 1024 query tokens at a 258k prefix:
+
+| Chunk (`PREFILL_BUCKETS` largest) | BF16 KV | FP8 KV |
+|---|---|---|
+| 1024 | 45.9 ms | 73.5 ms |
+| 2048 | 27.0 ms | 40.6 ms |
+| 4096 | 17.6 ms | 24.4 ms |
+
+The dense layers, however, take about 25-30% more time per token in the 2048- and 4096-token
+prefill graphs than in the 1024-token graph (not the MLP kernel or the GDN recurrence, which
+scale linearly; under investigation). End to end (262k recommended configuration, passkey
+retrieval correct in every case):
+
+| `PREFILL_BUCKETS` | 29k TTFT | 115k TTFT | 240k TTFT | Longest decode stall during a 28k prefill (`DECODE_INTERLEAVE=1`) |
+|---|---|---|---|---|
+| 1024 | 13.3 s | 75 s | 226 s | 0.55 s |
+| 1024, 2048 | 17.1 s | 80 s | 205 s | 1.29 s |
+| 1024, 4096 | 16.6 s | 72.5 s | 174 s | 2.39 s |
+
+Short prompts are padded to the smallest bucket and are not affected (1,024 tokens: TTFT
+0.39 s with any of them). The 4096-token graph takes over 20 minutes to compile.
 
 ### MTP speculative decoding
 
@@ -308,8 +345,8 @@ draft and about 7 ms on the host; asynchronous scheduling overlaps the host work
 |---|---|---|---|
 | 1,024 | 0.39 s | 8.9 ms | |
 | 28,856 | 13.3 s | 10.0 ms | correct at depths 0.25, 0.75 |
-| 115,256 | 75 s | 15.0 ms (262k decode bucket) | correct at depths 0.25, 0.75 |
-| 240,056 | 226 s | | correct at depth 0.5 |
+| 115,256 | 75 s | 11.6 ms (131k decode bucket; 15.0 ms without it) | correct at depths 0.25, 0.75 |
+| 240,056 | 226 s (174 s with `PREFILL_BUCKETS="1024, 4096"`) | | correct at depth 0.5 |
 
 With a BF16 KV cache (640k-token pool, block 32, no decode buckets) TTFT is 11.8 s at 29k,
 31 s at 61k, 76 s at 123k and 199 s at 240k, with retrieval correct at the same depths. With
@@ -328,7 +365,13 @@ run one at a time):
 | 4 | 249 | 12.8-15.1 ms | 0.47-1.68 s |
 
 Four concurrent 19k-token passkey requests all retrieve correctly (TTFT 8.3, 16.5, 24.7 and
-32.9 s: one prefill after another).
+32.9 s: one prefill after another). With `DECODE_INTERLEAVE=1` the other requests keep
+decoding while a long prompt prefills: one request decoding while a 28k-token prompt arrives
+stalls for at most 0.55 s between tokens (1024-token chunks) instead of the whole prefill
+(about 12 s), and the long prompt's TTFT grows by about 53 ms per chunk (12.2 s to 13.7 s).
+
+Throughput configuration (`MAX_MODEL_LEN=65536`, `MAX_NUM_SEQS=8`): 8 concurrent requests,
+1,000-token prompts, 512 output tokens: 318 output tokens/s aggregate, TPOT 18.8-24.1 ms.
 
 ## Accuracy
 
@@ -355,7 +398,7 @@ decode bound: thinking mode produces about 16k completion tokens per exercise):
 MODEL=<path-to-checkpoint>/Qwen3.8-27B SERVED_MODEL_NAME=qwen3.8-27b \
     FP8_SCALES=<path-to-checkpoint>/Qwen3.8-27B/fp8_act_amax.json MTP_TOKENS=2 KV_CACHE_DTYPE=fp8 \
     BLOCK_SIZE=128 MAX_MODEL_LEN=65536 MAX_NUM_SEQS=8 SEQS_BUCKETS="1, 8" DECODE_CTX_BUCKETS="16384" \
-    GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 examples/vllm_neuron/models/qwen3_5/serve.sh
+    DECODE_INTERLEAVE=1 GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 examples/vllm_neuron/models/qwen3_5/serve.sh
 ```
 
 Then set up Aider once and start the run, which goes to the background and logs to a file:
@@ -366,15 +409,16 @@ mkdir -p tmp.benchmarks
 git clone https://github.com/Aider-AI/polyglot-benchmark tmp.benchmarks/polyglot-benchmark
 ./benchmark/docker_build.sh
 cd <vllm-neuron>
-AIDER_DIR=<path>/aider LOG=/root/runs/aider_polyglot.log \
+AIDER_DIR=<path>/aider LOG=$PWD/aider_polyglot.log \
     examples/vllm_neuron/models/qwen3_5/run_aider_polyglot.sh
-tail -f /root/runs/aider_polyglot.log
+tail -f aider_polyglot.log
 ```
 
 `run_aider_polyglot.sh` copies `aider-model-settings.yml` into the Aider checkout and runs
 `benchmark.py` with the diff edit format, 8 threads (one per sequence) and 2 tries; `CONT=1`
 resumes a stopped run, `NUM_TESTS=N` runs a subset. The settings select thinking mode with
-Qwen's recommended sampling (temperature 0.6, top-p 0.95, top-k 20) and strip the thinking,
+Qwen's recommended sampling (temperature 0.6, top-p 0.95, top-k 20), raise the request timeout
+to 3600 s, and strip the thinking,
 which the server returns inline up to `</think>`. They set no `max_tokens`: vLLM rejects
 requests whose prompt plus `max_tokens` exceeds `max_model_len`, and by default it allows the
 rest of the context.
@@ -407,7 +451,8 @@ timed out 196 requests (`litellm.Timeout`; 205 error outputs): thinking response
 thousands of tokens at batch 8 outlast the default request timeout, and Aider retries them
 from the start. That wasted generation accounts for most of the wall time, and timed-out
 requests may also have cost passes, so the score is a lower bound for this configuration.
-Raise the client timeout before rerunning.
+`aider-model-settings.yml` now sets a 3600 s request timeout (`extra_params.timeout`) for
+the rerun.
 
 On the server side the run was clean: one server process for the whole run, no tracebacks,
 recompiles or engine errors; 801 of 804 requests returned HTTP 200, and the 3 HTTP 400s match
@@ -417,19 +462,21 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
 ## Known limitations
 
 - **Long-prompt prefill is compute bound**: about 0.4 s per 1024-token chunk in the dense
-  layers plus attention that grows with the position (47 ms per layer for the last chunk of a
-  256k prompt, about 20% of the Tensor Engine peak), so a 240k prompt takes 3-4 minutes.
-- **Prefills run one request at a time** and pause the other requests' decoding for their
-  duration.
-- **FP8 KV prefill attention** loads K per 128-token block (PE transpose), about 1.5x the
-  BF16 kernel time at long prefixes.
-- **Decode between the largest configured decode bucket and `max_model_len`** reads the whole
-  `max_model_len` of KV (15 ms per token at 115k in the 262k configuration); add a bucket
-  (for example 131072) at the cost of more compiled graphs.
+  layers plus attention that grows with the position (46 ms per layer for a 1024-token chunk
+  at a 258k prefix, about 20% of the Tensor Engine peak), so a 240k prompt takes about 3-4
+  minutes. Larger prefill buckets cut the attention cost but slow the dense layers (see
+  [Long-context prefill](#long-context-prefill)).
+- **Prefills run one request at a time.** With `DECODE_INTERLEAVE` the other requests decode
+  between chunks, at one decode step per chunk (or per setting); without it they pause for the
+  whole prefill.
+- **FP8 KV prefill attention** loads K per 128-token block (PE transpose), about 1.6x the BF16
+  kernel time at long prefixes.
+- **Decode above the largest decode context bucket** reads the whole `max_model_len` of KV;
+  each bucket adds compiled decode graphs.
 - **BF16 decode at batch > 1** uses the PyTorch GDN path (the fused BF16 GDN kernel is
   single-request); use FP8 for batched serving.
 - **vLLM allocates state blocks in the shared KV pool** that the dedicated state pool does
-  not use: `3 (1 + k)` blocks per request.
+  not use: `3 (1 + k)` blocks per request, each now one 256-token attention block.
 - **Packed FP8 KV (`fp8_packed_kv`) is not supported**: the library decode kernel reads the
   packed layout only at `head_dim` <= 128.
 - **Prefix caching** is not combined with MTP and has not been re-validated since the
@@ -439,6 +486,8 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
 - **`logprobs` requests fail.** The sampler output does not include top log-probabilities.
 - **MTP supports at most 2 draft tokens**. With 3 draft tokens the verify pass produced
   invalid indices; this is not resolved.
+- **Device profiles of prefill graphs are incomplete**: the runtime drops profiler
+  notifications for graphs of this size, so per-layer prefill breakdowns are not available yet.
 
 ## Related work
 
@@ -471,27 +520,30 @@ rather than to propose a competing implementation.
 Done:
 
 - Long-context prefill: segmented attention kernel at `head_dim` 256 for BF16 and FP8 KV,
-  serving the native 262144 context (passkey retrieval correct to 240k).
+  serving the native 262144 context (passkey retrieval correct to 240k), with several prefill
+  buckets and matching segment sizes.
 - Decode context-length buckets for hybrid models (the recurrent-state block tables keep their
   `1 + k` blocks).
+- Decode steps between the chunks of a long prefill.
+- Placeholder state page for the dedicated GDN state pool (+6% KV at 262k).
 - Dedicated GDN state pool, batched decode with MTP, FP8 KV cache, prefix caching (`align`).
+- Aider Polyglot: 73.8% with 2 tries (first run).
 
-Before this work is proposed upstream:
+Next:
 
 1. **Prefill throughput**: the dense layers (0.4 s per 1024-token chunk; #54's prefill graph
-   is 25% faster), the attention kernel at long prefixes (one K/V load for the 6 query heads of
-   a KV head), and a DMA-transpose load for FP8 K.
-2. **Scheduling**: interleave prefill chunks with decode steps so a long prefill does not pause
-   the other requests.
-3. **Aider Polyglot**: rerun with a longer client request timeout (the first run, 73.8%, lost
-   196 requests to client timeouts), then at long context.
-4. **KV pool**: stop allocating unused state blocks in the shared pool; dedicated state pool
-   with prefix caching; re-validate prefix caching with the segmented prefill kernel.
-5. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
-6. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
+   is 25% faster) and their slowdown in larger prefill graphs; the attention kernel's
+   efficiency at long prefixes (about 20% of peak; loading K/V once per query head is not the
+   bottleneck); a DMA-transpose load for FP8 K.
+2. **Aider Polyglot**: rerun with the longer client request timeout (the first run lost 196
+   requests to client timeouts), then at long context.
+3. **KV pool**: no state blocks in the shared pool at all; dedicated state pool with prefix
+   caching; re-validate prefix caching with the segmented prefill kernel.
+4. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
+5. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
    draft's `lm_head`.
-7. **API gaps**: `logprobs`, `all_greedy` on-device sampling.
-8. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
+6. **API gaps**: `logprobs`, `all_greedy` on-device sampling.
+7. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, plus latency and throughput sweeps over context length and batch size.
 
 ## Tutorials

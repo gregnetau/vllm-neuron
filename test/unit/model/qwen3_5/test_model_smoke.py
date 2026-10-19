@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 BLOCK, PAGE = 8, 5  # attention block size; state page id
 
@@ -279,7 +279,7 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
     mod = _install_stubs()
     A = mod.Qwen3_5Attention
     torch.manual_seed(3)
-    nkh, groups, Dh, bs, nblk = 1, 3, 16, 4, 6
+    nkh, groups, Dh, bs = 1, 3, 16, 4
     a = types.SimpleNamespace(num_key_value_heads_per_rank=nkh, num_key_value_groups=groups, scaling=Dh ** -0.5)
     a._attend_cached_torch = A._attend_cached_torch.__get__(a)
     a.kv_fp8, a.k_scale_float, a.v_scale_float = False, 1.0, 1.0

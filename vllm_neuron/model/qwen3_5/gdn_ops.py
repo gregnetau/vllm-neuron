@@ -46,7 +46,7 @@ def causal_conv1d(
     x [L, C], weight [C, K], conv_state [C, K-1] (the last K-1 raw inputs of the
     previous call, oldest first) or None (zeros). Returns (y [L, C], new_state).
     """
-    L, C = x.shape
+    _, C = x.shape
     K = weight.shape[1]
     if conv_state is None:
         conv_state = x.new_zeros(C, K - 1)

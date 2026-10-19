@@ -17,12 +17,12 @@
 # Knobs: RUN_NAME (default qwen3.8-27b-neuron), THREADS (default 8, at most the server's
 # MAX_NUM_SEQS), NUM_TESTS (default all 225), TRIES (default 2), MODEL_NAME (default
 # openai/qwen3.8-27b: openai/<served model name>), API_BASE (default the host's port 8000),
-# LOG (default /root/runs/aider_polyglot.log).
+# LOG (default <AIDER_DIR>/aider_polyglot.log).
 set -euo pipefail
 
 AIDER_DIR=${AIDER_DIR:?set AIDER_DIR to the aider checkout}
 RUN_NAME=${RUN_NAME:-qwen3.8-27b-neuron}
-LOG=${LOG:-/root/runs/aider_polyglot.log}
+LOG=${LOG:-${AIDER_DIR}/aider_polyglot.log}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 cp "${HERE}/aider-model-settings.yml" "${AIDER_DIR}/aider-model-settings.yml"

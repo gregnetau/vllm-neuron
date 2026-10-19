@@ -7,7 +7,7 @@ import pytest
 import torch
 
 hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 TP = 2
 P = "model.language_model.layers.0."
@@ -100,7 +100,7 @@ def test_partial_rotary_permutation_equivalent_to_full_width_rope(weights, qwen3
     """Permuted channels + full-width rotate_half (cos=1/sin=0 on pass dims) == partial rotary."""
     from conftest import ROOT, _load
 
-    gdn_ops = _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
+    _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
     ref = _load("vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py")
     D, R, L, H = 256, 64, 11, 3
     cfg = qwen3_5_config.Qwen3_5Config(head_dim=D, partial_rotary_factor=R / D, rope_theta=1e7)

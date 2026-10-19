@@ -1744,10 +1744,8 @@ class NeuronWorker(WorkerBase):
 
         targets = self._prefill_compile_targets()
         total_warmups = len(targets)
-        warmup_count = 0
 
-        for bucket_size, kv_seg_size in targets:
-            warmup_count += 1
+        for warmup_count, (bucket_size, kv_seg_size) in enumerate(targets, 1):
             logger.info(
                 "\n[%s/%s] Warming up for prefill: bucket_size=%s, "
                 "kv_segment_size=%s",

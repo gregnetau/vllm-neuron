@@ -4,10 +4,9 @@ on CPU and compare with the HF-semantics reference."""
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 pytest.importorskip("transformers.models.qwen3_5")
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 TP = 2
 

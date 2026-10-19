@@ -8,6 +8,9 @@
   reasoning_tag: think
   use_temperature: 0.6
   extra_params:
+    # Thinking responses of tens of thousands of tokens at batch 8 take over 10 minutes; Aider's
+    # default 600 s request timeout abandons and retries them.
+    timeout: 3600
     top_p: 0.95
     extra_body:
       top_k: 20

@@ -48,8 +48,13 @@ is taken out of the KV budget (`NeuronWorker.determine_available_memory`).
 In the shared layout every raw buffer is a graph input twice, as attention K/V views and as
 state views, and neuronx-cc's graph I/O check (`NCC_EVRF009`, 24 GB per logical core) counts
 both; that capped the KV pool at about half the free HBM. vLLM still allocates the state
-groups' blocks from the shared pool; they stay unused. Prefix caching (state checkpoints
-are cached blocks) keeps the shared layout, as does `VLLM_NEURON_SHARED_STATE_POOL=1`.
+groups' blocks (`1 + k` per request and group) from the shared pool; they stay unused. So that
+they cost little, the runner reports those groups with a placeholder page of one 256-token
+attention block (`_build_state_cache_specs`) and keeps the real page for the dedicated pool
+(`_state_page`). That also stops vLLM from enlarging the attention block to the state page
+(2048 tokens with FP8 KV; `per_group=[256, ...]` instead). Prefix caching (state checkpoints
+are cached blocks) keeps the shared layout and the real page, as does
+`VLLM_NEURON_SHARED_STATE_POOL=1`.
 
 ## Prefix caching
 
@@ -170,12 +175,22 @@ and how the plugin meets them:
 | Per-block K load (otherwise): block size <= 128 | FP8 cache viewed as 128-token blocks |
 | FP8 K only pre-transposed or packed | vendored `attention_segmented_cte.py`: 1-byte K takes the per-block load, widened to bf16 for the PE transpose |
 | `prior_tokens` a multiple of the block size | prefills are isolated and chunked by `max_num_batched_tokens`; cached prefixes are block aligned |
+| Query length equal to the segment size | one segment size per prefill bucket (`kv_segment_size_buckets` equal to `num_batched_tokens_buckets`); each step uses its bucket's (`kv_segment_size_for_tokens`), and warmup compiles only those pairs |
 
 With one KV head per rank a block `[1, B, Dh]` is contiguous, so the cache viewed as
 `[nb * r, 1, B / r, Dh]` is a reshape and block `b` becomes sub-blocks `b*r .. b*r+r-1`
 (`_split_kv_blocks`); unused table entries (-1) become the null block's sub-blocks. The
 packed FP8 K layout that the library kernel reads directly is not used: the decode kernel
 reads it only at `head_dim` <= 128.
+
+## Scheduling
+
+Prefill and decode are separate graphs and a step is one or the other; prefills run one
+request at a time. With `neuron_config.decode_steps_between_prefill_chunks` = N the scheduler
+runs N decode-only steps for the other running requests after each chunk of an ongoing
+prefill (`NeuronScheduler.schedule`, step 3.0), instead of holding them back until the last
+chunk. Nothing in the runner assumes a prefill's chunks are consecutive: requests absent from a
+step leave the persistent batch and are re-added, and each keeps its dedicated state-pool slot.
 
 ## Recycled blocks
 

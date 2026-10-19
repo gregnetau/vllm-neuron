@@ -47,15 +47,16 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
-from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
     set_weight_loader,
     sharding_weight_loader,
 )
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
-from . import gdn_ops, weights as W
+from . import gdn_ops
+from . import weights as W
 from .config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from .state import gdn_state_shapes
 
@@ -118,7 +119,9 @@ def _out_proj_tkg(x, weight, weight_scale=None, input_scale=None, d_head: int = 
     if T > 128 or ND % d_head or not can_run_kernel(x):
         return None
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-    from nkilib.core.output_projection.output_projection_tkg import output_projection_tkg
+    from nkilib.core.output_projection.output_projection_tkg import (
+        output_projection_tkg,
+    )
     from nkilib.core.utils.common_types import QuantizationType
 
     attention = x.reshape(T, ND // d_head, d_head).permute(2, 0, 1).unsqueeze(-1)  # [D, B=T, N, S=1]
@@ -399,7 +402,7 @@ class Qwen3_5Attention(nn.Module):
         the cache), in torch. q [Nh, T, Dh] -> [Nh, Dh, T]. One request per prefill step.
         Keys are valid iff pos < cached + n_valid (padded query rows see only valid keys too), and
         invalid V rows are zeroed: unwritten cache can hold NaN/Inf from recycled state pages."""
-        Nh, T, Dh = q.shape
+        _, T, Dh = q.shape
         nkh = self.num_key_value_heads_per_rank
         bt = md["block_table_tensor"][0].long().clamp(min=0)  # -1 (unused) -> null block; masked
         prior = md["cached_seq_len"].reshape(-1)[:1].long()

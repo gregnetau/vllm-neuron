@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Factory for the Qwen3.5 / Qwen3.8 dense hybrid text model (BF16, text only)."""
 
-import torch.nn as nn
+from torch import nn
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig

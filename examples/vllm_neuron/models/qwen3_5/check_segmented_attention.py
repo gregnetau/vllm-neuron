@@ -57,6 +57,7 @@ def main():
     args = ap.parse_args()
 
     import libtorch_neuronx_lite  # noqa: F401
+
     from vllm_neuron import functional as NF
     from vllm_neuron.envs import get_compile_backend_name
 
@@ -74,7 +75,9 @@ def main():
     kd, vd = kc.to(dev), vc.to(dev)
     seg_kernel = None
     if args.fp8_kv:
-        from vllm_neuron.model.qwen3_5.attention_segmented_cte import attention_segmented_cte_fp8_kernel
+        from vllm_neuron.model.qwen3_5.attention_segmented_cte import (
+            attention_segmented_cte_fp8_kernel,
+        )
 
         seg_kernel = attention_segmented_cte_fp8_kernel
 

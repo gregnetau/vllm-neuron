@@ -23,11 +23,10 @@ indirect DMAs generate descriptors on GpSimd per row). silu/sigmoid are exp + ve
 and the code is ordered softplus -> exp -> rsqrt to limit activation-table reloads.
 """
 
-import torch
-
 import nki
 import nki.isa as nisa
 import nki.language as nl
+import torch
 from nki.isa import oob_mode
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 

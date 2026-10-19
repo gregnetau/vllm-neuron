@@ -12,9 +12,8 @@ import pytest
 import torch
 
 pytest.importorskip("transformers.models.qwen3_5")
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
-
-import test_model_smoke as smoke  # noqa: E402
+import test_model_smoke as smoke
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 
 def test_prefill_and_gdn_decode_trace_on_meta():

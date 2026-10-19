@@ -17,7 +17,7 @@ draft tokens are greedy (distributed argmax over the vocabulary shards).
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
 
