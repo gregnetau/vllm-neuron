@@ -386,6 +386,15 @@ def resolve_segmented_prefill_config(
     return ([max_num_batched_tokens], [max_num_batched_tokens])
 
 
+def kv_segment_size_for_tokens(kv_segment_size_buckets: list[int], num_tokens: int) -> int:
+    """Segment size for a step of ``num_tokens`` (padded) tokens: the smallest segment bucket
+    that holds it (a prefill step is padded to that bucket), else the largest."""
+    for size in kv_segment_size_buckets:
+        if num_tokens <= size:
+            return size
+    return kv_segment_size_buckets[-1]
+
+
 def validate_kv_segment_size_buckets(
     buckets: Any,
     num_batched_tokens_buckets: list[int] | None,
@@ -398,12 +407,12 @@ def validate_kv_segment_size_buckets(
         3. Each value must be one of the sizes supported by the segmented
            attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``).
 
-    Current kernel limitations (will be relaxed in the future):
-        4. Only one segment size is supported (len == 1).
-        5. When num_batched_tokens_buckets is explicitly set by the user, it
+    Current kernel limitation (will be relaxed in the future):
+        4. When num_batched_tokens_buckets is explicitly set by the user, it
            must equal kv_segment_size_buckets because the segmented kernel
            currently requires the prefill bucket length to be exactly the
-           segment size.
+           segment size. With several buckets, each prefill step uses the
+           segment size equal to its bucket (see kv_segment_size_for_tokens).
 
     Args:
         buckets: List of segment size buckets to validate.
@@ -453,16 +462,7 @@ def validate_kv_segment_size_buckets(
 
     # --- Current kernel limitations ---
 
-    # 4. Only one segment size for now
-    if len(buckets) != 1:
-        # TODO: Add support for multiple segment sizes and implement
-        # bucket selection logic.
-        raise ValueError(
-            f"Only one segment size is currently supported, got "
-            f"{len(buckets)}: {buckets}."
-        )
-
-    # 5. If user explicitly set num_batched_tokens_buckets, it must match
+    # 4. If user explicitly set num_batched_tokens_buckets, it must match
     if num_batched_tokens_buckets is not None:
         # TODO: Remove this constraint once prefill bucket length is
         # decoupled from prior segment size in the segmented kernel.

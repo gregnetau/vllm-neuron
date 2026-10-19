@@ -1509,6 +1509,15 @@ class NeuronWorker(WorkerBase):
         return the flat tuple list the trace pool consumes.
         """
         num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
+        if effective_kv_buckets != [0]:
+            # Segmented prefill: a step's segment size is its bucket's (the kernel needs the
+            # query length to equal the segment size), so only those pairs exist at runtime.
+            from vllm_neuron.utils.bucket_utils import kv_segment_size_for_tokens
+
+            return [
+                (bucket_size, kv_segment_size_for_tokens(effective_kv_buckets, bucket_size))
+                for bucket_size in num_batched_tokens_buckets
+            ]
         return [
             (bucket_size, kv_seg_size)
             for kv_seg_size in effective_kv_buckets
@@ -1725,7 +1734,7 @@ class NeuronWorker(WorkerBase):
 
     def _warmup_prefill(self) -> None:
         """Run prefill warmup for all bucket and KV segment size combinations."""
-        num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
+        num_batched_tokens_buckets, _ = self._prefill_buckets()
 
         logger.info(
             "Warming up model for %s num_batched_tokens_buckets: %s",
@@ -1733,41 +1742,41 @@ class NeuronWorker(WorkerBase):
             num_batched_tokens_buckets,
         )
 
-        total_warmups = len(effective_kv_buckets) * len(num_batched_tokens_buckets)
+        targets = self._prefill_compile_targets()
+        total_warmups = len(targets)
         warmup_count = 0
 
-        for kv_seg_size in effective_kv_buckets:
-            for bucket_size in num_batched_tokens_buckets:
-                warmup_count += 1
+        for bucket_size, kv_seg_size in targets:
+            warmup_count += 1
+            logger.info(
+                "\n[%s/%s] Warming up for prefill: bucket_size=%s, "
+                "kv_segment_size=%s",
+                warmup_count,
+                total_warmups,
+                bucket_size,
+                kv_seg_size,
+            )
+            try:
+                self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
                 logger.info(
-                    "\n[%s/%s] Warming up for prefill: bucket_size=%s, "
-                    "kv_segment_size=%s",
-                    warmup_count,
-                    total_warmups,
+                    "  Successfully warmed up for prefill bucket %s "
+                    "with kv_segment_size %s",
                     bucket_size,
                     kv_seg_size,
                 )
-                try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
-                    logger.info(
-                        "  Successfully warmed up for prefill bucket %s "
-                        "with kv_segment_size %s",
-                        bucket_size,
-                        kv_seg_size,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "  Failed to warmup for prefill bucket %s "
-                        "with kv_segment_size %s: %s",
-                        bucket_size,
-                        kv_seg_size,
-                        e,
-                        exc_info=True,
-                    )
-                    raise RuntimeError(
-                        f"Model warmup failed for prefill bucket {bucket_size} "
-                        f"with kv_segment_size {kv_seg_size}. Error: {e}"
-                    ) from e
+            except Exception as e:
+                logger.error(
+                    "  Failed to warmup for prefill bucket %s "
+                    "with kv_segment_size %s: %s",
+                    bucket_size,
+                    kv_seg_size,
+                    e,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"Model warmup failed for prefill bucket {bucket_size} "
+                    f"with kv_segment_size {kv_seg_size}. Error: {e}"
+                ) from e
 
     def _decode_compile_targets(self) -> list[tuple[int, int]]:
         """Enumerate (batch_bucket, ctx_bucket) pairs to compile.

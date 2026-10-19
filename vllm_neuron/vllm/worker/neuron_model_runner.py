@@ -87,6 +87,7 @@ from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
     get_decode_padded_batch_size,
+    kv_segment_size_for_tokens,
 )
 from vllm_neuron.utils.spec_decode_utils import (
     extract_next_token_ids,
@@ -654,7 +655,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     explicit_num_batched_tokens_buckets,
                 )
             )
-            kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+            kv_segment_size = self.neuron_config.kv_segment_size_buckets[-1]
 
             # Auto-set num_batched_tokens_buckets to match if not explicitly set
             if not user_set_num_batched_tokens_buckets:
@@ -2039,21 +2040,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         1 + num_speculative_blocks state blocks for its whole life, so a dedicated pool of
         one set per batch slot (plus the null page 0) suffices; GDN block tables are
         translated to it (_state_pool_table). The state blocks vLLM still allocates in the
-        shared pool stay unused. Prefix caching keeps cached state blocks, so it uses the
+        shared pool stay unused; their spec reports a one-block placeholder page (see
+        _build_state_cache_specs). Prefix caching keeps cached state blocks, so it uses the
         shared pool."""
-        if self.vllm_config.cache_config.enable_prefix_caching or spec.mamba_cache_mode != "none":
-            return 0
-        if os.environ.get("VLLM_NEURON_SHARED_STATE_POOL") == "1":  # keep state in the KV pool
+        if not self._dedicated_state_pool() or spec.mamba_cache_mode != "none":
             return 0
         return 1 + self.max_num_reqs * (1 + spec.num_speculative_blocks)
+
+    def _dedicated_state_pool(self) -> bool:
+        """Recurrent state in dedicated pools rather than vLLM's shared KV pool."""
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            return False
+        return os.environ.get("VLLM_NEURON_SHARED_STATE_POOL") != "1"
+
+    def _state_page(self, layer_name: str, spec: "MambaSpec") -> tuple:
+        """(layout, page bytes) of a recurrent-state layer's real page: the spec's own, or the
+        one recorded for a dedicated pool, whose spec carries a placeholder page."""
+        real = getattr(self, "_state_real_pages", {}).get(layer_name)
+        if real is not None:
+            return real
+        return _state_page_layout(spec.shapes, spec.dtypes), spec.page_size_bytes
 
     def state_pool_bytes(self) -> int:
         """HBM per rank of the dedicated recurrent-state pools (0 without any), to keep out of
         the KV cache budget."""
         total = 0
-        for spec in self.get_kv_cache_spec().values():
+        for name, spec in self.get_kv_cache_spec().items():
             if isinstance(spec, MambaSpec):
-                total += self._state_pool_pages(spec) * spec.page_size_bytes
+                total += self._state_pool_pages(spec) * self._state_page(name, spec)[1]
         return total
 
     def _state_pool_table(self, padded_num_reqs: int, n_blocks: int) -> torch.Tensor:
@@ -4428,7 +4442,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # use in attention_metadata. Now we only use the ones below.
             kv_segment_size = 0
             if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+                kv_segment_size = kv_segment_size_for_tokens(
+                    self.neuron_config.kv_segment_size_buckets, total_num_scheduled_tokens
+                )
 
             swa_kv_pos_offset = None
 
@@ -4718,7 +4734,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             kv_segment_size = 0
             if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+                kv_segment_size = kv_segment_size_for_tokens(
+                    self.neuron_config.kv_segment_size_buckets, num_tokens
+                )
 
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
@@ -8945,11 +8963,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # Recurrent state (e.g. Gated DeltaNet): one page per request, stored as
                 # two contiguous halves matching the attention (2, N, ...) layout of the
                 # shared raw tensor (see state_cache.paired_half_views).
-                layout = _state_page_layout(kv_cache_spec.shapes, kv_cache_spec.dtypes)
-                page_bytes = kv_cache_spec.page_size_bytes
-                _state_half_elems(layout, page_bytes)  # validates fit
                 n_pages = self._state_pool_pages(kv_cache_spec)
                 for layer_name in group.layer_names:
+                    layout, page_bytes = self._state_page(layer_name, kv_cache_spec)
+                    _state_half_elems(layout, page_bytes)  # validates fit
                     if n_pages:
                         # Dedicated pool (see _state_pool_pages): the shared raw tensor is
                         # bound only as attention KV, so graphs see each pool byte once.
@@ -9050,6 +9067,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kernel_block = self.vllm_config.cache_config.block_size
         align_pages = max(1, 256 // kernel_block) if 256 % kernel_block == 0 else 1
         specs = {}
+        # With a dedicated pool the state never lives in vLLM's shared pool, but vLLM still
+        # allocates its (1 + k) blocks per request there. Report a placeholder page of one
+        # 256-token attention block instead of the real (padded) page: each unused block then
+        # costs one attention block, and vLLM no longer enlarges the attention block to the
+        # state page (2048 tokens with FP8 KV). The real page is kept for the pool.
+        dedicated = self._dedicated_state_pool()
+        self._state_real_pages = {}
         for layer in state_layers:
             layout = _state_page_layout(layer.shapes, layer.dtypes)
             page = _padded_state_page_bytes(layout.page_bytes, attn_page, align_pages)
@@ -9057,6 +9081,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # divides max_model_len (FP8 KV at Qwen3.8 sizes would otherwise give 1792-token
             # blocks, block tables of 1064 entries, and odd-stride FP8 DMAs neuronx-cc rejects).
             page = attn_page * (1 << (page // attn_page - 1).bit_length())
+            shapes, dtypes = tuple(layer.shapes), tuple(layer.dtypes)
+            if dedicated:
+                self._state_real_pages[layer.name] = (layout, page)
+                page, shapes, dtypes = attn_page * align_pages, ((1,),), (torch.float32,)
             if cache_config.enable_prefix_caching:
                 block_size = page // attn_page * kernel_block
                 mode = "align"
@@ -9065,8 +9093,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 block_size, mode = self.max_model_len, "none"
             specs[layer.name] = MambaSpec(
                 block_size=block_size,
-                shapes=tuple(layer.shapes),
-                dtypes=tuple(layer.dtypes),
+                shapes=shapes,
+                dtypes=dtypes,
                 page_size_padded=page,
                 mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
                 mamba_cache_mode=mode,

@@ -43,6 +43,15 @@ CHECKS = textwrap.dedent('''
     k2, _, t2, bs2 = seg._split_kv_blocks(k, k, torch.tensor([[2, -1]], dtype=torch.int32), 512)
     assert bs2 == 128 and k2.shape == (16, 1, 128, 8)
     assert t2.tolist() == [[8, 9, 10, 11, 0, 1, 2, 3]]
+
+    # Several segment sizes: a prefill step uses its bucket's segment size.
+    from vllm_neuron.utils import bucket_utils as bu
+    assert bu.validate_kv_segment_size_buckets([1024, 4096], [1024, 4096]) == [1024, 4096]
+    with pytest.raises(ValueError):
+        bu.validate_kv_segment_size_buckets([1024, 4096], [4096])
+    pick = lambda n: bu.kv_segment_size_for_tokens([1024, 4096], n)
+    assert (pick(1), pick(904), pick(1024), pick(1025), pick(4096), pick(9999)) == (
+        1024, 1024, 1024, 4096, 4096, 4096)
 ''')
 
 
