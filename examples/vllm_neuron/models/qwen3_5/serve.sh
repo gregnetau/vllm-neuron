@@ -37,7 +37,7 @@ if [[ -n "${PREFILL_BUCKETS:-}" ]]; then
 fi
 
 export NEURON_SKIP_EFA_AFFINITY=1                   # trn2.3xlarge has no EFA
-# Compile route. Qwen3.5 currently runs ~2x slower on the native torch.compile route (the
+# Compile route. Qwen3.5 prefills about 1.4x slower on the native torch.compile route (the
 # vllm-neuron 0.29 default) than on the XLA route, so default to XLA; BACKEND=neuron_native
 # selects the native route.
 export VLLM_NEURON_BACKEND=${BACKEND:-${VLLM_NEURON_BACKEND:-vllm_neuron}}
@@ -91,7 +91,7 @@ exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --max-num-batched-tokens "${PREFILL_BUCKET}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.65}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE:-auto}" \
-  --optimization-level "${OPTLEVEL:-1}" \
+  --optimization-level "${OPTLEVEL:-2}" \
   "$( [[ "${PREFIX_CACHING:-0}" == 1 ]] && echo --enable-prefix-caching || echo --no-enable-prefix-caching )" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --additional-config "{\"neuron_config\": {${NEURON_CONFIG}}${EXTRA_CONFIG}}"

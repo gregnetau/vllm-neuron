@@ -89,7 +89,7 @@ All with FP8 weights (`FP8_SCALES`), MTP with 2 draft tokens (`MTP_TOKENS=2`), F
 
 | Use | `MAX_MODEL_LEN` | `MAX_NUM_SEQS` / `SEQS_BUCKETS` | `DECODE_CTX_BUCKETS` | Other | Cold compile |
 |---|---|---|---|---|---|
-| Native context, mixed prompt lengths | 262144 | 4 / `"1, 4"` | `"16384, 65536, 131072"` | `DECODE_INTERLEAVE=1` | about 28 min |
+| Native context, mixed prompt lengths | 262144 | 4 / `"1, 4"` | `"16384, 65536, 131072"` | `DECODE_INTERLEAVE=1` | about 30 min |
 | Native context, mostly 100k+ prompts | 262144 | 4 / `"1, 4"` | `"16384, 65536, 131072"` | `DECODE_INTERLEAVE=1 PREFILL_BUCKETS="1024, 4096"` | about 65 min |
 | Agentic coding, throughput (Aider) | 65536 | 8 / `"1, 8"` | `"16384"` | `DECODE_INTERLEAVE=1` | about 30 min |
 | Lowest latency, short prompts | 2048 | 1 / `"1"` | | | about 12 min |
@@ -125,9 +125,10 @@ model needs, controlled by environment variables:
 | `FP8_SCALES` | `quantization: fp8` | none | static FP8 weights with these activation scales |
 | `MTP_TOKENS` | `--speculative-config` (`mtp`) | none | 1 or 2 draft tokens |
 | `PREFIX_CACHING` | `--enable-prefix-caching` | 0 | see [Prefix caching](#prefix-caching) |
+| `ALL_GREEDY` | `on_device_sampling_config.all_greedy` | 0 | 1: greedy-only on-device sampling (argmax; requests' temperature / top-k / top-p are ignored) |
 | `ASYNC_SCHEDULING` | `--no-async-scheduling` when 0 | 1 | |
 | `BACKEND` | `VLLM_NEURON_BACKEND` | `vllm_neuron` (XLA route) | `neuron_native` selects the native torch.compile route |
-| `OPTLEVEL`, `HLO2TENSORIZER_OPTIONS` | compiler options | 1, modular flow | see [Compilation](#compilation) |
+| `OPTLEVEL`, `HLO2TENSORIZER_OPTIONS` | compiler options | 2, modular flow | see [Compilation](#compilation) |
 | `PROFILE_DIR`, `PROFILE_DELAY`, `PROFILE_STEPS` | `--profiler-config`, `neuron_profiler` | none | NRT device profiles between `POST /start_profile` and `/stop_profile` |
 | `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | | 3600 | seconds a rank waits for another rank's compilation |
 
@@ -304,7 +305,7 @@ as rows; the library writes it one element per DMA descriptor at `head_dim` 256.
 
 vLLM Neuron 0.29 compiles through one of two torch.compile routes. `serve.sh` selects the XLA
 route (`VLLM_NEURON_BACKEND=vllm_neuron`); `BACKEND=neuron_native` selects the native route,
-the plugin's default. FP8 weights, FP8 KV, MTP 2, `max_model_len` 32768:
+the plugin's default. FP8 weights, FP8 KV, MTP 2, `max_model_len` 32768, `-O1`:
 
 | Route | TTFT, 1,024 tokens | TPOT | TTFT, 27k tokens |
 |---|---|---|---|
@@ -317,7 +318,11 @@ graph per layer and made it about 2.5x slower. The remaining gap in the prefill 
 against 361 ms of device time for 1,024 tokens) is time the two physical cores of a logical
 core spend waiting for each other at synchronizations; FLOPs and memory traffic are equal.
 
-`OPTLEVEL` (`--optimization-level`, default 1) and `HLO2TENSORIZER_OPTIONS` (`""` compiles the
+`serve.sh` compiles at `-O2` (`OPTLEVEL=2`). On plugin 0.29 that decodes faster than `-O1`
+with the same TTFT (262k configuration: TPOT 8.2 ms against 8.6 ms at 1k, 10.4 ms against
+11.7 ms at 115k) and takes about 30 minutes to compile cold, against 28.
+
+`OPTLEVEL` (`--optimization-level`) and `HLO2TENSORIZER_OPTIONS` (`""` compiles the
 whole graph instead of modular flow) are exposed by `serve.sh`. Measured on plugin 0.24 in BF16 at
 `max_model_len` 2048:
 
@@ -350,7 +355,7 @@ Rows other than the recommended configuration were measured on plugin 0.24.
 | FP8 + MTP, 1 draft token, same | 398 ms | 14.2 ms |
 | FP8 + MTP, 2 draft tokens, same | 401 ms | 10.5 ms |
 | FP8 + MTP, 2 draft tokens, asynchronous scheduling (default), same | 396 ms | 8.4 ms |
-| FP8 + MTP 2, FP8 KV, `max_model_len` 262144 (recommended configuration) | 385 ms | 8.6 ms |
+| FP8 + MTP 2, FP8 KV, `max_model_len` 262144 (recommended configuration) | 387 ms | 8.2 ms |
 | FP8 + MTP 2, BF16 KV, `max_model_len` 262144, no decode buckets | 396 ms | 15.3 ms |
 
 Without decode context buckets every decode step reads the whole `max_model_len` of KV.
@@ -367,10 +372,10 @@ draft and about 7 ms on the host; asynchronous scheduling overlaps the host work
 
 | Prompt tokens | TTFT | TPOT | Passkey retrieval |
 |---|---|---|---|
-| 1,024 | 0.39 s | 8.6 ms | |
+| 1,024 | 0.39 s | 8.2 ms | |
 | 27,896 | 11.5 s | | correct at depths 0.25, 0.75 |
 | 58,616 | 26.0 s | | correct at depth 0.5 |
-| 110,456 | 55 s | 11.7 ms (at 115,000 tokens, 131k decode bucket) | correct at depths 0.25, 0.75 |
+| 110,456 | 55 s | 10.4 ms (at 115,000 tokens, 131k decode bucket) | correct at depths 0.25, 0.75 |
 | 230,456 | 148 s | | correct at depth 0.5 |
 
 On plugin 0.24 the same configuration took 13.3 s at 29k, 75 s at 115k and 226 s at 240k (174 s
@@ -388,8 +393,8 @@ run one at a time):
 
 | Concurrent requests | Aggregate output tokens/s | TPOT per request | TTFT |
 |---|---|---|---|
-| 1 | 108 | 8.5 ms | 0.41 s |
-| 4 | 257 | 12.4-14.6 ms | 0.47-1.64 s |
+| 1 | 112 | 8.1 ms | 0.41 s |
+| 4 | 260 | 12.2-14.5 ms | 0.49-1.64 s |
 
 On plugin 0.24: four concurrent 19k-token passkey requests all retrieve correctly (TTFT 8.3, 16.5, 24.7 and
 32.9 s: one prefill after another). With `DECODE_INTERLEAVE=1` the other requests keep
@@ -535,6 +540,9 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
 - **Model Runner V2 is not supported.** Hybrid models and speculative decoding run on V1.
+- **`logprobs` requests fail with MTP**: with on-device rejection sampling the runner returns
+  no log-probabilities for the speculative tokens, and vLLM's endpoint fails (HTTP 500). Serve
+  without `MTP_TOKENS` when `logprobs` are needed.
 - **MTP supports at most 2 draft tokens**. With 3 draft tokens the verify pass produced
   invalid indices; this is not resolved.
 - **Device profiles of prefill graphs are incomplete**: the runtime drops profiler
