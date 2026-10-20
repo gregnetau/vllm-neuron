@@ -58,6 +58,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 "Use None/'bf16', or 'fp8' (per-tensor static FP8 MLP, quantized at load "
                 "from a BF16 checkpoint with calibrated activation scales)."
             )
+        cls._validate_chunked_prefill(neuron_config)
         cfg = Qwen3_5Config.from_configs(hf_config)
         tp = get_tp_group().world_size
         cfg.validate_tp(tp)
@@ -67,6 +68,27 @@ class Qwen3_5ForCausalLM(nn.Module):
             raise NotImplementedError(
                 f"tensor_parallel_size must equal num_key_value_heads "
                 f"({cfg.num_key_value_heads}) for Qwen3.5/3.8; got {tp}."
+            )
+
+    @staticmethod
+    def _validate_chunked_prefill(neuron_config: NeuronConfig | None) -> None:
+        """Without kv_segment_size_buckets, prefill attends only within its own chunk, so a
+        prompt split over several steps would ignore its cached prefix. Refuse that config."""
+        from vllm.config import get_current_vllm_config
+
+        if neuron_config is None or neuron_config.kv_segment_size_buckets is not None:
+            return
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config is None:
+            return
+        max_model_len = vllm_config.model_config.max_model_len
+        max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        if max_batched < max_model_len:
+            raise ValueError(
+                f"Qwen3.5/3.8 needs segmented prefill when a prompt can span several prefill "
+                f"steps (max_num_batched_tokens={max_batched} < max_model_len={max_model_len}), "
+                "but kv_segment_size_buckets resolved to None. Set kv_segment_size_buckets in "
+                "neuron_config, or max_num_batched_tokens >= max_model_len."
             )
 
 
