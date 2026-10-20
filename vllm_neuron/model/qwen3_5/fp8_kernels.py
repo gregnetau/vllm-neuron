@@ -317,6 +317,7 @@ def can_use_fp8_mlp_decode(x, gate) -> bool:
 def fp8_matvec(x, w, w_scale, in_scale):
     """Torch entry (inside the compiled graph): x [T, K] @ w [K, N] -> [T, N] in x.dtype."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     return wrap_nki(fp8_matvec_kernel)[get_logical_nc_config()](x, w, w_scale, in_scale)
@@ -326,6 +327,7 @@ def fp8_mlp_decode(x, ln_w, gate, up, down, gate_scale, up_scale, down_scale, ga
                    down_in_scale, eps):
     """Torch entry: MLP(RMSNorm(x)) for decode tokens -> [T, H] float32 (core partials summed)."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     parts = wrap_nki(fp8_mlp_decode_kernel)[get_logical_nc_config()](x, ln_w, gate, up, down, gate_scale, up_scale, down_scale,

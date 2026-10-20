@@ -327,6 +327,7 @@ def gdn_decode_kernel(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, s
 def gdn_decode(mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, state_b, slots, eps):
     """Torch entry (inside the compiled graph). Returns out [B, Hv*D]; states updated in place."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     out, _, _ = wrap_nki(gdn_decode_kernel)[get_logical_nc_config()](
@@ -693,6 +694,7 @@ def gdn_decode_fp8(x, ln_w, w_qkv, w_z, w_ba, qkv_scale, z_scale, in_scale, conv
                    eps):
     """Torch entry: RMSNorm + GDN decode + out_proj -> [T, H] float32; states updated in place."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     parts, _, _ = wrap_nki(gdn_decode_fp8_kernel)[get_logical_nc_config()](

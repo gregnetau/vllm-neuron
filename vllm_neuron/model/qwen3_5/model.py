@@ -119,11 +119,12 @@ def _out_proj_tkg(x, weight, weight_scale=None, input_scale=None, d_head: int = 
     if T > 128 or ND % d_head or not can_run_kernel(x):
         return None
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-    from vllm_neuron.utils.hardware_config import get_logical_nc_config
     from nkilib.core.output_projection.output_projection_tkg import (
         output_projection_tkg,
     )
     from nkilib.core.utils.common_types import QuantizationType
+
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     attention = x.reshape(T, ND // d_head, d_head).permute(2, 0, 1).unsqueeze(-1)  # [D, B=T, N, S=1]
     quant = QuantizationType.STATIC if weight_scale is not None else QuantizationType.NONE
