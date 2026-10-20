@@ -20,15 +20,11 @@ import os
 import pytest
 import torch
 
-# Same defaults as examples/vllm_neuron/models/qwen3_5/run.py.
-os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")  # trn2.3xlarge has no EFA
-os.environ.setdefault("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", "0.15")
-
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.8-27B")
 
 PROMPTS = [
     "The color of the sky is",
-    "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+    'def fibonacci(n):\n    """Return the n-th Fibonacci number."""\n',
     "The three primary colors of light are",
     "Translate to French: The weather is nice today.\nFrench:",
 ]
@@ -36,13 +32,22 @@ PROMPTS = [
 OUTPUT_LENGTH = 16
 
 # The argmax lower bound stays at 1e-5: a divergence is a correctness bug. The per-K upper
-# bounds are wider than the template's BF16 dense convention (0.03 / 0.05 / 0.08 / 0.09) for one
-# ill-conditioned token: the fibonacci prompt's 12th generated token ('0' after "return ").
-# A small deviation at its input grows about 15x in layer 62 (a GDN layer); the Neuron layer
-# matches Hugging Face's layer on the same inputs. Hugging Face's own BF16 model, run over the
-# same sequence, misses the FP32 logits there by 0.19 (L-inf / max), more than Neuron (0.14 to
-# 0.17). Every other token passes the template bounds.
+# bounds are the template's BF16 dense convention.
 TOL_MAP = {
+    "5": (1e-5, 0.03),
+    "50": (1e-5, 0.05),
+    "1000": (1e-5, 0.08),
+    "all": (1e-5, 0.09),
+}
+
+# Prompts validated with wider top-K bounds. The fibonacci prompt's 12th generated token ('0'
+# after "return ") is ill-conditioned in BF16: a small deviation at its input grows about 15x
+# in layer 62 (a GDN layer), and the Neuron layer matches Hugging Face's layer on the same
+# inputs. Hugging Face's own BF16 model, run over the same sequence, misses the FP32 logits
+# there by 0.19 (L-inf / max), more than Neuron (0.14 to 0.17). Its other tokens pass the
+# template bounds.
+ILL_CONDITIONED_PROMPTS = {1}
+ILL_CONDITIONED_TOL_MAP = {
     "5": (1e-5, 0.03),
     "50": (1e-5, 0.07),
     "1000": (1e-5, 0.12),
@@ -60,7 +65,8 @@ def _load_text_model(model_checkpoint, dtype, config=None):
 
     text_config = AutoConfig.from_pretrained(model_checkpoint).text_config
     model = Qwen3_5ForCausalLM.from_pretrained(
-        model_checkpoint, config=text_config, dtype=dtype, low_cpu_mem_usage=True)
+        model_checkpoint, config=text_config, dtype=dtype, low_cpu_mem_usage=True
+    )
     return model.eval()
 
 
@@ -72,8 +78,15 @@ def _load_text_model(model_checkpoint, dtype, config=None):
         (4, 2048),
     ],
 )
-def test_model_accuracy(batch_size: int, seq_len: int) -> None:
+def test_model_accuracy(batch_size: int, seq_len: int, monkeypatch) -> None:
     """Serve Qwen3.8 (BF16, BF16 KV, TP=4) through vLLM and validate its logits."""
+    # Same defaults as examples/vllm_neuron/models/qwen3_5/run.py (unless already set).
+    for name, value in (
+        ("NEURON_SKIP_EFA_AFFINITY", "1"),  # trn2.3xlarge has no EFA
+        ("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", "0.15"),
+    ):
+        if name not in os.environ:
+            monkeypatch.setenv(name, value)
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
 
@@ -128,18 +141,30 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         prompts_input_ids = [
             [list(ids) for ids in prompt] for prompt in cached_goldens["input_ids"]
         ]
-        result = multi_prompt_logit_validation(
-            prompts_input_ids=prompts_input_ids,
-            generate_fn=generate_fn,
-            prompts_expected_logits=cached_goldens["dtype_logits"],
-            prompts_baseline_logits=cached_goldens["fp32_logits"],
-            colorize=True,
-            replicate_to_batch_size=batch_size,
-            tol_map=TOL_MAP,
-        )
-        assert result.passed, (
-            f"Logit validation failed for parameters: {batch_size=}, {seq_len=}"
-        )
+        for tol_map, indices in (
+            (
+                TOL_MAP,
+                [i for i in range(len(PROMPTS)) if i not in ILL_CONDITIONED_PROMPTS],
+            ),
+            (ILL_CONDITIONED_TOL_MAP, sorted(ILL_CONDITIONED_PROMPTS)),
+        ):
+            result = multi_prompt_logit_validation(
+                prompts_input_ids=[prompts_input_ids[i] for i in indices],
+                generate_fn=generate_fn,
+                prompts_expected_logits=[
+                    cached_goldens["dtype_logits"][i] for i in indices
+                ],
+                prompts_baseline_logits=[
+                    cached_goldens["fp32_logits"][i] for i in indices
+                ],
+                colorize=True,
+                replicate_to_batch_size=batch_size,
+                tol_map=tol_map,
+            )
+            assert result.passed, (
+                f"Logit validation failed for parameters: {batch_size=}, {seq_len=}, "
+                f"prompts {indices}"
+            )
     finally:
         llm.llm_engine.engine_core.shutdown()
 

@@ -11,8 +11,6 @@ one head's [Dk, Dv] state tile, or a channel block of one conv tap. Only sizes m
 Page packing lives in :mod:`vllm_neuron.model.state_cache`.
 """
 
-from vllm_neuron.model.state_cache import StatePageLayout, page_layout
-
 
 def gdn_state_shapes(cfg, tp: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Per-rank (conv_state, ssm_state) shapes for one linear-attention layer."""
@@ -24,8 +22,3 @@ def gdn_state_shapes(cfg, tp: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
         cfg.linear_value_head_dim,
     )
     return conv, ssm
-
-
-def gdn_page_layout(cfg, tp: int) -> StatePageLayout:
-    conv, ssm = gdn_state_shapes(cfg, tp)
-    return page_layout((conv, ssm), (cfg.mamba_ssm_dtype, cfg.mamba_ssm_dtype))

@@ -13,20 +13,36 @@ def reference_mod(qwen3_5_config):
     from conftest import ROOT, _load
 
     _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
-    return _load("vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py")
+    return _load(
+        "vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py"
+    )
 
 
 @pytest.mark.parametrize("tie", [False, True])
 def test_reference_matches_hf_logits(qwen3_5_config, reference_mod, tie):
     torch.manual_seed(3)
     hf_cfg = Qwen3_5TextConfig(
-        hidden_size=64, num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=32, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
-        linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
-        vocab_size=128, partial_rotary_factor=0.25, tie_word_embeddings=tie,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
-                         "partial_rotary_factor": 0.25, "mrope_section": [1, 1, 2],
-                         "mrope_interleaved": True},
+        hidden_size=64,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=96,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        vocab_size=128,
+        partial_rotary_factor=0.25,
+        tie_word_embeddings=tie,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
     )
     model = hf.Qwen3_5ForCausalLM(hf_cfg).eval()
     with torch.no_grad():
@@ -45,7 +61,11 @@ def test_reference_matches_hf_logits(qwen3_5_config, reference_mod, tie):
 
     cfg = qwen3_5_config.Qwen3_5Config.from_configs(hf_cfg.to_dict())
     assert cfg.layer_types.count("full_attention") == 2
-    mine = reference_mod.Qwen3_5Reference(cfg, dict(model.state_dict()), prefix="model.")
+    mine = reference_mod.Qwen3_5Reference(
+        cfg, dict(model.state_dict()), prefix="model."
+    )
     outs = [mine.forward(ids[0, :40]), mine.forward(ids[0, 40:69])]  # chunked prefill
-    outs += [mine.forward(ids[0, t : t + 1], decode=True) for t in range(69, 75)]  # decode
+    outs += [
+        mine.forward(ids[0, t : t + 1], decode=True) for t in range(69, 75)
+    ]  # decode
     torch.testing.assert_close(torch.cat(outs), ref, rtol=2e-3, atol=2e-3)

@@ -75,14 +75,22 @@ def full_attention_reference(hidden, w, cfg, positions, kv):
 
 
 def mlp_reference(x, w):
-    return (F.silu(x @ w["gate_proj"].t()) * (x @ w["up_proj"].t())) @ w["down_proj"].t()
+    return (F.silu(x @ w["gate_proj"].t()) * (x @ w["up_proj"].t())) @ w[
+        "down_proj"
+    ].t()
 
 
 class Qwen3_5Reference:
     """weights: HF-named state dict; ``prefix`` is the text-tower key prefix, e.g.
     ``"model.language_model."`` (ConditionalGeneration) or ``"model."`` (CausalLM)."""
 
-    def __init__(self, cfg, weights: dict[str, torch.Tensor], prefix: str, lm_head: str = "lm_head.weight"):
+    def __init__(
+        self,
+        cfg,
+        weights: dict[str, torch.Tensor],
+        prefix: str,
+        lm_head: str = "lm_head.weight",
+    ):
         self.cfg, self.w, self.p = cfg, weights, prefix
         self.lm_head = weights.get(lm_head, weights[f"{prefix}embed_tokens.weight"])
         self.state: list = [None] * cfg.num_hidden_layers  # kv or (conv, ssm)
@@ -99,20 +107,44 @@ class Qwen3_5Reference:
         x = F.embedding(input_ids, self.w[f"{self.p}embed_tokens.weight"])
         for i, kind in enumerate(cfg.layer_types):
             lp = f"{self.p}layers.{i}."
-            h = rmsnorm_zero_centered(x, self.w[lp + "input_layernorm.weight"], cfg.rms_norm_eps)
+            h = rmsnorm_zero_centered(
+                x, self.w[lp + "input_layernorm.weight"], cfg.rms_norm_eps
+            )
             if kind == "full_attention":
-                aw = self._sub(i, "self_attn", ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"))
-                h, self.state[i] = full_attention_reference(h, aw, cfg, positions, self.state[i])
+                aw = self._sub(
+                    i,
+                    "self_attn",
+                    ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
+                )
+                h, self.state[i] = full_attention_reference(
+                    h, aw, cfg, positions, self.state[i]
+                )
             else:
-                g = lambda n: self.w[lp + "linear_attn." + n]
-                lw = {n: g(n + ".weight") for n in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d", "out_proj")}
+                g = lambda n, lp=lp: self.w[lp + "linear_attn." + n]
+                lw = {
+                    n: g(n + ".weight")
+                    for n in (
+                        "in_proj_qkv",
+                        "in_proj_z",
+                        "in_proj_b",
+                        "in_proj_a",
+                        "conv1d",
+                        "out_proj",
+                    )
+                }
                 lw.update(A_log=g("A_log"), dt_bias=g("dt_bias"), norm=g("norm.weight"))
                 conv, ssm = self.state[i] or (None, None)
-                h, conv, ssm = gdn_ops.gdn_layer_reference(h, lw, cfg, conv, ssm, decode=decode)
+                h, conv, ssm = gdn_ops.gdn_layer_reference(
+                    h, lw, cfg, conv, ssm, decode=decode
+                )
                 self.state[i] = (conv, ssm)
             x = x + h
-            h = rmsnorm_zero_centered(x, self.w[lp + "post_attention_layernorm.weight"], cfg.rms_norm_eps)
-            x = x + mlp_reference(h, self._sub(i, "mlp", ("gate_proj", "up_proj", "down_proj")))
+            h = rmsnorm_zero_centered(
+                x, self.w[lp + "post_attention_layernorm.weight"], cfg.rms_norm_eps
+            )
+            x = x + mlp_reference(
+                h, self._sub(i, "mlp", ("gate_proj", "up_proj", "down_proj"))
+            )
         x = rmsnorm_zero_centered(x, self.w[f"{self.p}norm.weight"], cfg.rms_norm_eps)
         self.pos += L
         return x @ self.lm_head.t()

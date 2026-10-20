@@ -39,7 +39,9 @@ def page_layout(
         cur = _round_up(cur, ALIGN)
         offsets.append(cur)
         cur += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-    return StatePageLayout(tuple(shapes), tuple(dtypes), tuple(offsets), _round_up(cur, ALIGN))
+    return StatePageLayout(
+        tuple(shapes), tuple(dtypes), tuple(offsets), _round_up(cur, ALIGN)
+    )
 
 
 def padded_state_page_bytes(
@@ -76,9 +78,13 @@ def paired_half_views(
 
 def state_half_elems(layout: StatePageLayout, page_bytes: int) -> tuple[int, int]:
     """(total float32 state elements S, elements per half h); requires all-float32 state."""
-    assert all(d == torch.float32 for d in layout.dtypes), "paired-half state must be float32"
+    assert all(d == torch.float32 for d in layout.dtypes), (
+        "paired-half state must be float32"
+    )
     total = sum(math.prod(s) for s in layout.shapes)
     half = page_bytes // 2 // 4
     if (total + 1) // 2 > half or total > 2 * half:
-        raise ValueError(f"state of {total} f32 elements does not fit two halves of {half}")
+        raise ValueError(
+            f"state of {total} f32 elements does not fit two halves of {half}"
+        )
     return total, half

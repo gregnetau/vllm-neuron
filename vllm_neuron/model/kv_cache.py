@@ -69,6 +69,8 @@ class StateLayerSpec:
     name: str
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype, ...]
+    # vLLM MambaAttentionBackendEnum member that names the layer type in its MambaSpec.
+    mamba_type: str = "GDN_ATTN"
 
 
 @dataclass

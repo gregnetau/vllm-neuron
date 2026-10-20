@@ -178,9 +178,9 @@ and how the plugin meets them:
 | Query length a multiple of 128 | the Q chunk is padded to a prefill bucket (`num_batched_tokens_buckets`), independent of the KV segment; each step picks its segment from `kv_segment_size_buckets` by the cached length (`pick_kv_segment_size`) |
 
 With one KV head per rank a block `[1, B, Dh]` is contiguous, so the cache viewed as
-`[nb * r, 1, B / r, Dh]` is a reshape and block `b` becomes sub-blocks `b*r .. b*r+r-1`
-(`_split_kv_blocks`); unused table entries (-1) become the null block's sub-blocks. The
-packed FP8 K layout that the library kernel reads directly is not used: the decode kernel
+`[nb * r, 1, B / r, Dh]` is a view and block `b` becomes sub-blocks `b*r .. b*r+r-1`
+(`_split_kv_blocks`, opted into with `segmented_attention(sub_block_kv=True)`); unused
+table entries (-1) become the null block's sub-blocks. The packed FP8 K layout that the library kernel reads directly is not used: the decode kernel
 reads it only at `head_dim` <= 128.
 
 ## Scheduling
@@ -197,8 +197,10 @@ step leave the persistent batch and are re-added, and each keeps its dedicated s
 Block ids are global across groups, so a KV block can previously have held float32 state.
 Read as bf16, those bytes include NaN and Inf, and the decode attention kernel reads whole
 blocks (a masked `0 * NaN` is still NaN). The runner clears attention blocks when the
-scheduler allocates them: each step that allocates any runs one small compiled graph that
-zeroes the new blocks of every attention layer in place (`_setup_kv_block_clearing`). The
+scheduler allocates them: vLLM lists them for models with Mamba layers
+(`SchedulerOutput.new_block_ids_to_zero`, which leaves out prefix-cache hits and blocks an
+async KV load will write), and each step that has any runs one small compiled graph that
+zeroes them for every attention layer in place (`_setup_kv_block_clearing`). The
 model then skips its own clearing (`set_runner_clears_kv_blocks`); without the runner hook it
 clears blocks on their first write, at prefill and at block boundaries during decode. Writing
 the cache ahead of `attention_decode` inside the decode graph makes the kernel input a copy of

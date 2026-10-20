@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Vendored from nkilib.core.attention.attention_segmented_cte (the nkilib shipped with
-# vllm-neuron 0.29.0.1.2.0) with one change for Qwen3.5 / Qwen3.8 segmented prefill over an FP8
-# KV cache at head_dim 256: load_kv_cache loads a 1-byte (unpacked FP8) K cache with the
-# per-block DMA + PE transpose (block_size <= 128; widened to bf16 for the transpose) instead
-# of the indirect DMA transpose, which needs a 2-byte dtype. The library otherwise needs the packed FP8
-# layout, which the decode kernel cannot read at d_head > 128. Relative imports are made
-# absolute; everything else is unchanged.
+# Vendored from nkilib.core.attention.attention_segmented_cte: nkilib 0.0.0.0dev0+100a53e9
+# (bundled with neuronx-cc 2.28.7631.0, Neuron SDK 2.33), with one change for Qwen3.5 /
+# Qwen3.8 segmented prefill over an FP8 KV cache at head_dim 256: load_kv_cache loads a
+# 1-byte (unpacked FP8) K cache with the per-block DMA + PE transpose (block_size <= 128;
+# widened to bf16 for the transpose) instead of the indirect DMA transpose, which needs a
+# 2-byte dtype. The library otherwise needs the packed FP8 layout, which the decode kernel
+# cannot read at d_head > 128. The change is marked "Vendored change"; relative imports are
+# made absolute, and attention_segmented_cte_fp8_kernel (end of file) is the entry point.
+# Everything else is unchanged.
 
 """
 Segmented attention operations with block-based KV cache support.

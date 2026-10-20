@@ -27,11 +27,12 @@ import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
-FP8_MAX = 240.0
+from .weights import FP8_MAX
+
 MAX_TOKENS = 32
 _P = 128
-_NB = 512            # matmul columns (one PSUM bank of fp32)
-_SB = 4096           # columns per PSUM pass (8 banks)
+_NB = 512  # matmul columns (one PSUM bank of fp32)
+_SB = 4096  # columns per PSUM pass (8 banks)
 _CHUNK_BYTES = 1 << 20
 
 
@@ -62,9 +63,17 @@ def _quantize_cols(dst, src, inv, T):
     nisa.memset(dst, 0.0)
     for t in range(T):
         tmp = _sb((_P, src.shape[2]))
-        nisa.tensor_scalar(dst=tmp, data=src[:, t, :], op0=nl.multiply, operand0=inv,
-                           op1=nl.minimum, operand1=FP8_MAX)
-        nisa.tensor_scalar(dst=dst[:, :, t], data=tmp, op0=nl.maximum, operand0=-FP8_MAX)
+        nisa.tensor_scalar(
+            dst=tmp,
+            data=src[:, t, :],
+            op0=nl.multiply,
+            operand0=inv,
+            op1=nl.minimum,
+            operand1=FP8_MAX,
+        )
+        nisa.tensor_scalar(
+            dst=dst[:, :, t], data=tmp, op0=nl.maximum, operand0=-FP8_MAX
+        )
 
 
 def _stream_pass(ps, subs, xq, wv, c0, KT, sw, wdtype):
@@ -76,20 +85,28 @@ def _stream_pass(ps, subs, xq, wv, c0, KT, sw, wdtype):
         k0 = chunks[ci][0]
         kc = chunks[ci][1] - k0
         wt = _sb((_P, kc, sw), wdtype)
-        nisa.dma_copy(dst=wt, src=wv[:, k0:k0 + kc, nl.ds(c0, sw)])
+        nisa.dma_copy(dst=wt, src=wv[:, k0 : k0 + kc, nl.ds(c0, sw)])
         for j in range(kc // 2):
             for si in range(len(subs)):
                 n0 = subs[si][0]
                 nb = subs[si][1] - n0
-                nisa.nc_matmul(dst=ps[:, si, 0:nb], stationary=xq[:, k0 + 2 * j:k0 + 2 * j + 2, :],
-                               moving=wt[:, 2 * j:2 * j + 2, n0:n0 + nb], accumulate=(k0 + 2 * j) > 0,
-                               perf_mode=nisa.matmul_perf_mode.double_row)
+                nisa.nc_matmul(
+                    dst=ps[:, si, 0:nb],
+                    stationary=xq[:, k0 + 2 * j : k0 + 2 * j + 2, :],
+                    moving=wt[:, 2 * j : 2 * j + 2, n0 : n0 + nb],
+                    accumulate=(k0 + 2 * j) > 0,
+                    perf_mode=nisa.matmul_perf_mode.double_row,
+                )
         if kc % 2 == 1:
             for si in range(len(subs)):
                 n0 = subs[si][0]
                 nb = subs[si][1] - n0
-                nisa.nc_matmul(dst=ps[:, si, 0:nb], stationary=xq[:, k0 + kc - 1, :],
-                               moving=wt[:, kc - 1, n0:n0 + nb], accumulate=(k0 + kc - 1) > 0)
+                nisa.nc_matmul(
+                    dst=ps[:, si, 0:nb],
+                    stationary=xq[:, k0 + kc - 1, :],
+                    moving=wt[:, kc - 1, n0 : n0 + nb],
+                    accumulate=(k0 + kc - 1) > 0,
+                )
 
 
 def _bank_pieces(lc, width):
@@ -113,16 +130,23 @@ def _matmul_tile(ps, lc, xq, wt, k0, kc, width):
         for pi in range(len(pieces)):
             col = pieces[pi][0]
             n = pieces[pi][1]
-            nisa.nc_matmul(dst=ps[:, col // _NB, col % _NB:col % _NB + n],
-                           stationary=xq[:, k0 + 2 * j:k0 + 2 * j + 2, :],
-                           moving=wt[:, 2 * j:2 * j + 2, col - lc:col - lc + n],
-                           accumulate=(k0 + 2 * j) > 0, perf_mode=nisa.matmul_perf_mode.double_row)
+            nisa.nc_matmul(
+                dst=ps[:, col // _NB, col % _NB : col % _NB + n],
+                stationary=xq[:, k0 + 2 * j : k0 + 2 * j + 2, :],
+                moving=wt[:, 2 * j : 2 * j + 2, col - lc : col - lc + n],
+                accumulate=(k0 + 2 * j) > 0,
+                perf_mode=nisa.matmul_perf_mode.double_row,
+            )
     if kc % 2 == 1:
         for pi in range(len(pieces)):
             col = pieces[pi][0]
             n = pieces[pi][1]
-            nisa.nc_matmul(dst=ps[:, col // _NB, col % _NB:col % _NB + n], stationary=xq[:, k0 + kc - 1, :],
-                           moving=wt[:, kc - 1, col - lc:col - lc + n], accumulate=(k0 + kc - 1) > 0)
+            nisa.nc_matmul(
+                dst=ps[:, col // _NB, col % _NB : col % _NB + n],
+                stationary=xq[:, k0 + kc - 1, :],
+                moving=wt[:, kc - 1, col - lc : col - lc + n],
+                accumulate=(k0 + kc - 1) > 0,
+            )
 
 
 def _stream_segment(ps, lc, xq, wv, c0, width, KT, wdtype):
@@ -134,7 +158,7 @@ def _stream_segment(ps, lc, xq, wv, c0, width, KT, wdtype):
         k0 = chunks[ci][0]
         kc = chunks[ci][1] - k0
         wt = _sb((_P, kc, width), wdtype)
-        nisa.dma_copy(dst=wt, src=wv[:, k0:k0 + kc, nl.ds(c0, width)])
+        nisa.dma_copy(dst=wt, src=wv[:, k0 : k0 + kc, nl.ds(c0, width)])
         _matmul_tile(ps, lc, xq, wt, k0, kc, width)
 
 
@@ -144,8 +168,12 @@ def _evacuate_segment(dst, ps, lc, width, osc, T):
     for pi in range(len(pieces)):
         col = pieces[pi][0]
         n = pieces[pi][1]
-        nisa.tensor_scalar(dst=dst[:, col:col + n], data=ps[0:T, col // _NB, col % _NB:col % _NB + n],
-                           op0=nl.multiply, operand0=osc[0:T, :])
+        nisa.tensor_scalar(
+            dst=dst[:, col : col + n],
+            data=ps[0:T, col // _NB, col % _NB : col % _NB + n],
+            op0=nl.multiply,
+            operand0=osc[0:T, :],
+        )
 
 
 def _evacuate(dst, ps, subs, osc, T):
@@ -153,15 +181,22 @@ def _evacuate(dst, ps, subs, osc, T):
     for si in range(len(subs)):
         n0 = subs[si][0]
         nb = subs[si][1] - n0
-        nisa.tensor_scalar(dst=dst[:, n0:n0 + nb], data=ps[0:T, si, 0:nb], op0=nl.multiply,
-                           operand0=osc[0:T, :])
+        nisa.tensor_scalar(
+            dst=dst[:, n0 : n0 + nb],
+            data=ps[0:T, si, 0:nb],
+            op0=nl.multiply,
+            operand0=osc[0:T, :],
+        )
 
 
 def _load_x(x, KT):
     """x [T, K] -> [P, T, KT] fp32 with k = p * KT + kt."""
     T, K = x.shape
     xs = _sb((_P, T, KT), x.dtype)
-    nisa.dma_copy(dst=xs, src=x.reshape((T, _P, KT)).ap(pattern=[[KT, _P], [K, T], [1, KT]], offset=0))
+    nisa.dma_copy(
+        dst=xs,
+        src=x.reshape((T, _P, KT)).ap(pattern=[[KT, _P], [K, T], [1, KT]], offset=0),
+    )
     xf = _sb((_P, T, KT))
     nisa.tensor_copy(dst=xf, src=xs)
     return xf
@@ -203,8 +238,19 @@ def fp8_matvec_kernel(x, w, w_scale, in_scale):
 
 
 @nki.jit
-def fp8_mlp_decode_kernel(x, ln_w, gate, up, down, gate_scale, up_scale, down_scale,
-                          gate_up_in_scale, down_in_scale, eps):
+def fp8_mlp_decode_kernel(
+    x,
+    ln_w,
+    gate,
+    up,
+    down,
+    gate_scale,
+    up_scale,
+    down_scale,
+    gate_up_in_scale,
+    down_in_scale,
+    eps,
+):
     """x [T, H] bf16 (pre-norm), ln_w [H] f32, gate/up [H, I] fp8, down [I, H] fp8, scales
     [128, 1] f32 -> [2, T, H] f32 per-core partial sums of the MLP output. rev 1"""
     T, H = x.shape
@@ -246,7 +292,12 @@ def fp8_mlp_decode_kernel(x, ln_w, gate, up, down, gate_scale, up_scale, down_sc
     nisa.activation(dst=rstd, op=nl.rsqrt, data=tot, scale=1.0 / H, bias=eps)
     xn = _sb((_P, T, KT))
     for t in range(T):
-        nisa.tensor_scalar(dst=xn[:, t, :], data=xf[:, t, :], op0=nl.multiply, operand0=rstd[:, t:t + 1])
+        nisa.tensor_scalar(
+            dst=xn[:, t, :],
+            data=xf[:, t, :],
+            op0=nl.multiply,
+            operand0=rstd[:, t : t + 1],
+        )
         nisa.tensor_tensor(dst=xn[:, t, :], data1=xn[:, t, :], data2=lw, op=nl.multiply)
     xq = _sb((_P, KT, TP), gate.dtype)
     _quantize_cols(xq, xn, inv_gu, T)
@@ -284,7 +335,14 @@ def fp8_mlp_decode_kernel(x, ln_w, gate, up, down, gate_scale, up_scale, down_sc
     a = _sb((_P, ICT, T))
     nisa.tensor_tensor(dst=a, data1=gt, data2=r, op=nl.multiply)
     nisa.tensor_tensor(dst=a, data1=a, data2=ut, op=nl.multiply)
-    nisa.tensor_scalar(dst=a, data=a, op0=nl.multiply, operand0=inv_dn, op1=nl.minimum, operand1=FP8_MAX)
+    nisa.tensor_scalar(
+        dst=a,
+        data=a,
+        op0=nl.multiply,
+        operand0=inv_dn,
+        op1=nl.minimum,
+        operand1=FP8_MAX,
+    )
     aq = _sb((_P, ICT, TP), down.dtype)
     nisa.memset(aq, 0.0)
     nisa.tensor_scalar(dst=aq[:, :, 0:T], data=a, op0=nl.maximum, operand0=-FP8_MAX)
@@ -300,18 +358,38 @@ def fp8_mlp_decode_kernel(x, ln_w, gate, up, down, gate_scale, up_scale, down_sc
         _stream_pass(ps, dsubs, aq, dv[prg_id], s0, ICT, sw, down.dtype)
         o = _sb((T, sw))
         _evacuate(o, ps, dsubs, od, T)
-        nisa.dma_copy(dst=out[prg_id, :, s0:s0 + sw], src=o)
+        nisa.dma_copy(dst=out[prg_id, :, s0 : s0 + sw], src=o)
     return out
+
+
+def two_programs() -> bool:
+    """The decode kernels here and in gdn_kernels split work over exactly 2 LNC programs
+    (out[prg_id], parts[0] + parts[1]); other logical-core configs use the PyTorch paths."""
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    return get_logical_nc_config() == 2
 
 
 def can_use_fp8_matvec(x, w) -> bool:
     T, K = x.shape
-    return T <= MAX_TOKENS and K % _P == 0 and w.shape[1] % 2 == 0 and w.dtype != x.dtype
+    return (
+        T <= MAX_TOKENS
+        and K % _P == 0
+        and w.shape[1] % 2 == 0
+        and w.dtype != x.dtype
+        and two_programs()
+    )
 
 
 def can_use_fp8_mlp_decode(x, gate) -> bool:
     T, H = x.shape
-    return T <= MAX_TOKENS and H % _P == 0 and gate.shape[1] % (2 * _P) == 0 and gate.dtype != x.dtype
+    return (
+        T <= MAX_TOKENS
+        and H % _P == 0
+        and gate.shape[1] % (2 * _P) == 0
+        and gate.dtype != x.dtype
+        and two_programs()
+    )
 
 
 def fp8_matvec(x, w, w_scale, in_scale):
@@ -323,13 +401,35 @@ def fp8_matvec(x, w, w_scale, in_scale):
     return wrap_nki(fp8_matvec_kernel)[get_logical_nc_config()](x, w, w_scale, in_scale)
 
 
-def fp8_mlp_decode(x, ln_w, gate, up, down, gate_scale, up_scale, down_scale, gate_up_in_scale,
-                   down_in_scale, eps):
+def fp8_mlp_decode(
+    x,
+    ln_w,
+    gate,
+    up,
+    down,
+    gate_scale,
+    up_scale,
+    down_scale,
+    gate_up_in_scale,
+    down_in_scale,
+    eps,
+):
     """Torch entry: MLP(RMSNorm(x)) for decode tokens -> [T, H] float32 (core partials summed)."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
-    parts = wrap_nki(fp8_mlp_decode_kernel)[get_logical_nc_config()](x, ln_w, gate, up, down, gate_scale, up_scale, down_scale,
-                                               gate_up_in_scale, down_in_scale, eps)
+    parts = wrap_nki(fp8_mlp_decode_kernel)[get_logical_nc_config()](
+        x,
+        ln_w,
+        gate,
+        up,
+        down,
+        gate_scale,
+        up_scale,
+        down_scale,
+        gate_up_in_scale,
+        down_in_scale,
+        eps,
+    )
     return parts[0] + parts[1]

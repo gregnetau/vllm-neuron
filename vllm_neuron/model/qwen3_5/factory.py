@@ -1,23 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Factory for the Qwen3.5 / Qwen3.8 dense hybrid text model (BF16, text only)."""
+"""Factory for the Qwen3.5 / Qwen3.8 dense hybrid text model (BF16 or static FP8, text only)."""
 
 from torch import nn
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.interfaces import HasRecurrentState, ServesTextOnly
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(nn.Module, HasRecurrentState, ServesTextOnly):
     """Validates the config and builds the Neuron implementation.
 
     Registered under both ``Qwen3_5ForCausalLM`` and ``Qwen3_5ForConditionalGeneration``
-    (the published Qwen3.8-27B checkpoint's architecture); the vision tower and MTP head are
-    ignored, so both serve text only.
+    (the published Qwen3.8-27B checkpoint's architecture). Both serve the text tower; the
+    vision tower is not loaded, and the MTP head is the separate ``Qwen3_5MTP`` draft model.
     """
 
+    # Options the plugin core reads from the registered class (registry.get_model_cls):
     # Segmented prefill reads an unpacked FP8 K cache with the vendored kernel
     # (attention_segmented_cte.py), so the runner keeps segmented prefill on for FP8 KV.
     SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV = True
+    # Native compile route: --model-type=generic, as on the XLA route. The default
+    # "transformer" partitions the prefill graph per layer and remats (about 2.5x slower).
+    NATIVE_COMPILER_MODEL_TYPE = "generic"
+
+    @classmethod
+    def num_recurrent_state_layers(cls, hf_config: PretrainedConfig) -> int:
+        from .config import LINEAR_ATTENTION, Qwen3_5Config
+
+        return Qwen3_5Config.from_configs(hf_config).layer_types.count(LINEAR_ATTENTION)
+
+    @classmethod
+    def serves_text_only(cls) -> bool:
+        return True
 
     def __init__(
         self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
@@ -55,11 +70,19 @@ class Qwen3_5ForCausalLM(nn.Module):
         if quantization not in (None, "bf16", "fp8"):
             raise ValueError(
                 f"quantization={quantization!r} is not supported for Qwen3.5/3.8. "
-                "Use None/'bf16', or 'fp8' (per-tensor static FP8 MLP, quantized at load "
-                "from a BF16 checkpoint with calibrated activation scales)."
+                "Use None/'bf16', or 'fp8' (per-tensor static FP8 MLP, attention and GDN "
+                "projections, quantized at load from a BF16 checkpoint with calibrated "
+                "activation scales)."
             )
         cls._validate_chunked_prefill(neuron_config)
         cfg = Qwen3_5Config.from_configs(hf_config)
+        if cfg.tie_word_embeddings:
+            # The model always loads a separate ``lm_head.weight`` (published checkpoints are
+            # untied); the reference model in reference.py does handle tied embeddings.
+            raise ValueError(
+                "tie_word_embeddings=True is not supported for Qwen3.5/3.8 (the Neuron "
+                "model loads a separate lm_head.weight)."
+            )
         tp = get_tp_group().world_size
         cfg.validate_tp(tp)
         if cfg.num_key_value_heads // tp != 1:
@@ -96,8 +119,12 @@ class Qwen3_5MTP(nn.Module):
     """Factory for the MTP draft model (vLLM's ``mtp`` speculative method)."""
 
     @classmethod
-    def from_configs(cls, config: PretrainedConfig, start_layer_idx: int,
-                     neuron_config: NeuronConfig | None = None) -> nn.Module:
+    def from_configs(
+        cls,
+        config: PretrainedConfig,
+        start_layer_idx: int,
+        neuron_config: NeuronConfig | None = None,
+    ) -> nn.Module:
         from .mtp import Qwen3_5MTP as Model
 
         return Model.from_configs(config, start_layer_idx, neuron_config)

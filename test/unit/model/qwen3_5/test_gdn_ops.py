@@ -22,9 +22,15 @@ def _rand_inputs(L, dtype=torch.float32):
 
 def _hf_ref(fn, q, k, v, g, beta, state=None, **kw):
     out, s = fn(
-        q[None], k[None], v[None], g[None], beta[None],
+        q[None],
+        k[None],
+        v[None],
+        g[None],
+        beta[None],
         initial_state=None if state is None else state[None],
-        output_final_state=True, use_qk_l2norm_in_kernel=True, **kw,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        **kw,
     )
     return out[0], s[0]
 
@@ -108,9 +114,17 @@ def test_layer_reference_matches_hf_with_chunked_prefill_then_decode(gdn_ops):
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
     cfg = Qwen3_5TextConfig(
-        hidden_size=48, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=16, intermediate_size=64, linear_num_key_heads=2, linear_num_value_heads=6,
-        linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+        hidden_size=48,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
         vocab_size=100,
     )
     layer = hf.Qwen3_5GatedDeltaNet(cfg, 0).eval()
@@ -126,10 +140,14 @@ def test_layer_reference_matches_hf_with_chunked_prefill_then_decode(gdn_ops):
         ref = layer(x)[0]
 
     w = {
-        "in_proj_qkv": layer.in_proj_qkv.weight.data, "in_proj_z": layer.in_proj_z.weight.data,
-        "in_proj_b": layer.in_proj_b.weight.data, "in_proj_a": layer.in_proj_a.weight.data,
-        "conv1d": layer.conv1d.weight.data, "A_log": layer.A_log.data,
-        "dt_bias": layer.dt_bias.data, "norm": layer.norm.weight.data,
+        "in_proj_qkv": layer.in_proj_qkv.weight.data,
+        "in_proj_z": layer.in_proj_z.weight.data,
+        "in_proj_b": layer.in_proj_b.weight.data,
+        "in_proj_a": layer.in_proj_a.weight.data,
+        "conv1d": layer.conv1d.weight.data,
+        "A_log": layer.A_log.data,
+        "dt_bias": layer.dt_bias.data,
+        "norm": layer.norm.weight.data,
         "out_proj": layer.out_proj.weight.data,
     }
     xs = x[0]
@@ -139,7 +157,9 @@ def test_layer_reference_matches_hf_with_chunked_prefill_then_decode(gdn_ops):
         o, cs, ss = gdn_ops.gdn_layer_reference(xs[lo:hi], w, cfg, cs, ss)
         outs.append(o)
     for t in range(L_pre, L_pre + L_dec):  # decode
-        o, cs, ss = gdn_ops.gdn_layer_reference(xs[t : t + 1], w, cfg, cs, ss, decode=True)
+        o, cs, ss = gdn_ops.gdn_layer_reference(
+            xs[t : t + 1], w, cfg, cs, ss, decode=True
+        )
         outs.append(o)
     torch.testing.assert_close(torch.cat(outs), ref, rtol=1e-3, atol=1e-4)
 
@@ -161,7 +181,12 @@ def test_batched_decode_steps_match_per_request_recurrent(gdn_ops):
     out, S2 = gdn_ops.gated_delta_step_batched(q, k, v, g, beta, S)
     for b in range(B):
         o, sb = gdn_ops.recurrent_gated_delta_rule(
-            q[b : b + 1], k[b : b + 1], v[b : b + 1], g[b : b + 1], beta[b : b + 1], S[b]
+            q[b : b + 1],
+            k[b : b + 1],
+            v[b : b + 1],
+            g[b : b + 1],
+            beta[b : b + 1],
+            S[b],
         )
         torch.testing.assert_close(out[b], o[0], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(S2[b], sb, rtol=1e-5, atol=1e-6)
@@ -171,7 +196,9 @@ def test_padding_tokens_are_identity_for_state(gdn_ops):
     """beta=0, g=0 on padded tail leaves the state (and valid outputs) unchanged."""
     q, k, v, g, beta = _rand_inputs(100)
     n = 70
-    o_ref, s_ref = gdn_ops.chunk_gated_delta_rule(q[:n], k[:n], v[:n], g[:n], beta[:n], None)
+    o_ref, s_ref = gdn_ops.chunk_gated_delta_rule(
+        q[:n], k[:n], v[:n], g[:n], beta[:n], None
+    )
     g_m, beta_m = g.clone(), beta.clone()
     g_m[n:], beta_m[n:] = 0.0, 0.0
     o, s = gdn_ops.chunk_gated_delta_rule(q, k, v, g_m, beta_m, None)
@@ -185,8 +212,12 @@ def test_inverse_unit_lower_matches_triangular_solve(gdn_ops, C):
     torch.manual_seed(2)
     m = torch.tril(torch.randn(3, 5, C, C) * 0.3, diagonal=-1)
     eye = torch.eye(C)
-    ref = torch.linalg.solve_triangular(eye + m, eye.expand_as(m), upper=False, unitriangular=True)
-    torch.testing.assert_close(gdn_ops.inverse_unit_lower(m, eye), ref, rtol=1e-4, atol=1e-4)
+    ref = torch.linalg.solve_triangular(
+        eye + m, eye.expand_as(m), upper=False, unitriangular=True
+    )
+    torch.testing.assert_close(
+        gdn_ops.inverse_unit_lower(m, eye), ref, rtol=1e-4, atol=1e-4
+    )
 
 
 def test_chunk_rule_graph_has_no_linalg_ops(gdn_ops):
@@ -194,8 +225,11 @@ def test_chunk_rule_graph_has_no_linalg_ops(gdn_ops):
     from torch.fx.experimental.proxy_tensor import make_fx
 
     q, k, v, g, beta = _rand_inputs(70)
-    gm = make_fx(lambda q, k, v, g, beta: gdn_ops.chunk_gated_delta_rule(q, k, v, g, beta, None)[0])(
-        q, k, v, g, beta)
+    gm = make_fx(
+        lambda q, k, v, g, beta: gdn_ops.chunk_gated_delta_rule(q, k, v, g, beta, None)[
+            0
+        ]
+    )(q, k, v, g, beta)
     targets = {str(n.target) for n in gm.graph.nodes if n.op == "call_function"}
     assert targets, "empty graph"
     assert not any("linalg" in t or "triangular" in t for t in targets), sorted(targets)
@@ -206,7 +240,9 @@ def test_inverse_unit_lower_stable_for_near_parallel_keys(gdn_ops):
     while powers of m grow combinatorially, so the result must not go through them."""
     torch.manual_seed(0)
     C = 64
-    k = torch.nn.functional.normalize(torch.ones(C, 16) + 0.01 * torch.randn(C, 16), dim=-1)
+    k = torch.nn.functional.normalize(
+        torch.ones(C, 16) + 0.01 * torch.randn(C, 16), dim=-1
+    )
     kk = (k @ k.t()) * 0.98
     m = torch.tril(kk, diagonal=-1).unsqueeze(0)
     eye = torch.eye(C).unsqueeze(0)

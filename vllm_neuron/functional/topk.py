@@ -647,9 +647,11 @@ def _topk_nki(
     inp2d = tensor.reshape(-1, vocab_size)
     n_rows = inp2d.shape[0]
     # Split over the LNC programs, an odd row count leaves the last program a one-row tile,
-    # which the rotational kernel can return as NaN values with index 0 (an MTP verify at
-    # batch 1 has 3 rows; it surfaced as token id 0 for the bonus token). Pad with copies of
-    # the last row to a multiple of the program count and drop them from the outputs.
+    # which the rotational kernel can return as NaN values with index 0 in some compiles (an
+    # MTP verify at batch 1 has 3 rows; it surfaced as token id 0 for the bonus token). Pad
+    # with copies of the last row to a multiple of the program count and drop them from the
+    # outputs. The kernel's partial-tile fill (cascaded_max_utils.predicated_folded_load)
+    # fixes one uninitialized read but did not make that failure go away on its own.
     n_programs = _get_topk_num_programs()
     pad_rows = (-n_rows) % n_programs if n_rows > 1 else 0
     if pad_rows:

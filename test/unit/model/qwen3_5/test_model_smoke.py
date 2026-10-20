@@ -24,32 +24,41 @@ class _TP:
 
 
 def _stub(name, **attrs):
+    from conftest import set_module
+
     mod = types.ModuleType(name)
     mod.__dict__.update(attrs)
-    sys.modules[name] = mod
+    set_module(name, mod)
     return mod
 
 
 def _install_stubs():
-    from conftest import ROOT, _load, _stub_packages
+    from conftest import ROOT, _load, _stub_packages, set_module
 
     _stub_packages()
     for pkg in ("vllm", "vllm.distributed"):
         _stub(pkg)
     _stub("vllm.distributed.parallel_state", get_tp_group=lambda: _TP())
-    for name, path in (("vllm_neuron.utils", ROOT / "utils"), ("vllm_neuron.nn", ROOT / "nn")):
+    for name, path in (
+        ("vllm_neuron.utils", ROOT / "utils"),
+        ("vllm_neuron.nn", ROOT / "nn"),
+    ):
         pkg = types.ModuleType(name)
         pkg.__path__ = [str(path)]
-        sys.modules[name] = pkg
+        set_module(name, pkg)
 
     def fake_quant(x, scale):  # static FP8: quantize with the input scale, dequantize
         s = scale[0, 0]
         return (x.float() / s).clamp(-240.0, 240.0).to(torch.float8_e4m3fn).float() * s
 
-    def qkv_proj(hidden, qkv_weights, bias=None, qkv_w_scale=None, qkv_in_scale=None, **kw):
+    def qkv_proj(
+        hidden, qkv_weights, bias=None, qkv_w_scale=None, qkv_in_scale=None, **kw
+    ):
         if qkv_w_scale is None:
             return hidden @ qkv_weights
-        out = fake_quant(hidden, qkv_in_scale) @ (qkv_weights.float() * qkv_w_scale[0, 0])
+        out = fake_quant(hidden, qkv_in_scale) @ (
+            qkv_weights.float() * qkv_w_scale[0, 0]
+        )
         return out.to(torch.bfloat16)
 
     def o_proj(active, weight, bias=None, weight_scales=None, input_scales=None, **kw):
@@ -73,29 +82,58 @@ def _install_stubs():
     def mlp(x, gate, up, down):
         return (F.silu(x @ gate) * (x @ up)) @ down
 
-    _stub("vllm_neuron.functional", qkv_proj=qkv_proj, o_proj=o_proj, flash_attention=flash_attention,
-          mlp=mlp, merge_prompt_embeds=lambda h, e, m: h)
+    _stub(
+        "vllm_neuron.functional",
+        qkv_proj=qkv_proj,
+        o_proj=o_proj,
+        flash_attention=flash_attention,
+        mlp=mlp,
+        merge_prompt_embeds=lambda h, e, m: h,
+    )
 
     class Embed(torch.nn.Module):
         def __init__(self, vocab_size, embed_dim, dtype, tp_group=None):
             super().__init__()
             self.vocab_size_per_rank = vocab_size
-            self.weight = torch.nn.Parameter(torch.empty(vocab_size, embed_dim, dtype=dtype))
+            self.weight = torch.nn.Parameter(
+                torch.empty(vocab_size, embed_dim, dtype=dtype)
+            )
 
         def forward(self, ids, scatter_tokens=False, rank=None):
             return F.embedding(ids, self.weight)
 
     class ColPar(torch.nn.Module):
-        def __init__(self, i, o, bias=False, dtype=None, gather_output=True, tp_group=None,
-                     weight_layout="out_in"):
+        def __init__(
+            self,
+            i,
+            o,
+            bias=False,
+            dtype=None,
+            gather_output=True,
+            tp_group=None,
+            weight_layout="out_in",
+        ):
             super().__init__()
             self.weight_layout = weight_layout
             shape = (o, i) if weight_layout == "out_in" else (i, o)
             self.weight = torch.nn.Parameter(torch.empty(*shape, dtype=dtype))
 
         def forward(self, x):
-            return x @ (self.weight.t() if self.weight_layout == "out_in" else self.weight)
+            return x @ (
+                self.weight.t() if self.weight_layout == "out_in" else self.weight
+            )
 
+    class HasRecurrentState:  # interfaces.py imports vllm.multimodal (stubbed out here)
+        pass
+
+    class ServesTextOnly:
+        pass
+
+    _stub(
+        "vllm_neuron.model.interfaces",
+        HasRecurrentState=HasRecurrentState,
+        ServesTextOnly=ServesTextOnly,
+    )
     _stub("vllm_neuron.nn", ColumnParallelLinear=ColPar)
     _stub("vllm_neuron.nn.embedding", VocabDimShardedEmbedding=Embed)
     _stub("vllm_neuron.nn.sampler", Sampler=object)
@@ -124,16 +162,32 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
     mod = _install_stubs()
     from conftest import ROOT, _load
 
-    ref_mod = _load("vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py")
+    ref_mod = _load(
+        "vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py"
+    )
     state_cache = sys.modules["vllm_neuron.model.state_cache"]
     wl = sys.modules["vllm_neuron.utils.weight_loader"]
 
     hf_cfg = Qwen3_5TextConfig(
-        hidden_size=64, num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=32, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
-        linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128, dtype="float32",
-        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
-                         "mrope_section": [1, 1, 2], "mrope_interleaved": True},
+        hidden_size=64,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=96,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        vocab_size=128,
+        dtype="float32",
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
     )
     hf_model = hf.Qwen3_5ForCausalLM(hf_cfg).eval()
     with torch.no_grad():
@@ -146,8 +200,14 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
                 p.copy_(torch.randn_like(p) * 0.1)
             else:
                 p.copy_(torch.randn_like(p) * 0.15)
-    sd = {(k.replace("model.", "model.language_model.", 1) if k.startswith("model.") else k): v
-          for k, v in hf_model.state_dict().items()}
+    sd = {
+        (
+            k.replace("model.", "model.language_model.", 1)
+            if k.startswith("model.")
+            else k
+        ): v
+        for k, v in hf_model.state_dict().items()
+    }
 
     model = mod.Qwen3_5ForCausalLM.from_configs(hf_cfg.to_dict(), None)
     cfg = model.config
@@ -156,11 +216,17 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
     # ---- weight mappings + loaders: every param mapped, every key exists, shapes match
     mappings = model._weight_mappings()
     params = dict(model.named_parameters())
-    assert set(mappings) == set(params), (set(mappings) ^ set(params))
+    assert set(mappings) == set(params), set(mappings) ^ set(params)
     for name, keys in mappings.items():
         keys = [keys] if isinstance(keys, str) else keys
-        loaded = wl.get_weight_loader(params[name]).load([FakeSlice(sd[k]) for k in keys], 0)
-        assert loaded.shape == params[name].shape, (name, loaded.shape, params[name].shape)
+        loaded = wl.get_weight_loader(params[name]).load(
+            [FakeSlice(sd[k]) for k in keys], 0
+        )
+        assert loaded.shape == params[name].shape, (
+            name,
+            loaded.shape,
+            params[name].shape,
+        )
         params[name].data = loaded.to(params[name].dtype)
 
     # ---- specs + caches
@@ -169,7 +235,9 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
     nblocks = 8
     kv = {}
     for l in spec.layers:
-        kv[l.name] = [torch.zeros(nblocks, l.num_kv_heads, BLOCK, l.head_size) for _ in range(2)]
+        kv[l.name] = [
+            torch.zeros(nblocks, l.num_kv_heads, BLOCK, l.head_size) for _ in range(2)
+        ]
     model.bind_kv_cache(kv)
     states = {}
     for sl in spec.state_layers:
@@ -195,17 +263,31 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
     slot[:n_real] = blocks[0][pos // BLOCK].long() * BLOCK + pos % BLOCK
 
     def md_for(is_decode, cached=0, slots=None, table=None, T_=T):
-        common = dict(max_query_len=1 if is_decode else T_, decode_token_threshold=1, block_size=BLOCK,
-                      max_blocks_per_seq=4, cached_seq_len=torch.tensor([[cached]], dtype=torch.int32),
-                      kv_segment_size=0)
+        common = {
+            "max_query_len": 1 if is_decode else T_,
+            "decode_token_threshold": 1,
+            "block_size": BLOCK,
+            "max_blocks_per_seq": 4,
+            "cached_seq_len": torch.tensor([[cached]], dtype=torch.int32),
+            "kv_segment_size": 0,
+        }
         md = {}
         for i, t in enumerate(cfg.layer_types):
             if t == "full_attention":
-                md[f"layers.{i}.self_attn"] = dict(common, slot_mapping=slot, block_table_tensor=blocks)
+                md[f"layers.{i}.self_attn"] = dict(
+                    common, slot_mapping=slot, block_table_tensor=blocks
+                )
             else:
-                tbl = torch.tensor([[PAGE]], dtype=torch.int32) if table is None else table
-                md[f"layers.{i}.linear_attn"] = dict(common, slot_mapping=slot if slots is None else slots,
-                                                     block_table_tensor=tbl)
+                tbl = (
+                    torch.tensor([[PAGE]], dtype=torch.int32)
+                    if table is None
+                    else table
+                )
+                md[f"layers.{i}.linear_attn"] = dict(
+                    common,
+                    slot_mapping=slot if slots is None else slots,
+                    block_table_tensor=tbl,
+                )
         return md
 
     # dirty pages (recycled): new-request prefill must ignore them
@@ -213,9 +295,15 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
         for h in halves:
             h[PAGE].fill_(123.0)
 
-    logits = model(padded, positions=torch.arange(T), attn_metadata=md_for(False),
-                   sampling_positions=torch.tensor([n_real - 1]))
-    ref = ref_mod.Qwen3_5Reference(cfg, sd, prefix="model.language_model.", lm_head="lm_head.weight")
+    logits = model(
+        padded,
+        positions=torch.arange(T),
+        attn_metadata=md_for(False),
+        sampling_positions=torch.tensor([n_real - 1]),
+    )
+    ref = ref_mod.Qwen3_5Reference(
+        cfg, sd, prefix="model.language_model.", lm_head="lm_head.weight"
+    )
     ref_logits = ref.forward(ids)
     torch.testing.assert_close(logits[0], ref_logits[-1], rtol=2e-3, atol=2e-3)
 
@@ -230,16 +318,34 @@ def test_model_smoke_prefill_padded_and_gdn_decode():
 
     # ---- GDN decode step on layer 0 vs the reference block, continuing from that state
     layer = model.model.layers[0].linear_attn
-    lw = {n: sd[f"model.language_model.layers.0.linear_attn.{n}.weight"]
-          for n in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "conv1d", "out_proj")}
-    lw.update(A_log=sd["model.language_model.layers.0.linear_attn.A_log"],
-              dt_bias=sd["model.language_model.layers.0.linear_attn.dt_bias"],
-              norm=sd["model.language_model.layers.0.linear_attn.norm.weight"])
+    lw = {
+        n: sd[f"model.language_model.layers.0.linear_attn.{n}.weight"]
+        for n in (
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+            "conv1d",
+            "out_proj",
+        )
+    }
+    lw.update(
+        A_log=sd["model.language_model.layers.0.linear_attn.A_log"],
+        dt_bias=sd["model.language_model.layers.0.linear_attn.dt_bias"],
+        norm=sd["model.language_model.layers.0.linear_attn.norm.weight"],
+    )
     x = torch.randn(1, cfg.hidden_size)
     conv_ref, ssm_ref = ref.state[0]
-    expected, conv_new, ssm_new = ref_mod.gdn_ops.gdn_layer_reference(x, lw, cfg, conv_ref, ssm_ref, decode=True)
-    md = {"layers.0.linear_attn": dict(max_query_len=1, decode_token_threshold=1,
-                                       block_table_tensor=torch.tensor([[PAGE]], dtype=torch.int32))}
+    expected, conv_new, ssm_new = ref_mod.gdn_ops.gdn_layer_reference(
+        x, lw, cfg, conv_ref, ssm_ref, decode=True
+    )
+    md = {
+        "layers.0.linear_attn": {
+            "max_query_len": 1,
+            "decode_token_threshold": 1,
+            "block_table_tensor": torch.tensor([[PAGE]], dtype=torch.int32),
+        }
+    }
     with torch.no_grad():
         out = layer(x, None, None, md)
     torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-4)
@@ -283,23 +389,29 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
     A = mod.Qwen3_5Attention
     torch.manual_seed(3)
     nkh, groups, Dh, bs = 1, 3, 16, 4
-    a = types.SimpleNamespace(num_key_value_heads_per_rank=nkh, num_key_value_groups=groups, scaling=Dh ** -0.5)
+    a = types.SimpleNamespace(
+        num_key_value_heads_per_rank=nkh, num_key_value_groups=groups, scaling=Dh**-0.5
+    )
     a._attend_cached_torch = A._attend_cached_torch.__get__(a)
     a.kv_fp8, a.k_scale_float, a.v_scale_float = False, 1.0, 1.0
-    prior, T, n_valid = 5, 6, 4                 # 5 cached tokens, 6-row bucket with 4 real tokens
+    prior, T, n_valid = 5, 6, 4  # 5 cached tokens, 6-row bucket with 4 real tokens
     a.k_cache = torch.full((10, nkh, bs, Dh), float("nan"))
     a.v_cache = torch.full((10, nkh, bs, Dh), float("nan"))
-    blocks = torch.tensor([7, 2, 9, 4, 0, 0])   # table padded with the null block
+    blocks = torch.tensor([7, 2, 9, 4, 0, 0])  # table padded with the null block
     L = prior + n_valid
     k_all, v_all = torch.randn(L, Dh), torch.randn(L, Dh)
     for pos in range(L):
         a.k_cache[blocks[pos // bs], 0, pos % bs] = k_all[pos]
         a.v_cache[blocks[pos // bs], 0, pos % bs] = v_all[pos]
     q = torch.randn(nkh * groups, T, Dh)
-    slot = torch.zeros(T, dtype=torch.long); slot[:n_valid] = 1
-    md = {"block_table_tensor": blocks.reshape(1, -1), "cached_seq_len": torch.tensor([prior]),
-          "slot_mapping": slot}
-    out = a._attend_cached_torch(q, md, bs)     # [Nh, Dh, T]
+    slot = torch.zeros(T, dtype=torch.long)
+    slot[:n_valid] = 1
+    md = {
+        "block_table_tensor": blocks.reshape(1, -1),
+        "cached_seq_len": torch.tensor([prior]),
+        "slot_mapping": slot,
+    }
+    out = a._attend_cached_torch(q, md, bs)  # [Nh, Dh, T]
     assert torch.isfinite(out).all()
     for i in range(n_valid):
         s = (q[:, i] @ k_all[: prior + i + 1].t()) * a.scaling
@@ -313,7 +425,9 @@ def test_attend_cached_torch_matches_causal_attention_and_ignores_stale_nan():
     a.v_cache = (v8 * 0.5).to(torch.float8_e4m3fn)
     out8 = a._attend_cached_torch(q, md, bs)
     assert torch.isfinite(out8).all()
-    rel = ((out8[:, :, :n_valid] - out[:, :, :n_valid]).norm() / out[:, :, :n_valid].norm()).item()
+    rel = (
+        (out8[:, :, :n_valid] - out[:, :, :n_valid]).norm() / out[:, :, :n_valid].norm()
+    ).item()
     assert rel < 0.1, rel
 
 
@@ -325,16 +439,32 @@ def test_gdn_static_fp8_matches_bf16():
     from vllm_neuron.model.qwen3_5.config import Qwen3_5Config
 
     torch.manual_seed(5)
-    kw = dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-              head_dim=32, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
-              linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128)
+    kw = {
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "intermediate_size": 96,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "vocab_size": 128,
+    }
     cfg16 = Qwen3_5Config(**kw)
-    cfg8 = Qwen3_5Config(**kw, neuron_config=NeuronConfig.from_dict({"quantization": "fp8"}))
+    cfg8 = Qwen3_5Config(
+        **kw, neuron_config=NeuronConfig.from_dict({"quantization": "fp8"})
+    )
     g16, g8 = mod.Qwen3_5GatedDeltaNet(cfg16, 0), mod.Qwen3_5GatedDeltaNet(cfg8, 0)
     assert not g16.fp8 and g8.fp8 and g8.in_proj_qkv_weight.dtype == torch.float8_e4m3fn
     with torch.no_grad():
         for name, p in g16.named_parameters():
-            p.copy_(torch.randn_like(p) * 0.3 if name not in ("A_log", "norm_weight") else torch.rand_like(p) + 0.5)
+            p.copy_(
+                torch.randn_like(p) * 0.3
+                if name not in ("A_log", "norm_weight")
+                else torch.rand_like(p) + 0.5
+            )
         for name, p in g8.named_parameters():
             if name.endswith("_weight_scale"):
                 continue
@@ -342,7 +472,9 @@ def test_gdn_static_fp8_matches_bf16():
             if p.dtype == torch.float8_e4m3fn:
                 s = W.fp8_weight_scale(src)
                 p.copy_(W.fp8_quantize(src, s))
-                getattr(g8, name + "_scale").copy_(W.fp8_scale_tile(s, getattr(g8, name + "_scale").shape[1]))
+                getattr(g8, name + "_scale").copy_(
+                    W.fp8_scale_tile(s, getattr(g8, name + "_scale").shape[1])
+                )
             else:
                 p.copy_(src)
     T = 6
@@ -354,19 +486,30 @@ def test_gdn_static_fp8_matches_bf16():
     seen, orig = [], g16._out_proj
     g16._out_proj = lambda o: (seen.append(o.float().abs().amax()), orig(o))[1]
     g16.bind_state(*page())
-    slot = torch.zeros(T, dtype=torch.long); slot[:5] = 8
+    slot = torch.zeros(T, dtype=torch.long)
+    slot[:5] = 8
     with torch.no_grad():
-        g16._prefill(x, {"block_table_tensor": torch.tensor([[1]]), "slot_mapping": slot,
-                         "cached_seq_len": torch.tensor([0])})
+        g16._prefill(
+            x,
+            {
+                "block_table_tensor": torch.tensor([[1]]),
+                "slot_mapping": slot,
+                "cached_seq_len": torch.tensor([0]),
+            },
+        )
     g16._out_proj = orig
     g8.out_proj_input_scale = W.fp8_scale_tile(W.fp8_scale(max(seen)))
     outs = []
     for g in (g16, g8):
         sa, sb = page()
         g.bind_state(sa, sb)
-        slot = torch.zeros(T, dtype=torch.long); slot[:5] = 8
-        md = {"block_table_tensor": torch.tensor([[1]]), "slot_mapping": slot,
-              "cached_seq_len": torch.tensor([0])}
+        slot = torch.zeros(T, dtype=torch.long)
+        slot[:5] = 8
+        md = {
+            "block_table_tensor": torch.tensor([[1]]),
+            "slot_mapping": slot,
+            "cached_seq_len": torch.tensor([0]),
+        }
         with torch.no_grad():
             pre = g._prefill(x, md)
             dec = g._decode_torch(x[:1], {"block_table_tensor": torch.tensor([[1]])})
@@ -374,7 +517,9 @@ def test_gdn_static_fp8_matches_bf16():
     for a, b in zip(outs[0], outs[1]):
         a, b = a.float(), b.float()
         rel = ((a - b).norm() / a.norm()).item()
-        assert F.cosine_similarity(a.flatten(), b.flatten(), 0) > 0.99 and rel < 0.1, rel
+        assert F.cosine_similarity(a.flatten(), b.flatten(), 0) > 0.99 and rel < 0.1, (
+            rel
+        )
 
 
 def test_attention_o_proj_views_head_dim_256_as_128():
@@ -385,9 +530,19 @@ def test_attention_o_proj_views_head_dim_256_as_128():
     from vllm_neuron.model.qwen3_5.config import Qwen3_5Config
 
     torch.manual_seed(2)
-    kw = dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-              head_dim=256, intermediate_size=96, linear_num_key_heads=2, linear_num_value_heads=4,
-              linear_key_head_dim=16, linear_value_head_dim=16, vocab_size=128)
+    kw = {
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "intermediate_size": 96,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "vocab_size": 128,
+    }
     for neuron_config in (None, NeuronConfig.from_dict({"quantization": "fp8"})):
         a = mod.Qwen3_5Attention(Qwen3_5Config(**kw, neuron_config=neuron_config), 3)
         w = torch.randn(4 * 256, 64) * 0.05
@@ -406,3 +561,39 @@ def test_attention_o_proj_views_head_dim_256_as_128():
         ref = flat @ w
         assert out.shape == ref.shape
         assert ((out - ref).norm() / ref.norm()).item() < tol
+
+
+def test_weight_mappings_match_real_checkpoint_index():
+    """The checkpoint keys the target model and the MTP draft map to (model._weight_mappings)
+    are exactly the text-tower + ``mtp.*`` names of the published safetensors index."""
+    import json
+    import pathlib
+
+    mod = _install_stubs()
+    from conftest import ROOT, _load
+
+    mtp = _load("vllm_neuron.model.qwen3_5.mtp", ROOT / "model/qwen3_5/mtp.py")
+    here = pathlib.Path(__file__).parent
+    raw = json.loads((here / "qwen3_8_27b_config.json").read_text())
+    published = set(json.loads((here / "qwen3_8_27b_weight_names.json").read_text()))
+
+    def keys(mappings):
+        out = set()
+        for v in mappings.values():
+            out |= {v} if isinstance(v, str) else set(v)
+        return out
+
+    with torch.device("meta"):  # 27B: build without allocating
+        model = mod.Qwen3_5ForCausalLM.from_configs(raw, None)
+        draft = mtp.Qwen3_5MTP.from_configs(raw, model.config.num_hidden_layers)
+    target_keys, draft_keys = (
+        keys(model._weight_mappings()),
+        keys(draft._weight_mappings()),
+    )
+    assert target_keys == {
+        n for n in published if n.startswith(mod.CKPT) or n == "lm_head.weight"
+    }
+    assert {k for k in draft_keys if k.startswith(mtp.MTP)} == {
+        n for n in published if n.startswith(mtp.MTP)
+    }
+    assert draft_keys <= published

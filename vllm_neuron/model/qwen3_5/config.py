@@ -110,7 +110,9 @@ class Qwen3_5Config:
 
     @property
     def fp8_enabled(self) -> bool:
-        return self.neuron_config is not None and self.neuron_config.quantization == "fp8"
+        return (
+            self.neuron_config is not None and self.neuron_config.quantization == "fp8"
+        )
 
     def fp8_quantized(self, module: str) -> bool:
         """Whether HF-named ``module`` (e.g. "layers.3.mlp") runs in static FP8."""

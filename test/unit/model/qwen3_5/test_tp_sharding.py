@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP sharding rules: shards reassemble, and per-rank GDN partial outputs sum to the full output."""
+"""TP sharding of the model's weight loaders (``weights.*_device``): shards reassemble, and
+per-rank GDN partial outputs sum to the full output."""
 
 import copy
 
@@ -10,16 +11,23 @@ hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 TP = 2
-P = "model.language_model.layers.0."
 
 
 @pytest.fixture(scope="module")
 def tiny(qwen3_5_config):
     torch.manual_seed(1)
     hf_cfg = Qwen3_5TextConfig(
-        hidden_size=48, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=16, intermediate_size=64, linear_num_key_heads=2, linear_num_value_heads=6,
-        linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+        hidden_size=48,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
         vocab_size=100,
     )
     cfg = qwen3_5_config.Qwen3_5Config.from_configs(hf_cfg.to_dict())
@@ -33,57 +41,98 @@ def tiny(qwen3_5_config):
 
 
 def _hf_named(layer):
-    return {P + "linear_attn." + n: p.data for n, p in layer.named_parameters()}
+    return {n: p.data for n, p in layer.named_parameters()}
 
 
 def test_gdn_tp_partial_sums_equal_unsharded(gdn_ops, weights, tiny):
+    """Per-rank shards from the model's GDN weight loaders (device layout transposed back to
+    HF "out x in") give partial outputs that sum to the unsharded layer output."""
     cfg, layer = tiny
-    named = _hf_named(layer)
+    w = _hf_named(layer)
     x = torch.randn(70, cfg.hidden_size)
 
-    def w_of(rank, tp):
-        g = lambda n: weights.shard_weight(P + "linear_attn." + n, named[P + "linear_attn." + n], cfg, rank, tp)
+    def w_of(rank):
+        heads = lambda n: weights.gdn_in_proj_heads_device(w[n], rank, TP).t()
+        vec = lambda n: weights.gdn_head_vector_device(w[n], cfg, rank, TP)
         return {
-            "in_proj_qkv": g("in_proj_qkv.weight"), "in_proj_z": g("in_proj_z.weight"),
-            "in_proj_b": g("in_proj_b.weight"), "in_proj_a": g("in_proj_a.weight"),
-            "conv1d": g("conv1d.weight"), "A_log": g("A_log"), "dt_bias": g("dt_bias"),
-            "norm": g("norm.weight"), "out_proj": g("out_proj.weight"),
+            "in_proj_qkv": weights.gdn_in_proj_qkv_device(
+                w["in_proj_qkv.weight"], cfg, rank, TP
+            ).t(),
+            "in_proj_z": heads("in_proj_z.weight"),
+            "in_proj_b": heads("in_proj_b.weight"),
+            "in_proj_a": heads("in_proj_a.weight"),
+            "conv1d": weights.gdn_conv_device(w["conv1d.weight"], cfg, rank, TP),
+            "A_log": vec("A_log"),
+            "dt_bias": vec("dt_bias"),
+            "norm": w["norm.weight"],
+            "out_proj": weights.gdn_out_proj_device(
+                w["out_proj.weight"], cfg, rank, TP
+            ).t(),
         }
 
-    full, _, _ = gdn_ops.gdn_layer_reference(x, w_of(0, 1), cfg, None, None)
+    full_w = {n.removesuffix(".weight"): t for n, t in w.items()}
+    full, _, _ = gdn_ops.gdn_layer_reference(x, full_w, cfg, None, None)
     rank_cfg = copy.copy(cfg)
     rank_cfg.linear_num_key_heads //= TP
     rank_cfg.linear_num_value_heads //= TP
-    parts = [gdn_ops.gdn_layer_reference(x, w_of(r, TP), rank_cfg, None, None)[0] for r in range(TP)]
+    parts = [
+        gdn_ops.gdn_layer_reference(x, w_of(r), rank_cfg, None, None)[0]
+        for r in range(TP)
+    ]
     torch.testing.assert_close(sum(parts), full, rtol=1e-4, atol=1e-5)
 
 
-def test_attention_qproj_keeps_query_gate_pairs(weights, tiny):
+def test_attention_shards_keep_query_gate_pairs(weights, tiny):
+    """q_proj is [query | gate] per head: a rank's query (qkv) and gate columns come from the
+    same heads, and the gate columns keep their channel order."""
     cfg, _ = tiny
-    heads, hd = cfg.num_attention_heads, cfg.head_dim
+    heads, kv, hd, D = (
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.hidden_size,
+    )
     # tag every row with (head, 0=query|1=gate)
     q = torch.arange(heads * 2 * hd).reshape(heads, 2, hd).float()
-    q_proj = q.reshape(heads * 2 * hd, 1).expand(-1, cfg.hidden_size).contiguous()
-    shard = weights.shard_weight(P + "self_attn.q_proj.weight", q_proj, cfg, 1, TP)
-    assert shard.shape[0] == heads // TP * 2 * hd
-    assert torch.equal(shard[:, 0], q[heads // TP :].reshape(-1))  # rank 1 owns heads 2..3, in [q|gate] order
+    q_proj = q.reshape(heads * 2 * hd, 1).expand(-1, D).contiguous()
+    k_proj = v_proj = torch.zeros(kv * hd, D)
+    perm = weights.rotary_channel_permutation(hd, cfg.rotary_dim)
+    mine = q[heads // TP :]  # rank 1 owns the second half of the heads
+    gate = weights.attention_gate_device(q_proj, cfg, 1, TP)
+    assert gate.shape == (D, heads // TP * hd)
+    assert torch.equal(gate[0], mine[:, 1].reshape(-1))
+    qkv = weights.attention_qkv_device(q_proj, k_proj, v_proj, cfg, 1, TP)
+    assert qkv.shape == (D, (heads + 2 * kv) // TP * hd)
+    assert torch.equal(qkv[0, : heads // TP * hd], mine[:, 0][:, perm].reshape(-1))
 
 
-@pytest.mark.parametrize("leaf,dim", [
-    ("mlp.gate_proj.weight", 0), ("mlp.up_proj.weight", 0), ("mlp.down_proj.weight", 1),
-    ("self_attn.k_proj.weight", 0), ("self_attn.o_proj.weight", 1),
-    ("linear_attn.in_proj_qkv.weight", None), ("linear_attn.out_proj.weight", 1),
-])
-def test_shards_cover_tensor_exactly(weights, tiny, leaf, dim):
+# (device-layout helper, HF tensor shape, HF dim that is split; None: q | k | v segments)
+_SHARDED = {
+    "mlp_gate_up_device": ((64, 48), 0),
+    "mlp_down_device": ((48, 64), 1),
+    "attention_o_device": ((48, 64), 1),
+    "gdn_in_proj_heads_device": ((96, 48), 0),
+    "gdn_out_proj_device": ((48, 96), 1),
+    "gdn_in_proj_qkv_device": (None, None),
+}
+
+
+@pytest.mark.parametrize("fn", list(_SHARDED))
+def test_shards_cover_tensor_exactly(weights, tiny, fn):
     cfg, _ = tiny
-    shape = {
-        "mlp.gate_proj.weight": (64, 48), "mlp.up_proj.weight": (64, 48), "mlp.down_proj.weight": (48, 64),
-        "self_attn.k_proj.weight": (32, 48), "self_attn.o_proj.weight": (48, 64),
-        "linear_attn.in_proj_qkv.weight": (cfg.conv_dim, 48), "linear_attn.out_proj.weight": (48, cfg.value_dim),
-    }[leaf]
-    t = torch.randn(shape)
-    shards = [weights.shard_weight(P + leaf, t, cfg, r, TP) for r in range(TP)]
-    if dim is None:  # segmented q|k|v: same multiset of rows, each rank gets 1/TP of every segment
+    shape, dim = _SHARDED[fn]
+    t = torch.randn(shape or (cfg.conv_dim, 48))
+    f = getattr(weights, fn)
+    takes_cfg = fn not in (
+        "mlp_gate_up_device",
+        "mlp_down_device",
+        "gdn_in_proj_heads_device",
+    )
+    # device layout is [in, out]: transpose back to HF "out x in"
+    shards = [(f(t, cfg, r, TP) if takes_cfg else f(t, r, TP)).t() for r in range(TP)]
+    if (
+        dim is None
+    ):  # segmented q|k|v: same multiset of rows, each rank gets 1/TP of every segment
         assert sum(s.numel() for s in shards) == t.numel()
         assert torch.equal(torch.cat(shards).sort(dim=0).values, t.sort(dim=0).values)
     else:
@@ -91,19 +140,28 @@ def test_shards_cover_tensor_exactly(weights, tiny, leaf, dim):
 
 
 def test_indivisible_raises(weights, tiny):
-    cfg, _ = tiny
     with pytest.raises(ValueError):
-        weights.shard_weight(P + "mlp.up_proj.weight", torch.randn(65, 48), cfg, 0, TP)
+        weights.mlp_gate_up_device(torch.randn(65, 48), 0, TP)
 
 
-def test_partial_rotary_permutation_equivalent_to_full_width_rope(weights, qwen3_5_config):
+def test_partial_rotary_permutation_equivalent_to_full_width_rope(
+    weights, qwen3_5_config
+):
     """Permuted channels + full-width rotate_half (cos=1/sin=0 on pass dims) == partial rotary."""
     from conftest import ROOT, _load
 
     _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
-    ref = _load("vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py")
+    ref = _load(
+        "vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py"
+    )
     D, R, L, H = 256, 64, 11, 3
-    cfg = qwen3_5_config.Qwen3_5Config(head_dim=D, partial_rotary_factor=R / D, rope_theta=1e7)
+    cfg = qwen3_5_config.Qwen3_5Config(
+        head_dim=D,
+        partial_rotary_factor=R / D,
+        rope_theta=1e7,
+        num_attention_heads=H,
+        num_key_value_heads=1,
+    )
     torch.manual_seed(0)
     q, k = torch.randn(L, H, D), torch.randn(L, H, D)
     pos = torch.arange(5, 5 + L)
@@ -114,27 +172,39 @@ def test_partial_rotary_permutation_equivalent_to_full_width_rope(weights, qwen3
 
     perm = weights.rotary_channel_permutation(D, R)
     assert sorted(perm.tolist()) == list(range(D))
-    kcos, ksin = weights.kernel_rope_angles(pos, D, R, cfg.rope_theta)
-    q_k, k_k = ref.apply_rope(q[..., perm], kcos, ksin), ref.apply_rope(k[..., perm], kcos, ksin)
-    torch.testing.assert_close(torch.einsum("lhd,thd->hlt", q_k, k_k), scores_ref, rtol=1e-4, atol=1e-4)
+    inv_freq = weights.rope_inv_freq(R, cfg.rope_theta)
+    kcos, ksin = weights.kernel_rope_angles_from_inv_freq(pos, inv_freq, D, R)
+    q_k, k_k = (
+        ref.apply_rope(q[..., perm], kcos, ksin),
+        ref.apply_rope(k[..., perm], kcos, ksin),
+    )
+    torch.testing.assert_close(
+        torch.einsum("lhd,thd->hlt", q_k, k_k), scores_ref, rtol=1e-4, atol=1e-4
+    )
     # the roped tensors are the reference ones, permuted
     torch.testing.assert_close(q_k, q_ref[..., perm], rtol=1e-5, atol=1e-5)
 
-    # row-permuting q_proj (query part only) reproduces permuted queries; gate untouched
+    # the loaded q/k columns produce permuted queries/keys; the gate columns are untouched
     hidden = torch.randn(L, 32)
-    w = torch.randn(H * 2 * D, 32)
-    qg = (hidden @ w.t()).view(L, H, 2 * D)
-    wp = weights.permute_head_rows(w, H, D, perm, per_head_width=2 * D, offset=0)
-    qgp = (hidden @ wp.t()).view(L, H, 2 * D)
-    torch.testing.assert_close(qgp[..., :D], qg[..., :D][..., perm])
-    torch.testing.assert_close(qgp[..., D:], qg[..., D:])
+    w_q, w_k, w_v = torch.randn(H * 2 * D, 32), torch.randn(D, 32), torch.randn(D, 32)
+    qg = (hidden @ w_q.t()).view(L, H, 2 * D)
+    qkv = hidden @ weights.attention_qkv_device(w_q, w_k, w_v, cfg, 0, 1)
+    torch.testing.assert_close(qkv[:, : H * D].view(L, H, D), qg[..., :D][..., perm])
+    torch.testing.assert_close(qkv[:, H * D : H * D + D], (hidden @ w_k.t())[..., perm])
+    torch.testing.assert_close(qkv[:, H * D + D :], hidden @ w_v.t())
+    gate = hidden @ weights.attention_gate_device(w_q, cfg, 0, 1)
+    torch.testing.assert_close(gate.view(L, H, D), qg[..., D:])
 
 
 def test_fold_zero_centered_norm(weights, qwen3_5_config):
     from conftest import ROOT, _load
 
-    ref = _load("vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py")
+    ref = _load(
+        "vllm_neuron.model.qwen3_5.reference", ROOT / "model/qwen3_5/reference.py"
+    )
     x, w = torch.randn(4, 16), torch.randn(16) * 0.1
     gamma = weights.fold_zero_centered_norm(w)
     plain = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * gamma
-    torch.testing.assert_close(plain, ref.rmsnorm_zero_centered(x, w, 1e-6), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        plain, ref.rmsnorm_zero_centered(x, w, 1e-6), rtol=1e-5, atol=1e-6
+    )

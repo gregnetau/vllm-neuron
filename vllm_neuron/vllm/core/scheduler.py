@@ -25,7 +25,11 @@ from vllm_neuron.metrics import (
     SCHEDULER_ENCODER_CACHE_HITS,
     SCHEDULER_ENCODER_CACHE_QUERIES,
 )
-from vllm_neuron.model.neuron_config import NeuronConfig, EncoderNeuronConfig
+from vllm_neuron.model.neuron_config import (
+    EncoderNeuronConfig,
+    NeuronConfig,
+    validate_decode_steps_between_prefill_chunks,
+)
 from vllm_neuron.utils.bucket_utils import (
     get_bucket_for_count,
     get_default_kv_segment_size_buckets,
@@ -284,8 +288,10 @@ class NeuronScheduler(Scheduler):
         # Decode steps scheduled between the chunks of an ongoing segmented prefill. Prefill
         # and decode are separate graphs, so a multi-chunk prefill otherwise pauses every
         # decoding request until its last chunk. 0 keeps the prefill uninterrupted.
-        self._decode_steps_between_chunks: int = int(
-            neuron_config.get("decode_steps_between_prefill_chunks", 0)
+        self._decode_steps_between_chunks: int = (
+            validate_decode_steps_between_prefill_chunks(
+                neuron_config.get("decode_steps_between_prefill_chunks", 0)
+            )
         )
         self._interleave_decodes_left: int = 0
 

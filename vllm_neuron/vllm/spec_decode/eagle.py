@@ -120,7 +120,9 @@ class EagleProposer:
         compile_options: dict | None = None,
     ) -> None:
         # Load draft model
-        target_num_layers = self.vllm_config.model_config.hf_text_config.num_hidden_layers
+        target_num_layers = (
+            self.vllm_config.model_config.hf_text_config.num_hidden_layers
+        )
         self.model = self.compile_and_load_draft_model(
             start_layer_idx=target_num_layers,
             target_hidden_size=target_hidden_size,
@@ -131,7 +133,9 @@ class EagleProposer:
 
         # Set draft model attn layer names
         if self.method == "mtp":
-            draft_num_layers = getattr(self.draft_model_config.hf_config, "n_predict", None) or 1
+            draft_num_layers = (
+                getattr(self.draft_model_config.hf_config, "n_predict", None) or 1
+            )
         else:
             draft_num_layers = self.draft_model_config.hf_config.num_hidden_layers
         self.attn_layer_names = [

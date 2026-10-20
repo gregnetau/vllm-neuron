@@ -1446,12 +1446,12 @@ class NeuronWorker(WorkerBase):
         else:
             available = self._determine_available_memory_neuron()
         # Recurrent-state models may keep their state in dedicated pools outside the KV cache.
-        # (V1 runner only; the V2 runner serves no recurrent-state models.)
-        pool_bytes = getattr(self.model_runner, "state_pool_bytes", None)
-        state_pool = pool_bytes() if pool_bytes is not None else 0
+        state_pool = self.model_runner.state_pool_bytes()
         if state_pool:
-            logger.info("Dedicated recurrent-state pools: %.2f GiB per rank (outside the KV cache)",
-                        state_pool / (1024**3))
+            logger.info(
+                "Dedicated recurrent-state pools: %.2f GiB per rank (outside the KV cache)",
+                state_pool / (1024**3),
+            )
         return max(available - state_pool, 0)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -1705,10 +1705,7 @@ class NeuronWorker(WorkerBase):
 
         # Hybrid-model helper graphs (KV block clearing, Mamba-align state copies). Graphs
         # that execute on device must not run before the parallel-trace forks.
-        for warm_up in ("warm_up_kv_block_clearing", "warm_up_mamba_align"):
-            hook = getattr(self.model_runner, warm_up, None)
-            if hook is not None:
-                hook()
+        self.model_runner.warm_up_hybrid_graphs()
 
         # Save the torch compile-cache package once, after the last warmup
         # bucket. Native backend and caching-precompile only. A later warm start

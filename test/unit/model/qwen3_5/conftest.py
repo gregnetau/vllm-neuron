@@ -15,6 +15,18 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[4] / "vllm_neuron"
 
+# Modules a test installed or replaced (name -> previous entry or _MISSING); see
+# set_module and the autouse _restore_stubbed_modules fixture.
+_MISSING = object()
+_REPLACED: dict = {}
+
+
+def set_module(name: str, mod) -> None:
+    """``sys.modules[name] = mod``, undone after the test."""
+    if name not in _REPLACED:
+        _REPLACED[name] = sys.modules.get(name, _MISSING)
+    sys.modules[name] = mod
+
 
 def _stub_packages():
     try:
@@ -31,7 +43,7 @@ def _stub_packages():
         if name not in sys.modules:
             pkg = types.ModuleType(name)
             pkg.__path__ = [str(path)]
-            sys.modules[name] = pkg
+            set_module(name, pkg)
 
 
 def _load(name: str, path: pathlib.Path):
@@ -39,17 +51,36 @@ def _load(name: str, path: pathlib.Path):
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
+    set_module(name, mod)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _restore_stubbed_modules():
+    """Undo the module stubs a test installs (test_model_smoke._install_stubs replaces vllm,
+    vllm_neuron.nn and others), and drop qwen3_5 modules imported against them, so stubs
+    never leak into other tests."""
+    before = set(sys.modules)
+    yield
+    for name in [
+        n
+        for n in sys.modules
+        if n not in before and n.startswith("vllm_neuron.model.qwen3_5")
+    ]:
+        del sys.modules[name]
+    for name, prev in _REPLACED.items():
+        if prev is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = prev
+    _REPLACED.clear()
 
 
 @pytest.fixture(scope="session")
 def gdn_ops():
     _stub_packages()
-    return _load(
-        "vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py"
-    )
+    return _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
 
 
 @pytest.fixture(scope="session")
@@ -61,9 +92,7 @@ def qwen3_5_config():
 
 @pytest.fixture(scope="session")
 def weights(qwen3_5_config):
-    return _load(
-        "vllm_neuron.model.qwen3_5.weights", ROOT / "model/qwen3_5/weights.py"
-    )
+    return _load("vllm_neuron.model.qwen3_5.weights", ROOT / "model/qwen3_5/weights.py")
 
 
 @pytest.fixture(scope="session")

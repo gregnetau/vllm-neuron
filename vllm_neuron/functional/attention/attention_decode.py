@@ -1790,7 +1790,9 @@ def attention_decode(
                 swa_start_pos_ids=swa_start_pos_ids,
             )
         else:
-            wrapped = wrap_nki(block_kernel or _torch_compatible_attention_block_tkg_kernel)
+            wrapped = wrap_nki(
+                block_kernel or _torch_compatible_attention_block_tkg_kernel
+            )
             kernel_out = wrapped[lnc_degree](
                 X,
                 X_hidden_dim_actual=X_hidden_dim_actual,

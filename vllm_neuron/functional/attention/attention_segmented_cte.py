@@ -210,8 +210,9 @@ def _split_kv_blocks(
         )
     r = block_size // sub
     nb, _, _, d = k_cache.shape
-    k_cache = k_cache.reshape(nb * r, 1, sub, d)
-    v_cache = v_cache.reshape(nb * r, 1, sub, v_cache.shape[-1])
+    # view(): a non-contiguous cache must fail here rather than be copied whole.
+    k_cache = k_cache.view(nb * r, 1, sub, d)
+    v_cache = v_cache.view(nb * r, 1, sub, v_cache.shape[-1])
     bt = block_tables.clamp(min=0) * r
     offsets = torch.arange(r, dtype=bt.dtype, device=bt.device)
     block_tables = (bt.unsqueeze(-1) + offsets).reshape(bt.shape[0], -1)
@@ -967,6 +968,7 @@ def segmented_attention(
     v_scale: Optional[Tensor] = None,
     allow_vector_exp: bool = True,
     kernel=None,
+    sub_block_kv: bool = False,
 ) -> Tensor:
     """
     Segmented Attention API using the attention_segmented_cte NKI kernel.
@@ -1012,6 +1014,9 @@ def segmented_attention(
             Scalar Engine exp, which is more accurate. Default: True
         kernel: Optional @nki.jit entry point with the signature of attention_segmented_cte
             (e.g. a model's vendored variant) instead of the library kernel. Default: None
+        sub_block_kv: View KV blocks larger than the kernel's preferred block (64 tokens for
+            2-byte K, 128 for 1-byte K) as sub-blocks (``_split_kv_blocks``; needs an unpacked
+            cache with one KV head per rank). Default: False
 
     Returns:
         Output tensor with attention results.
@@ -1115,12 +1120,14 @@ def segmented_attention(
             "ships the segmented packed FP8 read path."
         )
 
-    if not fp8_packed:
+    if sub_block_kv and not fp8_packed:
         k_cache, v_cache, block_tables, block_size = _split_kv_blocks(
             k_cache, v_cache, block_tables, block_size
         )
 
-    wrapped = wrap_nki(kernel) if kernel is not None else _wrapped_attention_segmented_cte
+    wrapped = (
+        wrap_nki(kernel) if kernel is not None else _wrapped_attention_segmented_cte
+    )
     result = wrapped[2](
         q=q_seg,
         k_cache=k_cache,

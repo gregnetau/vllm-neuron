@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Vendored from nkilib.experimental.transformer.attention_block_tkg (the nkilib shipped with
-# vllm-neuron 0.29.0.1.2.0) with one change for Qwen3.5 / Qwen3.8 decode:
+# Vendored from nkilib.experimental.transformer.attention_block_tkg: nkilib 0.0.0.0dev0+100a53e9
+# (bundled with neuronx-cc 2.28.7631.0, Neuron SDK 2.33), with one change for Qwen3.5 / Qwen3.8
+# decode:
 # - Without the in-kernel cache update, with one KV head and d_head > 128, the new K token is
 #   returned as [B*S, d_head] rows (PE transpose + one DMA per d-tile) instead of the
 #   [d_head, B, S] layout, which the library writes one 2-byte element per descriptor
 #   (~30 us per call).
-# (The batch-major Q layout fix for d_head > 128 carried by the 0.24-based copy is in this
-# nkilib.)
 # Relative imports are made absolute and attention_block_tkg_k_rows_kernel (end of file) is
 # the torch-compatible entry point; everything else is unchanged.
 
@@ -2929,7 +2928,7 @@ def attention_block_tkg_k_rows_kernel(
         sbm_lower_bound, sbm_upper_bound, sbm_use_auto_alloc, sbm_default_stack_alloc
     )
 
-    # Forward to the library kernel (no kv_heads argument — see the module header).
+    # Forward to the vendored kernel above (it takes no kv_heads argument).
     return attention_block_tkg(
         X=X,
         X_hidden_dim_actual=X_hidden_dim_actual,

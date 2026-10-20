@@ -2,14 +2,14 @@
 """Offline text generation example for Qwen3.5 / Qwen3.8 dense (27B) on Neuron.
 
 Serves the text tower of ``Qwen3_5ForConditionalGeneration`` with TP=4 on one Trainium2
-chip (trn2.3xlarge). ``--fp8`` quantizes the MLPs to per-tensor static FP8 at load time,
-using activation scales from ``calibrate_fp8.py``.
+chip (trn2.3xlarge). ``--fp8`` quantizes the MLP, attention and GDN projections to per-tensor
+static FP8 at load time, using activation scales from ``calibrate_fp8.py``.
 
 Usage:
     python examples/vllm_neuron/models/qwen3_5/run.py \
         --model <path-to-checkpoint>/Qwen3.8-27B
 
-    # Static FP8 MLPs
+    # Static FP8
     python examples/vllm_neuron/models/qwen3_5/run.py \
         --model <path-to-checkpoint>/Qwen3.8-27B \
         --fp8 --fp8-activation-scales <path-to-checkpoint>/Qwen3.8-27B/fp8_act_amax.json
@@ -61,7 +61,9 @@ def main() -> None:
         limit_mm_per_prompt={"image": 0, "video": 0},
         additional_config={"neuron_config": neuron_config},
     )
-    outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=args.max_tokens, temperature=0.0))
+    outputs = llm.generate(
+        PROMPTS, SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+    )
     for prompt, output in zip(PROMPTS, outputs):
         print(f"Prompt:    {prompt!r}")
         print(f"Generated: {output.outputs[0].text!r}\n")

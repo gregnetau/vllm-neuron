@@ -3,9 +3,9 @@
 Gated DeltaNet reference ops (pure PyTorch, single sequence, explicit state)
 ============================================================================
 
-These are the correctness oracles / CPU fallbacks for the NKI kernels that will
-back Qwen3.5 linear-attention layers. They depend only on ``torch`` so they can be
-unit-tested without a Neuron install.
+The model's GDN prefill path (traced to Neuron) and decode fallback, and the correctness
+oracles for the fused NKI decode kernels in ``gdn_kernels``. They depend only on ``torch``
+so they can be unit-tested without a Neuron install.
 
 Layouts (one sequence, no batch dim; the runner loops/packs requests):
     q, k    [L, H, Dk]   (already repeated up to the value-head count H)
@@ -15,8 +15,9 @@ Layouts (one sequence, no batch dim; the runner loops/packs requests):
     conv    x [L, C], weight [C, K], conv_state [C, K-1]
 
 The delta rule and its chunked (WY) form follow the FLA / HF ``modeling_qwen3_5``
-reference (Apache-2.0); the chunk kernel here solves the intra-chunk triangular
-system with ``solve_triangular`` instead of HF's row-by-row loop.
+reference (Apache-2.0); the chunk kernel here inverts the intra-chunk unit-lower-triangular
+system with matmuls only (``inverse_unit_lower``) instead of HF's row-by-row loop, since
+``torch.linalg.solve_triangular`` does not lower on Neuron.
 """
 
 import torch
@@ -106,7 +107,11 @@ def inverse_unit_lower(m: torch.Tensor, eye: torch.Tensor) -> torch.Tensor:
     x = eye.expand_as(m)
     s = 1
     while s < C:
-        mask = (row // (2 * s) == col // (2 * s)) & ((row // s) % 2 == 1) & ((col // s) % 2 == 0)
+        mask = (
+            (row // (2 * s) == col // (2 * s))
+            & ((row // s) % 2 == 1)
+            & ((col // s) % 2 == 0)
+        )
         lower = torch.where(mask, m, torch.zeros_like(m))
         x = x - x @ lower @ x
         s *= 2
@@ -157,8 +162,11 @@ def chunk_gated_delta_rule(
     strict = r[:, None] > r[None, :]  # i > j
     eye = (r[:, None] == r[None, :]).to(torch.float32)
     diff = g.unsqueeze(-1) - g.unsqueeze(-2)  # g_i - g_j (<= 0 on/below the diagonal)
-    decay = torch.where(incl, torch.exp(torch.where(incl, diff, torch.zeros_like(diff))),
-                        torch.zeros_like(diff))
+    decay = torch.where(
+        incl,
+        torch.exp(torch.where(incl, diff, torch.zeros_like(diff))),
+        torch.zeros_like(diff),
+    )
     kk = (k_beta @ k.transpose(-1, -2)) * decay
     m = torch.where(strict, kk, torch.zeros_like(kk))
     # T = (I + m)^-1 : intra-chunk WY correction (matmul-only; see inverse_unit_lower)
@@ -166,11 +174,7 @@ def chunk_gated_delta_rule(
     v_corr = T @ v_beta
     k_cumdecay = T @ (k_beta * g.exp().unsqueeze(-1))
 
-    S = (
-        q.new_zeros(H, Dk, Dv)
-        if state is None
-        else state.to(torch.float32).clone()
-    )
+    S = q.new_zeros(H, Dk, Dv) if state is None else state.to(torch.float32).clone()
     outs = []
     for i in range(n):
         q_i, k_i = q[:, i], k[:, i]
@@ -179,9 +183,11 @@ def chunk_gated_delta_rule(
         v_new = v_corr[:, i] - k_cumdecay[:, i] @ S
         outs.append((q_i * g[:, i, :, None].exp()) @ S + attn @ v_new)
         g_last = g[:, i, -1]
-        S = S * g_last.exp()[:, None, None] + (
-            k_i * (g_last[:, None] - g[:, i]).exp()[..., None]
-        ).transpose(-1, -2) @ v_new
+        S = (
+            S * g_last.exp()[:, None, None]
+            + (k_i * (g_last[:, None] - g[:, i]).exp()[..., None]).transpose(-1, -2)
+            @ v_new
+        )
     out = torch.stack(outs, dim=1).reshape(H, n * chunk_size, Dv)[:, :L].transpose(0, 1)
     return out.contiguous().to(dtype), S
 
