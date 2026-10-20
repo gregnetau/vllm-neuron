@@ -86,12 +86,15 @@ def _install_stubs():
             return F.embedding(ids, self.weight)
 
     class ColPar(torch.nn.Module):
-        def __init__(self, i, o, bias=False, dtype=None, gather_output=True, tp_group=None):
+        def __init__(self, i, o, bias=False, dtype=None, gather_output=True, tp_group=None,
+                     weight_layout="out_in"):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.empty(o, i, dtype=dtype))
+            self.weight_layout = weight_layout
+            shape = (o, i) if weight_layout == "out_in" else (i, o)
+            self.weight = torch.nn.Parameter(torch.empty(*shape, dtype=dtype))
 
         def forward(self, x):
-            return x @ self.weight.t()
+            return x @ (self.weight.t() if self.weight_layout == "out_in" else self.weight)
 
     _stub("vllm_neuron.nn", ColumnParallelLinear=ColPar)
     _stub("vllm_neuron.nn.embedding", VocabDimShardedEmbedding=Embed)

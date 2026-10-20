@@ -107,9 +107,11 @@ class Qwen3_5MTP(nn.Module):
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.model = Qwen3_5MTPModel(config, start_layer_idx)
+        # [in, out] storage: the draft graph runs the head once per draft token, and on the
+        # native route the shared weight.t() got materialized in HBM (~635 MB) per call.
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype,
-            gather_output=False, tp_group=self.tp_group.device_group)
+            gather_output=False, tp_group=self.tp_group.device_group, weight_layout="in_out")
         self.num_speculative_tokens = 1  # set by the proposer
         self._setup_weight_loaders()
 
@@ -206,7 +208,7 @@ class Qwen3_5MTP(nn.Module):
             shard_dim=0, shard_size=self.model.embed_tokens.vocab_size_per_rank, num_shards=tp,
             is_storage_transposed=False, pad_shard=True))
         set_weight_loader(self.lm_head.weight, sharding_weight_loader(
-            shard_dim=0, shard_size=cfg.vocab_size // tp, num_shards=tp, is_storage_transposed=False))
+            shard_dim=1, shard_size=cfg.vocab_size // tp, num_shards=tp, is_storage_transposed=True))
 
     def _weight_mappings(self) -> dict:
         m = {

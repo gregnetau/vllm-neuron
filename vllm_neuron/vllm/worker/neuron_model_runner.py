@@ -2120,8 +2120,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if hlo2tensorizer_opts:  # "" (override): whole-graph compilation, no modular flow
             self.compile_options["compiler_args"].insert(
                 -1, f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}")
+        # A model can declare NATIVE_COMPILER_MODEL_TYPE to replace that default on the native
+        # route too. "transformer" makes hlo2penguin split the graph per layer and remat.
+        native_model_type = None
+        if envs.is_native_backend() and not cpu_mode:
+            native_model_type = getattr(base_model_for_opt, "NATIVE_COMPILER_MODEL_TYPE", None)
         if native_gk_decode:
-            self.compile_options["compiler_args"].append("--model-type=generic")
+            native_model_type = "generic"
+        if native_model_type:
+            self.compile_options["compiler_args"].append(f"--model-type={native_model_type}")
         # An explicit caller level wins over the model default. Enable the model
         # policy only when the caller did not set the level. The runner then
         # resolves compiler_args_for eagerly, one time per graph, before the
