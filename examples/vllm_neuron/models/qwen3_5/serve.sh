@@ -60,6 +60,9 @@ fi
 if [[ -n "${HLO2TENSORIZER_OPTIONS+set}" ]]; then  # "" = whole-graph compilation (no modular flow)
   NEURON_CONFIG="${NEURON_CONFIG}, \"hlo2tensorizer_options\": \"${HLO2TENSORIZER_OPTIONS}\""
 fi
+if [[ "${ALL_GREEDY:-0}" == 1 ]]; then  # greedy-only serving: on-device argmax, no top-k / top-p
+  NEURON_CONFIG="${NEURON_CONFIG}, \"on_device_sampling_config\": {\"all_greedy\": true}"
+fi
 if [[ -n "${FP8_SCALES:-}" ]]; then
   NEURON_CONFIG="${NEURON_CONFIG}, \"quantization\": \"fp8\", \"fp8_activation_scales_path\": \"${FP8_SCALES}\""
 fi
