@@ -19,7 +19,8 @@
 #       MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" DECODE_CTX_BUCKETS="16384, 65536" GPU_MEM_UTIL=0.95 \
 #       KV_CAP_FRACTION=0.48 examples/vllm_neuron/models/qwen3_5/serve.sh
 #
-# Other knobs: PREFILL_BUCKET (default 1024), PREFILL_BUCKETS, MAX_NUM_SEQS (default 1), SEQS_BUCKETS,
+# Other knobs: BACKEND (vllm_neuron = XLA route, default; neuron_native), PREFILL_BUCKET (default 1024),
+# PREFILL_BUCKETS, MAX_NUM_SEQS (default 1), SEQS_BUCKETS,
 # DECODE_CTX_BUCKETS, DECODE_INTERLEAVE (decode steps between prefill chunks), BLOCK_SIZE
 # (attention kernel block, vLLM's default if unset), PROFILE_DIR,
 # ASYNC_SCHEDULING (default 1), SERVED_MODEL_NAME (default: the checkpoint directory name).
@@ -36,6 +37,10 @@ if [[ -n "${PREFILL_BUCKETS:-}" ]]; then
 fi
 
 export NEURON_SKIP_EFA_AFFINITY=1                   # trn2.3xlarge has no EFA
+# Compile route. Qwen3.5 currently runs ~2x slower on the native torch.compile route (the
+# vllm-neuron 0.29 default) than on the XLA route, so default to XLA; BACKEND=neuron_native
+# selects the native route.
+export VLLM_NEURON_BACKEND=${BACKEND:-${VLLM_NEURON_BACKEND:-vllm_neuron}}
 # Ranks wait for the rank compiling a shared graph; the 4096-token prefill graph takes > 10 min.
 export NEURON_LIBTORCH_COMPILATION_TIMEOUT=${NEURON_LIBTORCH_COMPILATION_TIMEOUT:-3600}
 # KV/state pool = min(free HBM, KV_CAP_FRACTION * GPU_MEM_UTIL * 24 GB) per logical core.
