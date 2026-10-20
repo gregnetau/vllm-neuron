@@ -37,8 +37,17 @@ NEURON_MIN_BATCH_QUEUE_DEPTH = 2
 # and the V2 forward adapter's device-state update is compiled-only, so they crash on
 # V2 at the first step. They do not set enforce_eager, so the eager check below
 # cannot catch them.
+#
+# Qwen3.5 / Qwen3.8 dense are hybrid (Gated DeltaNet recurrent-state layers). Only the V1
+# runner allocates recurrent-state KV groups, and the plugin's model classes do not declare
+# vLLM's IsHybrid interface, so the is_hybrid check below does not see them.
 UNSUPPORTED_V2_NEURON_RUNNER_ARCHITECTURES = frozenset(
-    {"SyntheticNeuronModel", "SyntheticStackedNeuronModel"}
+    {
+        "SyntheticNeuronModel",
+        "SyntheticStackedNeuronModel",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+    }
 )
 
 # Architectures whose V2 debug-logits emission path has been validated

@@ -560,6 +560,41 @@ class NeuronPlatform(Platform):
             )
             encoder_config[new_name] = encoder_config.pop(old_name)
 
+    # Architectures with per-request recurrent state (Gated DeltaNet layers). With prefix
+    # caching their state is checkpointed per KV block in vLLM's Mamba "align" mode.
+    # (The plugin's model classes do not declare vLLM's IsHybrid interface, so vLLM's
+    # MambaModelConfig hook does not configure them.)
+    _STATEFUL_ARCHITECTURES = frozenset(
+        {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+    )
+
+    @classmethod
+    def _configure_prefix_caching_for_stateful_models(
+        cls, vllm_config: "VllmConfig"
+    ) -> None:
+        """Recurrent-state models cache prefixes in Mamba "align" mode: the state is kept
+        per KV-manager block and copied to the next block when a request crosses into it
+        (NeuronModelRunner._preprocess_mamba_align), and prefills are scheduled in
+        block-aligned chunks. The block (the attention block enlarged to the state page)
+        must not exceed the prefill chunk (max_num_batched_tokens)."""
+        archs = set(getattr(vllm_config.model_config, "architectures", None) or [])
+        if not (archs & cls._STATEFUL_ARCHITECTURES):
+            return
+        cache_config = vllm_config.cache_config
+        if not cache_config.enable_prefix_caching:
+            return
+        if cache_config.mamba_cache_mode != "align":
+            logger.info(
+                "Prefix caching for %s uses Mamba cache mode 'align' (was '%s').",
+                ", ".join(sorted(archs)),
+                cache_config.mamba_cache_mode,
+            )
+            cache_config.mamba_cache_mode = "align"
+        if not vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "Prefix caching for models with recurrent state needs chunked prefill."
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Configure vLLM for vLLM Neuron platform."""
@@ -722,6 +757,7 @@ class NeuronPlatform(Platform):
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
+        cls._configure_prefix_caching_for_stateful_models(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         # TODO: Implement a CPU fallback based on the value from DeviceConfig
@@ -760,7 +796,12 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Text-only architectures (Qwen3.5/3.8 serves only the language tower even though
+        # the checkpoint config carries a vision_config) need no vision buckets.
+        archs = set(getattr(model_config, "architectures", None) or [])
+        if hasattr(model_config.hf_config, "vision_config") and not (
+            archs & cls._STATEFUL_ARCHITECTURES
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.
