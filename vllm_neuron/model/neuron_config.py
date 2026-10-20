@@ -153,6 +153,14 @@ class NeuronConfig:
     # everything the active quantization path supports. Mirrors the NxDI /
     # AWSNeuronEval modules_to_not_convert convention.
     modules_to_not_convert: list[str] | None = None
+    # Static-FP8 activation calibration: JSON of per-linear input amax
+    # ({"layers.<i>.mlp.down_proj": {"amax": ...}, ...}), for BF16 checkpoints that are
+    # quantized at load time (quantization="fp8"). None => <checkpoint>/fp8_act_amax.json.
+    fp8_activation_scales_path: str | None = None
+    # Override for the extra ``--internal-hlo2tensorizer-options`` passed to neuronx-cc.
+    # None keeps the default; "" passes no extra options (whole-graph compilation
+    # instead of modular flow).
+    hlo2tensorizer_options: str | None = None
     # Bucket configurations for scheduling
     num_batched_tokens_buckets: list[int] | None = None
     num_seqs_buckets: list[int] | None = None
@@ -266,6 +274,8 @@ class NeuronConfig:
             quantization=config_dict.get("quantization"),
             all2all_backend=config_dict.get("all2all_backend"),
             modules_to_not_convert=config_dict.get("modules_to_not_convert"),
+            fp8_activation_scales_path=config_dict.get("fp8_activation_scales_path"),
+            hlo2tensorizer_options=config_dict.get("hlo2tensorizer_options"),
             num_batched_tokens_buckets=config_dict.get("num_batched_tokens_buckets"),
             num_seqs_buckets=config_dict.get("num_seqs_buckets"),
             decode_context_length_buckets=config_dict.get(
