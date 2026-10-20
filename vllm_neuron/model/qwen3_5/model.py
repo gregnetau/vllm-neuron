@@ -1280,6 +1280,10 @@ def _layer_weight_mappings(layer, pre: str, ck: str) -> dict:
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 dense hybrid text model + column-parallel LM head (untied)."""
 
+    # Native route: compile as --model-type=generic, as the XLA route does. The default
+    # "transformer" partitions per layer and remats; prefill ran about 2.5x slower.
+    NATIVE_COMPILER_MODEL_TYPE = "generic"
+
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
         self.config = config
