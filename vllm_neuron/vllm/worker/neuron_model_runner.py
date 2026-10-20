@@ -11196,7 +11196,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """
         cache_dtype = self.vllm_config.cache_config.cache_dtype
         kv_is_fp8 = isinstance(cache_dtype, str) and cache_dtype.startswith("fp8")
-        return kv_is_fp8 and not self.neuron_config.fp8_packed_kv
+        if not kv_is_fp8 or self.neuron_config.fp8_packed_kv:
+            return False
+        # A model whose segmented prefill reads the unpacked FP8 K cache itself (e.g. with a
+        # vendored kernel, see segmented_attention(kernel=)) declares it on its class.
+        return not self._model_reads_unpacked_fp8_kv_in_segmented_prefill()
+
+    def _model_reads_unpacked_fp8_kv_in_segmented_prefill(self) -> bool:
+        """Whether the model class registered for this architecture sets
+        ``SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV`` (resolved from the registry: this runs
+        in ``__init__``, before the model is loaded)."""
+        from vllm_neuron.model.registry import get_models
+
+        models = dict(get_models())
+        archs = getattr(self.vllm_config.model_config, "architectures", None) or []
+        return any(
+            getattr(models.get(arch), "SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV", False)
+            for arch in archs
+        )
 
     @staticmethod
     def _k_cache_alloc_shape(

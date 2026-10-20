@@ -15,6 +15,10 @@ class Qwen3_5ForCausalLM(nn.Module):
     ignored, so both serve text only.
     """
 
+    # Segmented prefill reads an unpacked FP8 K cache with the vendored kernel
+    # (attention_segmented_cte.py), so the runner keeps segmented prefill on for FP8 KV.
+    SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV = True
+
     def __init__(
         self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
     ) -> None:
