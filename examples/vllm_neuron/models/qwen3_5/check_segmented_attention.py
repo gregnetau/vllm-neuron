@@ -26,8 +26,20 @@ def reference(q, kc, vc, bt, prior, n_valid, block_size, scale):
     T = q.shape[1]
     blocks = bt.clamp(min=0).long()
     S = blocks.shape[0] * block_size
-    k = kc[blocks].transpose(0, 1).reshape(NKH, S, DH).float().repeat_interleave(NH // NKH, 0)
-    v = vc[blocks].transpose(0, 1).reshape(NKH, S, DH).float().repeat_interleave(NH // NKH, 0)
+    k = (
+        kc[blocks]
+        .transpose(0, 1)
+        .reshape(NKH, S, DH)
+        .float()
+        .repeat_interleave(NH // NKH, 0)
+    )
+    v = (
+        vc[blocks]
+        .transpose(0, 1)
+        .reshape(NKH, S, DH)
+        .float()
+        .repeat_interleave(NH // NKH, 0)
+    )
     key_pos, q_pos = torch.arange(S), prior + torch.arange(T)
     allowed = (key_pos[None] < prior + n_valid) & (key_pos[None] <= q_pos[:, None])
     scores = (q.float() @ k.transpose(1, 2)) * scale
@@ -47,13 +59,25 @@ def _timed(fn, args, reps=10):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--max-model-len", type=int, default=32768)
-    ap.add_argument("--block-size", type=int, default=32, help="kernel block size (serving: 32)")
+    ap.add_argument(
+        "--block-size", type=int, default=32, help="kernel block size (serving: 32)"
+    )
     ap.add_argument("--chunk", type=int, default=1024)
-    ap.add_argument("--n-valid", type=int, default=1000, help="valid tokens in the chunk")
-    ap.add_argument("--priors", type=str, default=None,
-                    help="comma-separated cached prefix lengths (default: 0, 1 chunk, half, max)")
-    ap.add_argument("--no-torch", action="store_true", help="skip timing the PyTorch fallback")
-    ap.add_argument("--fp8-kv", action="store_true", help="FP8 KV cache (vendored kernel)")
+    ap.add_argument(
+        "--n-valid", type=int, default=1000, help="valid tokens in the chunk"
+    )
+    ap.add_argument(
+        "--priors",
+        type=str,
+        default=None,
+        help="comma-separated cached prefix lengths (default: 0, 1 chunk, half, max)",
+    )
+    ap.add_argument(
+        "--no-torch", action="store_true", help="skip timing the PyTorch fallback"
+    )
+    ap.add_argument(
+        "--fp8-kv", action="store_true", help="FP8 KV cache (vendored kernel)"
+    )
     args = ap.parse_args()
 
     import libtorch_neuronx_lite  # noqa: F401
@@ -82,9 +106,19 @@ def main():
         seg_kernel = attention_segmented_cte_fp8_kernel
 
     def kernel(q, bt, prior):
-        return NF.segmented_attention(q, k_cache=kd, v_cache=vd, block_tables=bt, prior_tokens=prior,
-                                      block_size=bs, kv_segment_size=T, scale=scale, tp_q=True,
-                                      tp_out=True, kernel=seg_kernel)
+        return NF.segmented_attention(
+            q,
+            k_cache=kd,
+            v_cache=vd,
+            block_tables=bt,
+            prior_tokens=prior,
+            block_size=bs,
+            kv_segment_size=T,
+            scale=scale,
+            tp_q=True,
+            tp_out=True,
+            kernel=seg_kernel,
+        )
 
     def torch_fallback(q, bt, prior):
         # Same computation as Qwen3_5Attention._attend_cached_torch (gather the whole table).
@@ -92,18 +126,30 @@ def main():
         S = blocks.shape[0] * bs
         k = kd.index_select(0, blocks).transpose(0, 1).reshape(NKH, S, DH).float()
         v = vd.index_select(0, blocks).transpose(0, 1).reshape(NKH, S, DH).float()
-        key_pos, q_pos = torch.arange(S, device=q.device), prior.reshape(1) + torch.arange(T, device=q.device)
-        allowed = (key_pos[None] < prior.reshape(1) + args.n_valid) & (key_pos[None] <= q_pos[:, None])
+        key_pos, q_pos = (
+            torch.arange(S, device=q.device),
+            prior.reshape(1) + torch.arange(T, device=q.device),
+        )
+        allowed = (key_pos[None] < prior.reshape(1) + args.n_valid) & (
+            key_pos[None] <= q_pos[:, None]
+        )
         k, v = k.repeat_interleave(NH // NKH, 0), v.repeat_interleave(NH // NKH, 0)
-        s = torch.where(allowed[None], (q.float() @ k.transpose(1, 2)) * scale, torch.full((), -1e30, device=q.device))
+        s = torch.where(
+            allowed[None],
+            (q.float() @ k.transpose(1, 2)) * scale,
+            torch.full((), -1e30, device=q.device),
+        )
         return (torch.softmax(s, -1) @ v).transpose(1, 2).to(q.dtype)
 
     backend = get_compile_backend_name()
     kernel_c = torch.compile(kernel, backend=backend, dynamic=False)
     torch_c = torch.compile(torch_fallback, backend=backend, dynamic=False)
 
-    priors = ([int(p) for p in args.priors.split(",")] if args.priors
-              else sorted({0, T, (L // 2 // T) * T, L - T}))
+    priors = (
+        [int(p) for p in args.priors.split(",")]
+        if args.priors
+        else sorted({0, T, (L // 2 // T) * T, L - T})
+    )
     for prior in priors:
         used = -(-(prior + T) // bs)
         perm = torch.randperm(num_blocks - 1)[:used] + 1
@@ -111,14 +157,20 @@ def main():
         bt[0, :used] = perm.to(torch.int32)
         q = torch.randn(NH, T, DH).to(torch.bfloat16)
         p = torch.tensor([[prior]], dtype=torch.int32)
-        ref = reference(q, kc, vc, bt[0], prior, args.n_valid, bs, scale)[..., :args.n_valid]
+        ref = reference(q, kc, vc, bt[0], prior, args.n_valid, bs, scale)[
+            ..., : args.n_valid
+        ]
         dargs = (q.to(dev), bt.to(dev), p.to(dev))
-        out = kernel_c(*dargs).cpu().float()[..., :args.n_valid]
+        out = kernel_c(*dargs).cpu().float()[..., : args.n_valid]
         err = ((out - ref).abs().max() / ref.abs().max()).item()
-        cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+        cos = torch.nn.functional.cosine_similarity(
+            out.flatten(), ref.flatten(), dim=0
+        ).item()
         t_k = _timed(kernel_c, dargs)
-        line = (f"max_model_len {L:6d} prior {prior:6d}: rel err {err:.1e} cos {cos:.6f}  "
-                f"kernel {t_k * 1e3:7.2f} ms")
+        line = (
+            f"max_model_len {L:6d} prior {prior:6d}: rel err {err:.1e} cos {cos:.6f}  "
+            f"kernel {t_k * 1e3:7.2f} ms"
+        )
         if not args.no_torch:
             t_t = _timed(torch_c, dargs)
             line += f"  torch fallback {t_t * 1e3:7.2f} ms"

@@ -40,12 +40,17 @@ def ask(url: str, model: str, prompt: str, max_tokens: int):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt + "\n\n" + QUESTION}],
-        "max_tokens": max_tokens, "temperature": 0, "stream": True,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
         "chat_template_kwargs": {"enable_thinking": False},
         "stream_options": {"include_usage": True},
     }
-    req = urllib.request.Request(f"{url}/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     t0, ttft, text, usage = time.perf_counter(), None, "", {}
     with urllib.request.urlopen(req, timeout=3600) as resp:
         for raw in resp:
@@ -67,7 +72,9 @@ def main():
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--context", type=int, default=30000, help="approximate prompt tokens")
+    ap.add_argument(
+        "--context", type=int, default=30000, help="approximate prompt tokens"
+    )
     ap.add_argument("--depths", default="0.1,0.5,0.9")
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
@@ -78,12 +85,19 @@ def main():
     failures = 0
     for depth in (float(d) for d in args.depths.split(",")):
         passkey = str(rng.randint(100000, 999999))
-        text, ttft, n_prompt = ask(args.url, args.model, build_prompt(tok, args.context, depth, passkey),
-                                   args.max_tokens)
+        text, ttft, n_prompt = ask(
+            args.url,
+            args.model,
+            build_prompt(tok, args.context, depth, passkey),
+            args.max_tokens,
+        )
         ok = passkey in text
         failures += not ok
-        print(f"context {n_prompt} tokens, depth {depth:.2f}: {'OK  ' if ok else 'FAIL'} "
-              f"passkey {passkey} answer {text.strip()!r} TTFT {ttft:.2f} s", flush=True)
+        print(
+            f"context {n_prompt} tokens, depth {depth:.2f}: {'OK  ' if ok else 'FAIL'} "
+            f"passkey {passkey} answer {text.strip()!r} TTFT {ttft:.2f} s",
+            flush=True,
+        )
     sys.exit(1 if failures else 0)
 
 

@@ -31,11 +31,11 @@ PROMPTS = [
     "请用中文简要介绍一下长城的历史和它的建造目的。",
     "SELECT customer_id, SUM(amount) AS total FROM orders WHERE created_at >= '2024-01-01' GROUP BY customer_id ORDER BY total DESC LIMIT 10;",
     "In 1905, Albert Einstein published four papers that changed physics. The first concerned the photoelectric effect,",
-    "Here is a JSON object describing a user: {\"id\": 4821, \"name\": \"Ada\", \"roles\": [\"admin\", \"editor\"], \"active\": true}. Convert it to YAML.",
+    'Here is a JSON object describing a user: {"id": 4821, "name": "Ada", "roles": ["admin", "editor"], "active": true}. Convert it to YAML.',
     "Translate to German: 'The weather was terrible, so we stayed inside and played board games all afternoon.'",
     "1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,",
     "Summarize the plot of Romeo and Juliet in three bullet points, then list the main characters.",
-    "#include <stdio.h>\nint main(void) {\n    for (int i = 0; i < 10; ++i) {\n        printf(\"%d\\n\", i * i);\n    }\n",
+    '#include <stdio.h>\nint main(void) {\n    for (int i = 0; i < 10; ++i) {\n        printf("%d\\n", i * i);\n    }\n',
     "Q: What is the derivative of x^3 * sin(x)? A: Using the product rule,",
     "The mitochondria is the powerhouse of the cell. It produces ATP through oxidative phosphorylation, which",
     "Dear hiring manager, I am writing to apply for the position of senior software engineer at your company.",
@@ -50,13 +50,16 @@ def main() -> None:
 
     tok = transformers.AutoTokenizer.from_pretrained(args.model)
     chats = [
-        tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
-                                add_generation_prompt=True)
+        tok.apply_chat_template(
+            [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
+        )
         for p in PROMPTS[:4]
     ]
     texts = PROMPTS + chats
     t0 = time.time()
-    model = transformers.Qwen3_5ForConditionalGeneration.from_pretrained(args.model, dtype=torch.bfloat16)
+    model = transformers.Qwen3_5ForConditionalGeneration.from_pretrained(
+        args.model, dtype=torch.bfloat16
+    )
     model.eval()
     lm = model.model.language_model
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
@@ -64,9 +67,11 @@ def main() -> None:
     stats, current = {}, {}
     for name, mod in lm.named_modules():
         if isinstance(mod, torch.nn.Linear):
+
             def hook(_m, inputs, name=name):
                 amax = inputs[0].detach().abs().amax().float().item()
                 current[name] = max(current.get(name, 0.0), amax)
+
             mod.register_forward_pre_hook(hook)
 
     n_tokens = 0
@@ -81,7 +86,11 @@ def main() -> None:
                 s["amax"] = max(s["amax"], v)
                 s["per_prompt"].append(v)
             print(f"prompt {i + 1}/{len(texts)}: {ids.shape[1]} tokens", flush=True)
-    stats["_meta"] = {"n_prompts": len(texts), "n_tokens": n_tokens, "checkpoint": args.model}
+    stats["_meta"] = {
+        "n_prompts": len(texts),
+        "n_tokens": n_tokens,
+        "checkpoint": args.model,
+    }
     with open(args.output, "w") as f:
         json.dump(stats, f, indent=0)
     print(f"saved {len(stats) - 1} modules to {args.output}")

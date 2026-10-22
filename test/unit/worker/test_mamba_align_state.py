@@ -13,14 +13,14 @@ import torch
 
 pytest.importorskip("vllm")
 
-from vllm.v1.kv_cache_interface import (  # noqa: E402
+from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.worker.block_table import BlockTable  # noqa: E402
+from vllm.v1.worker.block_table import BlockTable
 
 
 def _nmr():
@@ -31,6 +31,7 @@ def _nmr():
     from vllm_neuron.vllm.worker import neuron_model_runner
 
     return neuron_model_runner
+
 
 BS = 4  # align-mode state block size (tokens per block)
 MAX_BLOCKS = 8
@@ -200,7 +201,9 @@ def test_copy_state_blocks_chunks_and_pads_with_null_block():
     # padding with (0, 0) (null block onto itself). Run it eagerly on CPU tensors.
     chunk = _nmr()._STATE_COPY_CHUNK
     n_pages = 2 * chunk + 4
-    g0 = torch.arange(n_pages, dtype=torch.float32).repeat_interleave(3).view(n_pages, 3)
+    g0 = (
+        torch.arange(n_pages, dtype=torch.float32).repeat_interleave(3).view(n_pages, 3)
+    )
     g1 = g0.clone() + 1000
     r = _runner(
         _state_copy_pages=[g0, g1],
@@ -403,12 +406,18 @@ def test_state_pool_pages_zero_for_align_or_shared():
 
 
 def _attn(bs):
-    return FullAttentionSpec(block_size=bs, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    return FullAttentionSpec(
+        block_size=bs, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+    )
 
 
 def _swa(bs):
     return SlidingWindowSpec(
-        block_size=bs, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, sliding_window=64
+        block_size=bs,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        sliding_window=64,
     )
 
 
@@ -449,4 +458,7 @@ def test_kernel_block_sizes_non_divisible_or_unset_fall_back():
 def test_kernel_block_sizes_mamba_none_mode():
     # Without prefix caching the state block spans max_model_len.
     r = _runner(_attn_kernel_block_size=32)
-    assert r._kernel_block_sizes(_kv_config(_attn(64), _mamba(4096, "none"))) == [32, 4096]
+    assert r._kernel_block_sizes(_kv_config(_attn(64), _mamba(4096, "none"))) == [
+        32,
+        4096,
+    ]

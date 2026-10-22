@@ -38,6 +38,7 @@ def _timed(fn, args, n_layers=8, reps=5):
                 o, s = fn(out, k, v, g, b, s)
                 out = (q.float() + 1e-3 * o.float()).to(q.dtype)
             return out, s
+
         return torch.compile(f, backend=get_compile_backend_name(), dynamic=False)
 
     def run(f):
@@ -55,7 +56,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tokens", type=int, default=1024)
     ap.add_argument("--impl", default="ref", help="gdn_ops function name")
-    ap.add_argument("--chunk-size", type=int, default=None, help="delta-rule chunk (default gdn_ops')")
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="delta-rule chunk (default gdn_ops')",
+    )
     args = ap.parse_args()
     import libtorch_neuronx_lite  # noqa: F401
 
@@ -69,16 +75,20 @@ def main():
         fn = functools.partial(fn, chunk_size=args.chunk_size)
     dev = torch.device("neuron:0")
     q, k, v, g, b, s0 = _inputs(args.tokens)
-    ref_o, ref_s = gdn_ops.recurrent_gated_delta_rule(q.double(), k.double(), v.double(), g.double(),
-                                                      b.double(), s0.double())
+    ref_o, ref_s = gdn_ops.recurrent_gated_delta_rule(
+        q.double(), k.double(), v.double(), g.double(), b.double(), s0.double()
+    )
     dargs = tuple(t.to(dev) for t in (q, k, v, g, b, s0))
     o, s = torch.compile(fn, backend=get_compile_backend_name(), dynamic=False)(*dargs)
     o, s = o.cpu().double(), s.cpu().double()
     err_o = ((o - ref_o).norm() / ref_o.norm()).item()
     err_s = ((s - ref_s).norm() / ref_s.norm()).item()
     per = _timed(fn, dargs)
-    print(f"{args.impl} chunk {args.chunk_size or gdn_ops.CHUNK_SIZE} T {args.tokens}: rel err out {err_o:.1e} state {err_s:.1e}  {per * 1e3:7.2f} ms/layer"
-          f"  ({48 * per * 1e3:6.1f} ms for 48 GDN layers)", flush=True)
+    print(
+        f"{args.impl} chunk {args.chunk_size or gdn_ops.CHUNK_SIZE} T {args.tokens}: rel err out {err_o:.1e} state {err_s:.1e}  {per * 1e3:7.2f} ms/layer"
+        f"  ({48 * per * 1e3:6.1f} ms for 48 GDN layers)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
