@@ -33,9 +33,12 @@ def _stub(name, **attrs):
 
 
 def _install_stubs():
-    from conftest import ROOT, _load, _stub_packages, set_module
+    from conftest import ROOT, _load, _stub_packages, hide_modules, set_module
 
     _stub_packages()
+    # Another test may have imported the real model modules (e.g. through the registry);
+    # load them again against the stubs below.
+    hide_modules("vllm_neuron.model.qwen3_5")
     for pkg in ("vllm", "vllm.distributed"):
         _stub(pkg)
     _stub("vllm.distributed.parallel_state", get_tp_group=lambda: _TP())
