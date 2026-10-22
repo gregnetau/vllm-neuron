@@ -350,7 +350,11 @@ class Qwen3_5MTP(nn.Module):
     def _weight_mappings(self) -> dict:
         m = {
             "model.embed_tokens.weight": f"{CKPT}embed_tokens.weight",
-            "lm_head.weight": "lm_head.weight",
+            # Tied checkpoints (e.g. Qwen3.5-2B) have no lm_head.weight: the head is the
+            # embedding, sharded over the vocabulary the same way.
+            "lm_head.weight": f"{CKPT}embed_tokens.weight"
+            if self.config.tie_word_embeddings
+            else "lm_head.weight",
             "model.fc_weight": MTP + "fc.weight",
             "model.pre_fc_norm_embedding.weight": MTP + "pre_fc_norm_embedding.weight",
             "model.pre_fc_norm_hidden.weight": MTP + "pre_fc_norm_hidden.weight",

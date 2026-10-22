@@ -1990,7 +1990,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         m = {
             "model.embed_tokens.weight": f"{CKPT}embed_tokens.weight",
             "model.norm.weight": f"{CKPT}norm.weight",
-            "lm_head.weight": "lm_head.weight",
+            # Tied checkpoints (e.g. Qwen3.5-2B) have no lm_head.weight: the head is the
+            # embedding, sharded over the vocabulary the same way.
+            "lm_head.weight": f"{CKPT}embed_tokens.weight"
+            if self.config.tie_word_embeddings
+            else "lm_head.weight",
         }
         for i, layer in enumerate(self.model.layers):
             m.update(

@@ -600,3 +600,29 @@ def test_weight_mappings_match_real_checkpoint_index():
         n for n in published if n.startswith(mtp.MTP)
     }
     assert draft_keys <= published
+
+
+def test_tied_embeddings_map_lm_head_to_embedding():
+    """Tied checkpoints (e.g. Qwen3.5-2B) have no lm_head.weight: the target and MTP heads
+    load the embedding tensor instead."""
+    import copy
+    import json
+    import pathlib
+
+    mod = _install_stubs()
+    from conftest import ROOT, _load
+
+    mtp = _load("vllm_neuron.model.qwen3_5.mtp", ROOT / "model/qwen3_5/mtp.py")
+    raw = json.loads(
+        (pathlib.Path(__file__).parent / "qwen3_8_27b_config.json").read_text()
+    )
+    tied = copy.deepcopy(raw)
+    tied["tie_word_embeddings"] = True
+    tied.setdefault("text_config", {})["tie_word_embeddings"] = True
+    with torch.device("meta"):
+        model = mod.Qwen3_5ForCausalLM.from_configs(tied, None)
+        draft = mtp.Qwen3_5MTP.from_configs(tied, model.config.num_hidden_layers)
+    embed = f"{mod.CKPT}embed_tokens.weight"
+    assert model.config.tie_word_embeddings
+    assert model._weight_mappings()["lm_head.weight"] == embed
+    assert draft._weight_mappings()["lm_head.weight"] == embed
