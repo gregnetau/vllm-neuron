@@ -76,13 +76,6 @@ class Qwen3_5ForCausalLM(nn.Module, HasRecurrentState, ServesTextOnly):
             )
         cls._validate_chunked_prefill(neuron_config)
         cfg = Qwen3_5Config.from_configs(hf_config)
-        if cfg.tie_word_embeddings:
-            # The model always loads a separate ``lm_head.weight`` (published checkpoints are
-            # untied); the reference model in reference.py does handle tied embeddings.
-            raise ValueError(
-                "tie_word_embeddings=True is not supported for Qwen3.5/3.8 (the Neuron "
-                "model loads a separate lm_head.weight)."
-            )
         tp = get_tp_group().world_size
         cfg.validate_tp(tp)
         if cfg.num_key_value_heads // tp != 1:

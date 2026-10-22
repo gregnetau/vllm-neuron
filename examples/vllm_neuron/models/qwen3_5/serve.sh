@@ -4,9 +4,11 @@
 #
 # Usage:
 #   MODEL=<path-to-checkpoint>/Qwen3.8-27B examples/vllm_neuron/models/qwen3_5/serve.sh
+#   # Tensor parallelism = the checkpoint's KV-head count (TP, default 4; Qwen3.5-2B: TP=2):
+#   MODEL=<path-to-checkpoint>/Qwen3.5-2B TP=2 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Static FP8 MLPs:
 #   MODEL=... FP8_SCALES=<path>/fp8_act_amax.json examples/vllm_neuron/models/qwen3_5/serve.sh
-#   # neuronx-cc optimization level (default 1; 3 speeds up prefill, longer compile):
+#   # neuronx-cc optimization level (default 2; 3 speeds up prefill, longer compile):
 #   MODEL=... OPTLEVEL=3 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # FP8 KV cache (unit KV scales):
 #   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen3_5/serve.sh
@@ -85,7 +87,7 @@ fi
 
 exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --served-model-name "${SERVED_MODEL_NAME:-$(basename "${MODEL}")}" \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size "${TP:-4}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS:-1}" \
   --max-num-batched-tokens "${PREFILL_BUCKET}" \
