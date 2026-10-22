@@ -18,17 +18,17 @@ import torch
 
 pytest.importorskip("vllm")
 
-from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig  # noqa: E402
-from vllm.sampling_params import SamplingParams  # noqa: E402
-from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
-from vllm.v1.kv_cache_interface import (  # noqa: E402
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput  # noqa: E402
-from vllm.v1.request import Request, RequestStatus  # noqa: E402
-from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 
 # vllm_neuron is imported inside the fixture, not at collection: importing the real
 # vllm_neuron.functional before test/unit/model/qwen3_5/test_model_smoke.py runs defeats
@@ -142,7 +142,8 @@ def _step(sched) -> dict[str, int]:
     out = sched.schedule()
     req_ids = list(out.num_scheduled_tokens)
     sampled = [
-        [7] if sched.requests[r].num_computed_tokens >= sched.requests[r].num_prompt_tokens
+        [7]
+        if sched.requests[r].num_computed_tokens >= sched.requests[r].num_prompt_tokens
         else []
         for r in req_ids
     ]

@@ -31,14 +31,23 @@ TEXT = (
 
 
 def _post(url: str, body: dict):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     return urllib.request.urlopen(req, timeout=3600)
 
 
 def timed_request(url: str, model: str, ids: list[int], output_len: int) -> dict:
-    body = {"model": model, "prompt": ids, "max_tokens": output_len, "temperature": 0,
-            "ignore_eos": True, "stream": True}
+    body = {
+        "model": model,
+        "prompt": ids,
+        "max_tokens": output_len,
+        "temperature": 0,
+        "ignore_eos": True,
+        "stream": True,
+    }
     start = time.perf_counter()
     first, chunks, text = None, 0, []
     with _post(url, body) as resp:
@@ -55,8 +64,13 @@ def timed_request(url: str, model: str, ids: list[int], output_len: int) -> dict
     out = "".join(text)
     if len(set(out.strip())) <= 1:
         raise RuntimeError(f"degenerate output (NaN logits?): {out[:80]!r}")
-    return {"text": out[:200], "ttft_s": first - start, "tpot_s": (end - first) / max(output_len - 1, 1),
-            "e2e_s": end - start, "chunks": chunks}
+    return {
+        "text": out[:200],
+        "ttft_s": first - start,
+        "tpot_s": (end - first) / max(output_len - 1, 1),
+        "e2e_s": end - start,
+        "chunks": chunks,
+    }
 
 
 def main() -> None:
@@ -76,9 +90,14 @@ def main() -> None:
         raise ValueError(f"prompt has {len(ids)} tokens, expected {args.input_len}")
 
     timed_request(args.url, args.model, ids, args.output_len)  # warmup
-    runs = [timed_request(args.url, args.model, ids, args.output_len) for _ in range(args.rounds)]
+    runs = [
+        timed_request(args.url, args.model, ids, args.output_len)
+        for _ in range(args.rounds)
+    ]
     result = {
-        "input_len": args.input_len, "output_len": args.output_len, "rounds": args.rounds,
+        "input_len": args.input_len,
+        "output_len": args.output_len,
+        "rounds": args.rounds,
         "ttft_ms": round(statistics.mean(r["ttft_s"] for r in runs) * 1e3, 1),
         "tpot_ms": round(statistics.mean(r["tpot_s"] for r in runs) * 1e3, 2),
         "e2e_ms": round(statistics.mean(r["e2e_s"] for r in runs) * 1e3, 1),

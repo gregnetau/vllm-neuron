@@ -173,7 +173,9 @@ def predicated_folded_load(
     loaded_rows = batch_size_sharded_bounded * fold_factor
     if remainder > 0 and loaded_rows < data_sb.shape[0]:
         nisa.memset(
-            dst=data_sb[nl.ds(loaded_rows, data_sb.shape[0] - loaded_rows), nl.ds(0, remainder)],
+            dst=data_sb[
+                nl.ds(loaded_rows, data_sb.shape[0] - loaded_rows), nl.ds(0, remainder)
+            ],
             value=fill_value,
         )
     for batch_line_idx in nl.affine_range(batch_size_sharded_bounded):

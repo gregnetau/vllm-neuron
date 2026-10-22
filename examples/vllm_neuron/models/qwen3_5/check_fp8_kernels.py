@@ -32,17 +32,25 @@ def _fq(x, scale):
 def _timed(fn, x, n_layers=8, reps=10):
     from vllm_neuron.envs import get_compile_backend_name
 
-    opts = {"alias_meta_to_neuron": True, "compiler_args": [
-        "--auto-cast=none", "-O1",
-        "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 --experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
-        "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"]}
+    opts = {
+        "alias_meta_to_neuron": True,
+        "compiler_args": [
+            "--auto-cast=none",
+            "-O1",
+            "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 --experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+            "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
+        ],
+    }
 
     def chain(n):
         def f(h):
             for i in range(n):
                 h = fn(h, i)
             return h
-        return torch.compile(f, backend=get_compile_backend_name(), dynamic=False, options=opts)
+
+        return torch.compile(
+            f, backend=get_compile_backend_name(), dynamic=False, options=opts
+        )
 
     def run(f):
         with torch.no_grad():
@@ -66,13 +74,24 @@ def check_matvec(T, dev):
         isc = torch.full((128, 1), 0.02).to(dev)
         x = torch.randn(T, K).to(torch.bfloat16)
         ref = _fq(x.float(), 0.02) @ ws[0][0].float() * (ws[0][1] * 0.02)
-        out = torch.compile(lambda h: fp8_matvec(h, wd[0], wsc[0], isc), backend=get_compile_backend_name(),
-                            dynamic=False)(x.to(dev)).cpu().float()
+        out = (
+            torch.compile(
+                lambda h, wd=wd, wsc=wsc, isc=isc: fp8_matvec(h, wd[0], wsc[0], isc),
+                backend=get_compile_backend_name(),
+                dynamic=False,
+            )(x.to(dev))
+            .cpu()
+            .float()
+        )
         err = ((out - ref).abs().max() / ref.abs().max()).item()
-        step = lambda h, i: h * (1 + 1e-9 * fp8_matvec(h, wd[i], wsc[i], isc)[:, :1])
+        step = lambda h, i, wd=wd, wsc=wsc, isc=isc: (
+            h * (1 + 1e-9 * fp8_matvec(h, wd[i], wsc[i], isc)[:, :1])
+        )
         per = _timed(step, x.to(dev))
-        print(f"fp8_matvec     K {K:5d} N {N:5d} T {T}: rel err {err:.1e}  {per * 1e6:6.1f} us  "
-              f"{K * N / per / 1e9:4.0f} GB/s")
+        print(
+            f"fp8_matvec     K {K:5d} N {N:5d} T {T}: rel err {err:.1e}  {per * 1e6:6.1f} us  "
+            f"{K * N / per / 1e9:4.0f} GB/s"
+        )
 
 
 def check_mlp(T, dev):
@@ -82,32 +101,72 @@ def check_mlp(T, dev):
     sc = lambda v: torch.full((128, 1), v).to(dev)
     layers = []
     for _ in range(8):
-        (g, gs), (u, us), (d, ds) = (_q8(torch.randn(H, I) * 0.02), _q8(torch.randn(H, I) * 0.02),
-                                     _q8(torch.randn(I, H) * 0.02))
-        layers.append(dict(g=g, u=u, d=d, gs=gs, us=us, ds=ds, lw=1 + 0.1 * torch.randn(H)))
+        (g, gs), (u, us), (d, ds) = (
+            _q8(torch.randn(H, I) * 0.02),
+            _q8(torch.randn(H, I) * 0.02),
+            _q8(torch.randn(I, H) * 0.02),
+        )
+        layers.append(
+            {
+                "g": g,
+                "u": u,
+                "d": d,
+                "gs": gs,
+                "us": us,
+                "ds": ds,
+                "lw": 1 + 0.1 * torch.randn(H),
+            }
+        )
     gu_in, dn_in = 0.02, 0.002
     gu_t, dn_t = sc(gu_in), sc(dn_in)
-    D = [dict(g=L["g"].to(dev), u=L["u"].to(dev), d=L["d"].to(dev), gs=sc(L["gs"]), us=sc(L["us"]),
-              ds=sc(L["ds"]), lw=L["lw"].to(dev)) for L in layers]
+    D = [
+        {
+            "g": L["g"].to(dev),
+            "u": L["u"].to(dev),
+            "d": L["d"].to(dev),
+            "gs": sc(L["gs"]),
+            "us": sc(L["us"]),
+            "ds": sc(L["ds"]),
+            "lw": L["lw"].to(dev),
+        }
+        for L in layers
+    ]
 
     def mlp(h, i):
         d = D[i]
-        return fp8_mlp_decode(h, d["lw"], d["g"], d["u"], d["d"], d["gs"], d["us"], d["ds"], gu_t, dn_t,
-                              EPS)
+        return fp8_mlp_decode(
+            h,
+            d["lw"],
+            d["g"],
+            d["u"],
+            d["d"],
+            d["gs"],
+            d["us"],
+            d["ds"],
+            gu_t,
+            dn_t,
+            EPS,
+        )
 
     x = (torch.randn(T, H) * 2).to(torch.bfloat16)
     L = layers[0]
     xf = x.float()
     xn = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS) * L["lw"]
     xq = _fq(xn, gu_in)
-    a = F.silu(xq @ L["g"].float() * (L["gs"] * gu_in)) * (xq @ L["u"].float() * (L["us"] * gu_in))
+    a = F.silu(xq @ L["g"].float() * (L["gs"] * gu_in)) * (
+        xq @ L["u"].float() * (L["us"] * gu_in)
+    )
     ref = _fq(a, dn_in) @ L["d"].float() * (L["ds"] * dn_in)
-    out = torch.compile(lambda h: mlp(h, 0), backend=get_compile_backend_name(), dynamic=False)(x.to(dev))
+    out = torch.compile(
+        lambda h: mlp(h, 0), backend=get_compile_backend_name(), dynamic=False
+    )(x.to(dev))
     out = out.cpu().float()
     err = ((out - ref).abs().max() / ref.abs().max()).item()
     per = _timed(lambda h, i: h + mlp(h, i).to(h.dtype), x.to(dev))
-    print(f"fp8_mlp_decode H {H} I {I} T {T}: rel err {err:.1e}  {per * 1e6:6.1f} us  "
-          f"{3 * H * I / per / 1e9:4.0f} GB/s")
+    print(
+        f"fp8_mlp_decode H {H} I {I} T {T}: rel err {err:.1e}  {per * 1e6:6.1f} us  "
+        f"{3 * H * I / per / 1e9:4.0f} GB/s"
+    )
 
 
 def main():

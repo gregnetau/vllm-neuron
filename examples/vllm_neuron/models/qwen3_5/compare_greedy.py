@@ -34,12 +34,26 @@ PROMPTS = [
 def capture(url: str, model: str, max_tokens: int, out: str) -> None:
     results = []
     for prompt in PROMPTS:
-        body = {"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": 0,
-                "return_token_ids": True}
-        req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "return_token_ids": True,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
         choice = json.load(urllib.request.urlopen(req))["choices"][0]
-        results.append({"prompt": prompt, "text": choice["text"], "token_ids": choice.get("token_ids")})
+        results.append(
+            {
+                "prompt": prompt,
+                "text": choice["text"],
+                "token_ids": choice.get("token_ids"),
+            }
+        )
     with open(out, "w") as f:
         json.dump(results, f, indent=1, ensure_ascii=False)
     print(f"saved {len(results)} completions to {out}")
@@ -51,12 +65,16 @@ def compare(a_path: str, b_path: str) -> None:
     prefixes = []
     for x, y in zip(a, b):
         ta, tb = x["token_ids"] or list(x["text"]), y["token_ids"] or list(y["text"])
-        n = next((i for i, (u, v) in enumerate(zip(ta, tb)) if u != v), min(len(ta), len(tb)))
+        n = next(
+            (i for i, (u, v) in enumerate(zip(ta, tb)) if u != v), min(len(ta), len(tb))
+        )
         prefixes.append((n, len(ta)))
         print(f"{n:3d}/{len(ta)} identical  {x['prompt'][:40]!r}")
     full = sum(n == total for n, total in prefixes)
     mean = sum(n for n, _ in prefixes) / len(prefixes)
-    print(f"mean identical prefix {mean:.1f} tokens; {full}/{len(prefixes)} fully identical")
+    print(
+        f"mean identical prefix {mean:.1f} tokens; {full}/{len(prefixes)} fully identical"
+    )
 
 
 def main() -> None:

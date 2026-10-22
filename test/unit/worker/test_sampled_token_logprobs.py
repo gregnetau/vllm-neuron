@@ -7,7 +7,7 @@ import pytest
 import torch
 
 runner_mod = pytest.importorskip("vllm_neuron.vllm.worker.neuron_model_runner")
-from vllm.v1.sample.sampler import Sampler  # noqa: E402
+from vllm.v1.sample.sampler import Sampler
 
 V = 11
 
