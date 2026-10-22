@@ -19,6 +19,19 @@ ROOT = pathlib.Path(__file__).resolve().parents[4] / "vllm_neuron"
 # set_module and the autouse _restore_stubbed_modules fixture.
 _MISSING = object()
 _REPLACED: dict = {}
+_PARENT_ATTRS: dict = {}  # (parent module, attribute) -> previous value
+
+
+def _set_parent_attr(name: str, mod) -> None:
+    """``import a.b as c`` reads ``a.b`` from the parent package, not sys.modules."""
+    parent_name, _, attr = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is None:
+        return
+    key = (parent, attr)
+    if key not in _PARENT_ATTRS:
+        _PARENT_ATTRS[key] = getattr(parent, attr, _MISSING)
+    setattr(parent, attr, mod)
 
 
 def set_module(name: str, mod) -> None:
@@ -26,6 +39,16 @@ def set_module(name: str, mod) -> None:
     if name not in _REPLACED:
         _REPLACED[name] = sys.modules.get(name, _MISSING)
     sys.modules[name] = mod
+    _set_parent_attr(name, mod)
+
+
+def hide_modules(prefix: str) -> None:
+    """Drop already-imported modules under ``prefix`` for this test (restored after it), so
+    they are loaded again against the test's stubs rather than reused."""
+    for name in [n for n in sys.modules if n == prefix or n.startswith(prefix + ".")]:
+        if name not in _REPLACED:
+            _REPLACED[name] = sys.modules[name]
+        del sys.modules[name]
 
 
 def _stub_packages():
@@ -75,6 +98,13 @@ def _restore_stubbed_modules():
         else:
             sys.modules[name] = prev
     _REPLACED.clear()
+    for (parent, attr), prev in _PARENT_ATTRS.items():
+        if prev is _MISSING:
+            if hasattr(parent, attr):
+                delattr(parent, attr)
+        else:
+            setattr(parent, attr, prev)
+    _PARENT_ATTRS.clear()
 
 
 @pytest.fixture(scope="session")
