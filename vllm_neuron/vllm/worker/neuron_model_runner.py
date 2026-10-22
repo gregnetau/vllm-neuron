@@ -59,6 +59,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
+    LogprobsTensors,
     ModelRunnerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
@@ -427,10 +428,14 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         model_runner: "NeuronModelRunner",
         partial_prefill_req_ids: set[str] | None = None,
+        logprobs_inputs: tuple[torch.Tensor, int] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self._model_runner = model_runner
         self._partial_prefill_req_ids = partial_prefill_req_ids or set()
+        # (gathered logits, max_num_logprobs) when this step's requests asked for logprobs:
+        # computed in get_output(), once the sampled tokens are on the host.
+        self._logprobs_inputs = logprobs_inputs
         # Per-object lock: prevents double-materialization when both the async
         # output thread and the main thread call get_output() on the same object.
         self._lock = threading.Lock()
@@ -494,6 +499,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
+                raw_sampled = sampled_token_ids
                 if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] > 1:
                     # Spec decode: rejection sampler output [bs, num_spec+1]
                     # with -1 padding for rejected positions. Strip -1s to
@@ -542,6 +548,12 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 if empty_tokens is not None:
                     sampled_token_ids = empty_tokens
                 self.model_runner_output.sampled_token_ids = sampled_token_ids
+                if self._logprobs_inputs is not None:
+                    logits, max_num_logprobs = self._logprobs_inputs
+                    logprobs = self._model_runner._sampled_token_logprobs(
+                        raw_sampled, logits, max_num_logprobs, sampled_token_ids
+                    )
+                    self.model_runner_output.logprobs = logprobs.tolists()
                 logger.debug(
                     "sampled_token_ids on cpu after moving: sampled_token_ids=%s",
                     sampled_token_ids,
@@ -552,7 +564,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     "Skip updating batch state."
                 )
 
-        # Logprobs are computed in _sample() when on-device logits are available
+        # Logprobs: computed above for this step's samples (sync scheduling: in _sample())
         return self.model_runner_output
 
 
@@ -973,6 +985,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.neuron_config.on_device_sampling_config is not None
         )
         self._on_device_logits: torch.Tensor | None = None
+        # Async spec decode: each request's row of its latest spec-step output.
+        self._last_spec_rows: dict[str, tuple[torch.Tensor, int]] = {}
+        # Logprobs inputs of the step whose async output is being built (see _sample()).
+        self._async_logprobs_inputs: tuple[torch.Tensor, int] | None = None
         self._debug_logits_dir: str | None = self.neuron_config.debug_logits_dir
         self._debug_logits_step_counter: int = 0
         self._tensor_replacer = None
@@ -2559,18 +2575,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             prev_sampled, dummy_rows = self._remap_prev_sampled_by_req_id(
                 prev_future, num_reqs_padded
             )
-            # When the previous future has shape [bs, num_spec+1], the previous
-            # step was a spec step with a full num_spec_tokens bucket. Use
-            # num_spec directly: it's always the scheduled draft count for
-            # that step (we never mid-trim draft counts — NeuronAsyncScheduler
-            # clears spec_token_ids entirely near max_model_len instead).
-            # Rows of requests new to the batch carry a dummy (see below).
-            draft_counts = [
-                0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)
-            ]
-            prev_num_draft_tokens_tensor = torch.tensor(
-                draft_counts, dtype=torch.int32
-            ).to(device)
         else:
             # First decode step after prefill, or shape mismatch. Pass a dummy
             # with one valid token and no drafts, so valid_count == 1 and
@@ -2578,11 +2582,73 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # → correction is a no-op (and the last accepted token is the
             # step's first: recurrent-state models resume from state block 0).
             prev_sampled = self._dummy_prev_sampled(num_reqs_padded, num_spec, device)
-            prev_num_draft_tokens_tensor = torch.zeros(
-                (num_reqs_padded,), dtype=torch.int32, device=device
-            )
+            dummy_rows = set(range(num_reqs_padded))
+        # A request absent from the previous step (held back during another request's
+        # prefill, for example) still has the rejected drafts of its own last spec step
+        # to correct: use that step's row instead of the no-op dummy.
+        prev_sampled, dummy_rows = self._fill_from_last_spec_rows(
+            prev_sampled, dummy_rows, prev_future if use_real_prev else None
+        )
+        # A real row comes from a spec step with a full num_spec_tokens bucket, so its
+        # draft count is num_spec (we never mid-trim draft counts —
+        # NeuronAsyncScheduler clears spec_token_ids entirely near max_model_len).
+        draft_counts = [
+            0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)
+        ]
+        prev_num_draft_tokens_tensor = torch.tensor(draft_counts, dtype=torch.int32).to(
+            device
+        )
 
         return prev_sampled, prev_num_draft_tokens_tensor
+
+    def _record_last_spec_rows(self, sampled_token_ids, req_ids: list[str]) -> None:
+        """Remember each request's row of its latest spec-step output (device future
+        [bs, num_spec + 1]), for the correction of a later step it is part of; a request in
+        a non-spec step drops its row. Rows of finished requests are dropped."""
+        rows = self._last_spec_rows
+        is_spec = (
+            isinstance(sampled_token_ids, torch.Tensor)
+            and sampled_token_ids.ndim == 2
+            and sampled_token_ids.shape[1] > 1
+        )
+        for i, req_id in enumerate(req_ids):
+            if is_spec:
+                rows[req_id] = (sampled_token_ids, i)
+            else:
+                rows.pop(req_id, None)
+        for req_id in [r for r in rows if r not in self.requests]:
+            del rows[req_id]
+
+    def _fill_from_last_spec_rows(
+        self,
+        prev_sampled: torch.Tensor,
+        dummy_rows: set[int],
+        prev_future: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, set[int]]:
+        """Replace the dummy rows of real requests whose latest spec step is older than
+        the previous step with their row from that step. Returns the tensor and the rows
+        that stay dummies."""
+        rows = self._last_spec_rows
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        fill = [
+            (i, rows[req_ids[i]])
+            for i in sorted(dummy_rows)
+            if i < len(req_ids)
+            and req_ids[i] in rows
+            and rows[req_ids[i]][0] is not prev_future
+            and rows[req_ids[i]][0].shape[1] == prev_sampled.shape[1]
+        ]
+        if not fill:
+            return prev_sampled, dummy_rows
+        src = torch.cat([future[row : row + 1] for _, (future, row) in fill]).to(
+            prev_sampled.device
+        )
+        idx = torch.tensor([i for i, _ in fill], dtype=torch.long).to(
+            prev_sampled.device
+        )
+        # Out of place: in-place row writes can give non-contiguous NEFF inputs.
+        prev_sampled = prev_sampled.index_copy(0, idx, src).contiguous()
+        return prev_sampled, dummy_rows - {i for i, _ in fill}
 
     @staticmethod
     def _dummy_prev_sampled(
@@ -2975,14 +3041,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _state_pool_table(self, padded_num_reqs: int, n_blocks: int) -> torch.Tensor:
         """[padded_num_reqs, n_blocks] dedicated-pool pages of each request's state blocks
-        (-1 for padded rows). A request keeps its slot (pages 1 + slot * n_blocks + j) from
-        its first step until it finishes or is preempted (_release_state_pool_slots); running
-        requests can be out of the persistent batch for a step (e.g. during another request's
-        prefill) and keep their state."""
+        (-1 for padded rows). A request keeps its slot from its first step until it finishes
+        or is preempted (_release_state_pool_slots); running requests can be out of the
+        persistent batch for a step (e.g. during another request's prefill) and keep their
+        state. Its 1 + num_speculative_blocks state blocks map to pages
+        1 + slot * (1 + num_speculative_blocks) + j. The block table can be wider (vLLM pads
+        it for alignment); the extra columns map to the null page 0."""
         slots = self._state_pool_slots
         for req_id in [r for r in slots if r not in self.requests]:
             self._state_pool_free.append(slots.pop(req_id))
         table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
+        pages = min(self._state_pool_slot_pages, n_blocks)
         for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
             if req_id is None:
                 continue
@@ -2992,8 +3061,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "Recurrent-state pool exhausted: more live requests than max_num_seqs"
                     )
                 slots[req_id] = self._state_pool_free.pop(0)
-            table[i] = (
-                1 + slots[req_id] * n_blocks + torch.arange(n_blocks, dtype=torch.int32)
+            table[i] = 0
+            table[i, :pages] = (
+                1
+                + slots[req_id] * self._state_pool_slot_pages
+                + torch.arange(pages, dtype=torch.int32)
             )
         return table.to(self.device)
 
@@ -8318,7 +8390,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             partial_prefill_req_ids=getattr(
                 self, "_async_partial_prefill_req_ids", set()
             ),
+            logprobs_inputs=self._async_logprobs_inputs,
         )
+        self._async_logprobs_inputs = None
         self.async_execution_buffer["async_output"] = async_output
         return async_output
 
@@ -10553,6 +10627,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.async_execution_buffer["prev_req_ids_ordered"] = list(
                 req_ids_output_copy
             )
+            self._record_last_spec_rows(
+                sampler_output.sampled_token_ids, req_ids_output_copy
+            )
             return model_runner_output
 
         # Not async scheduling, tensor to list conversion
@@ -10740,12 +10817,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         sampling_metadata = self.input_batch.sampling_metadata
 
         if self.use_async_scheduling:
-            if spec_decode_metadata is not None:
-                # Async spec decode: keep the raw rejection-sampler output
-                # (device tensor [bs, num_spec+1]) as-is. Materialization is
-                # deferred to the async output thread in
-                # AsyncNeuronModelRunnerOutput.get_output().
-                return SamplerOutput(model_output_tensor, None)
+            # Keep the sampled tokens (device tensor [bs], or [bs, num_spec+1] from the
+            # rejection sampler) as-is: AsyncNeuronModelRunnerOutput.get_output()
+            # materializes them on the async output thread, and computes the logprobs
+            # from the gathered logits kept here.
+            self._async_logprobs_inputs = self._logprobs_inputs(sampling_metadata)
             return SamplerOutput(model_output_tensor, None)
 
         if spec_decode_metadata is None:
@@ -10818,7 +10894,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     model_output_tensor,
                     self.input_batch.vocab_size,
                 )
-                sampler_output = SamplerOutput(output_token_ids, None)
+                logprobs = None
+                logprobs_inputs = self._logprobs_inputs(sampling_metadata)
+                if logprobs_inputs is not None:
+                    num_reqs = self.input_batch.num_reqs
+                    logprobs = self._sampled_token_logprobs(
+                        model_output_tensor,
+                        *logprobs_inputs,
+                        output_token_ids[:num_reqs],
+                    )
+                sampler_output = SamplerOutput(output_token_ids, logprobs)
                 return sampler_output
 
             # CPU rejection sampling
@@ -10853,6 +10938,58 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             sampler_output.sampled_token_ids = output_token_ids
 
         return sampler_output
+
+    def _logprobs_inputs(self, sampling_metadata) -> tuple[torch.Tensor, int] | None:
+        """(gathered logits, max_num_logprobs) when this step's requests asked for logprobs
+        and the model returned its logits (on-device sampling), else None."""
+        max_num_logprobs = sampling_metadata.max_num_logprobs
+        if max_num_logprobs is None or self._on_device_logits is None:
+            return None
+        return self._on_device_logits, max_num_logprobs
+
+    def _sampled_token_logprobs(
+        self,
+        sampled: torch.Tensor,
+        logits: torch.Tensor,
+        max_num_logprobs: int,
+        emitted: list[list[int]],
+    ) -> LogprobsTensors:
+        """Logprobs of the tokens a step emits, from the model's gathered logits.
+
+        Mirrors vLLM's RejectionSampler (_get_logprobs_tensors + parse_output), and
+        covers plain decode too.
+
+        Args:
+            sampled: Sampled tokens, [bs], or the rejection-sampler output [bs, k + 1]
+                with -1 for rejected positions.
+            logits: Gathered logits of the sampled rows, [bs * width, vocab],
+                request-major (a verify step samples all of its k + 1 rows).
+            max_num_logprobs: Top logprobs per token (-1: the whole vocabulary).
+            emitted: Tokens the step emits per request, without padding rows. A
+                discarded row (partial prefill, skip-emit) is empty and gets none.
+
+        Returns:
+            LogprobsTensors of the emitted tokens, with cu_num_generated_tokens.
+        """
+        sampled = sampled.to("cpu")
+        if sampled.dim() == 1:
+            sampled = sampled.unsqueeze(1)
+        num_reqs, width = len(emitted), sampled.shape[1]
+        sampled = sampled[:num_reqs].to(torch.int64)
+        logits = logits.to("cpu")[: num_reqs * width].to(torch.float32)
+        valid = (sampled != -1) & (sampled < self.input_batch.vocab_size)
+        valid &= torch.tensor([len(t) > 0 for t in emitted]).unsqueeze(1)
+        if self.sampler.logprobs_mode in ("raw_logits", "processed_logits"):
+            logprobs = logits
+        else:
+            logprobs = self.sampler.compute_logprobs(logits)
+        if max_num_logprobs < 0:
+            max_num_logprobs = logprobs.shape[-1]
+        tensors = self.sampler.gather_logprobs(
+            logprobs, max_num_logprobs, torch.where(valid, sampled, 0).reshape(-1)
+        ).filter(valid.reshape(-1))
+        cu = [0, *valid.sum(dim=1).cumsum(dim=0).tolist()]
+        return tensors._replace(cu_num_generated_tokens=cu)
 
     def _parse_rejection_sampling_output(
         self,
@@ -11673,6 +11810,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ]
             self._state_pool_slots: dict[str, int] = {}
             self._state_pool_free = list(range(self.max_num_reqs))
+            # Pages per slot: each request's 1 + num_speculative_blocks state blocks.
+            self._state_pool_slot_pages = 1 + max(
+                (
+                    kv_cache_config.kv_cache_groups[
+                        gi
+                    ].kv_cache_spec.num_speculative_blocks
+                    for gi in self._state_pool_groups
+                ),
+                default=0,
+            )
             self.model.bind_state_cache(state_caches)
             self._setup_kv_block_clearing(kv_cache_config, block_sizes, kv_caches)
             self._setup_mamba_align(kv_cache_config, state_caches)
