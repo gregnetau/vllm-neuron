@@ -596,6 +596,11 @@ class Qwen3_5Attention(nn.Module):
             out = self.tp_group.reduce_scatter(out, dim=0)
         return out.contiguous()
 
+    def _restrict_decode_mask(self, attention_mask, positions, block_size):
+        """Hook for subclasses to restrict the pre-generated decode mask (e.g. to a sparse
+        selection of the cached context); positions [B, S]. Unchanged here."""
+        return attention_mask
+
     def forward_decode(
         self, hidden_states, positions, position_embeddings, attn_metadata
     ):
@@ -634,6 +639,9 @@ class Qwen3_5Attention(nn.Module):
             s_prior=S_ctx,
             start_pos=None,
             block_len=block_size,
+        )
+        attention_mask = self._restrict_decode_mask(
+            attention_mask, positions.view(B, S_decode), block_size
         )
         k_cache = (
             self.k_cache.squeeze(1) if self.k_cache.dim() == 4 and nkh else self.k_cache
@@ -1066,7 +1074,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return False
         if (
             x.shape[0] > max_requests
-        ):  # gdn_decode: B > 1 needs a core barrier around the conv-state update
+        ):  # gdn_decode: B > 1 needs own_conv_rows (qwen4_exp) or a core barrier
             return False
         if not (self.Dk == self.Dv == self._STATE_ROW == self.state_a.shape[-1]):
             return False

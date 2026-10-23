@@ -141,12 +141,35 @@ def _silu(x, n):
 
 @nki.jit
 def gdn_decode_kernel(
-    mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, state_b, slots, eps=1e-6
+    mixed,
+    z,
+    b,
+    a,
+    conv_w,
+    A_log,
+    dt_bias,
+    norm_w,
+    state_a,
+    state_b,
+    slots,
+    eps=1e-6,
+    gate_sigmoid=False,
+    own_conv_rows=False,
 ):
     """mixed [B, C] / z [B, Hv*D] / b, a [B, Hv] (bf16 projections); conv_w [C, K] bf16;
     A_log, dt_bias [Hv] f32; norm_w [D]; state_a/b [P, R, 128] f32 (updated in place);
-    slots [B] int32. Returns (out [B, Hv*D] bf16, state_a, state_b)."""
-    # rev 11: the NKI compile cache keys on this function's source only; bump on helper edits.
+    slots [B] int32 (a negative slot skips that row's page reads and writes; its output row
+    is undefined). The output gate is silu(z), or sigmoid(z) with ``gate_sigmoid``.
+    Returns (out [B, Hv*D] bf16, state_a, state_b).
+
+    Conv-state write-back: by default program 0 writes every conv row of the page. Program 1
+    reads the same rows without synchronisation, so it may see program 0's new rows (only safe
+    for one request, by timing). With ``own_conv_rows`` each program writes only the rows of
+    the channel blocks it uses (q, k of its key heads, v of its value heads; needs
+    Hk % programs == 0), so no row is read by one program and written by the other and B > 1
+    needs no core barrier. Rows of the other program's channels may be read mid-update; they
+    only feed columns this program does not use."""
+    # rev 12: the NKI compile cache keys on this function's source only; bump on helper edits.
     B, C = mixed.shape
     D = norm_w.shape[0]
     Hv = z.shape[1] // D
@@ -164,6 +187,14 @@ def gdn_decode_kernel(
     assert Hv % n_prgs == 0
     hp = Hv // n_prgs
     h0 = prg_id * hp
+    own_runs = []  # [first channel block, count] of this program's q | k | v blocks
+    if own_conv_rows:
+        assert Hk % n_prgs == 0, (
+            "own_conv_rows: key heads must not be shared by programs"
+        )
+        hkp = Hk // n_prgs
+        kh0 = prg_id * hkp
+        own_runs = [[kh0, hkp], [Hk + kh0, hkp], [2 * Hk + h0, hp]]
 
     va = state_a.reshape(
         (P, R * D)
@@ -229,7 +260,7 @@ def gdn_decode_kernel(
         decay = _sb((128, hp))
         nisa.activation(dst=decay, op=nl.exp, data=sp)
         beta = _sigmoid(b_b, hp)
-        zs = _silu(zl, hp)
+        zs = _sigmoid(zl, hp) if gate_sigmoid else _silu(zl, hp)
 
         # ---- causal conv (channels on partitions) + SiLU
         cs_ps = _ps((128, CR))
@@ -249,7 +280,30 @@ def gdn_decode_kernel(
             nisa.tensor_tensor(dst=y, data1=y, data2=t, op=nl.add)
         xs = _silu(y, NCB)
 
-        if prg_id == 0:  # new conv state: drop the oldest tap, append x
+        if own_conv_rows:  # new conv state of this program's channel blocks
+            ncs_blk = _sb((NCB, K - 1, D))  # ncs_blk[f, j, :] = tap j of block f
+            for j in range(K - 1):
+                src = x
+                if j < K - 2:
+                    src = cs[:, (j + 1) * NCB : (j + 2) * NCB]
+                ncs_ps = _ps((NCB, 128))
+                nisa.nc_transpose(dst=ncs_ps, data=src)
+                nisa.tensor_copy(dst=ncs_blk[:, j, :], src=ncs_ps)
+            for ri in range(len(own_runs)):
+                f0 = own_runs[ri][0]
+                n = own_runs[ri][1]
+                nisa.dma_copy(
+                    dst=_page_ap(
+                        conv_view,
+                        slot,
+                        conv_off + f0 * D,
+                        [[D, n], [NCB * D, K - 1], [1, D]],
+                    ),
+                    src=ncs_blk[f0 : f0 + n, :, :],
+                    dge_mode=nisa.dge_mode.hwdge,
+                    oob_mode=oob_mode.skip,
+                )
+        elif prg_id == 0:  # new conv state: drop the oldest tap, append x
             ncs = _sb((128, CR))
             nisa.tensor_copy(
                 dst=ncs[:, 0 : (K - 2) * NCB], src=cs[:, NCB : (K - 1) * NCB]
@@ -374,15 +428,42 @@ def gdn_decode_kernel(
 
 
 def gdn_decode(
-    mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, state_b, slots, eps
+    mixed,
+    z,
+    b,
+    a,
+    conv_w,
+    A_log,
+    dt_bias,
+    norm_w,
+    state_a,
+    state_b,
+    slots,
+    eps,
+    gate_sigmoid=False,
+    own_conv_rows=False,
 ):
-    """Torch entry (inside the compiled graph). Returns out [B, Hv*D]; states updated in place."""
+    """Torch entry (inside the compiled graph). Returns out [B, Hv*D]; states updated in place.
+    ``own_conv_rows``: see gdn_decode_kernel (required for B > 1)."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     out, _, _ = wrap_nki(gdn_decode_kernel)[get_logical_nc_config()](
-        mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, state_a, state_b, slots, eps
+        mixed,
+        z,
+        b,
+        a,
+        conv_w,
+        A_log,
+        dt_bias,
+        norm_w,
+        state_a,
+        state_b,
+        slots,
+        eps,
+        gate_sigmoid=gate_sigmoid,
+        own_conv_rows=own_conv_rows,
     )
     return out
 
