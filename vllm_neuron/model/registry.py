@@ -6,6 +6,7 @@ from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM, PEagleLlamaForCausalLM
 from .qwen3 import DFlashQwen3ForCausalLM, Qwen3ForCausalLM
 from .qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MTP
+from .qwen4_exp import Qwen4ExpForCausalLM, Qwen4ExpMTP
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 from .qwen3_asr import Qwen3ASRForConditionalGeneration
 
@@ -32,6 +33,10 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM),
         ("Qwen3_5ForConditionalGeneration", Qwen3_5ForCausalLM),
         ("Qwen3_5MTP", Qwen3_5MTP),  # MTP head, draft model for speculative decoding
+        # Qwen3.8-Flash-Next (qwen4_exp): GDN + QSA hybrid MoE, text only.
+        ("Qwen4ExpForCausalLM", Qwen4ExpForCausalLM),
+        ("Qwen4ExpForConditionalGeneration", Qwen4ExpForCausalLM),
+        ("Qwen4ExpMTP", Qwen4ExpMTP),  # MTP head, draft model for speculative decoding
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
     ]
 

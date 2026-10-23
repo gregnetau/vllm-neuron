@@ -40,6 +40,13 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 Model recipe for the dense Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet) models on Trn2.
 :::
 
+:::{grid-item-card} Deploy Qwen3.8-Flash-Next
+:link: qwen3-8-flash-next
+:link-type: doc
+
+Model recipe for Qwen3.8-Flash-Next (QSA + Gated DeltaNet hybrid MoE) on Trn2.
+:::
+
 :::{grid-item-card} Deploy Qwen3-Embedding 8B
 :link: qwen3-embedding-8b
 :link-type: doc
@@ -65,6 +72,7 @@ GPT-OSS <gpt-oss>
 Qwen3-32B <qwen3-32b>
 Qwen3-VL <qwen3-vl>
 Qwen3.5 / Qwen3.8 <qwen3-5>
+Qwen3.8-Flash-Next <qwen3-8-flash-next>
 Qwen3-Embedding <qwen3-embedding-8b>
 Qwen3-ASR <qwen3-asr>
 :::
