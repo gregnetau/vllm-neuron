@@ -191,8 +191,8 @@ def moe_tkg(
         )
     else:
         raise NotImplementedError(
-            "moe_tkg only supports uint16 (MXFP4), uint32 (STATIC_MX FP8), or "
-            f"bfloat16 weights, but got {expert_down_weights.dtype=}"
+            "moe_tkg only supports uint16 (MXFP4), uint32 (STATIC_MX FP8), "
+            f"float8_e4m3fn or bfloat16 weights, but got {expert_down_weights.dtype=}"
         )
 
 
@@ -208,9 +208,15 @@ def _can_use_kernel(
 
     Kernel constraints checked:
         - Must be running on Neuron device or CPU with NKI simulator
-        - Must use MXFP4 (uint16), STATIC_MX FP8 (uint32), or BF16 weights
+        - Must use MXFP4 (uint16), STATIC_MX FP8 (uint32), BF16, or float8_e4m3fn weights
+          (static / per-channel FP8 with BF16 activations on Trn2)
     """
     if not can_run_kernel(hidden_input):
         return False
 
-    return expert_down_weights.dtype in (torch.uint16, torch.uint32, torch.bfloat16)
+    return expert_down_weights.dtype in (
+        torch.uint16,
+        torch.uint32,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    )
