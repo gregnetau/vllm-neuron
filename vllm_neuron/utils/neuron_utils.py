@@ -26,9 +26,17 @@ def can_run_kernel(device: torch.Tensor | str = "") -> bool:
 def model_forward_context(
     vllm_config: VllmConfig,
 ) -> contextlib.AbstractContextManager[None]:
-    """Context manager for model forward: skips fail_on_recompile in CPU mode."""
+    """Context manager for model forward: skips fail_on_recompile in CPU mode.
+
+    With VLLM_NEURON_SKIP_GUARD_EVAL=1 it also skips the guards that do not tell the
+    compiled graphs apart (torch's ``skip_guard_eval_unsafe``).
+    """
     if envs.VLLM_NEURON_CPU_MODE and vllm_config.model_config.enforce_eager:
         return contextlib.nullcontext()
+    if envs.VLLM_NEURON_SKIP_GUARD_EVAL:
+        return torch.compiler.set_stance(
+            "fail_on_recompile", skip_guard_eval_unsafe=True
+        )
     return torch.compiler.set_stance("fail_on_recompile")
 
 

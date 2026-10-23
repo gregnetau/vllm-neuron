@@ -29,6 +29,15 @@ from vllm_neuron.model.registry import get_models
 logger = logging.getLogger(__name__)
 
 
+def target_hidden_size_of(model: nn.Module) -> int:
+    """Width of the target hidden state that a draft head reads.
+
+    ``config.hidden_size``, unless the model reports a wider ``mtp_hidden_size`` (e.g. an
+    MTP head that reads a multi-stream residual).
+    """
+    return getattr(model, "mtp_hidden_size", model.config.hidden_size)
+
+
 class EagleProposer:
     def __init__(
         self,
@@ -168,7 +177,7 @@ class EagleProposer:
         assert self.model is not None
         if device is None:
             device = self.device
-        hidden_size = self.model.config.hidden_size
+        hidden_size = target_hidden_size_of(self.model)
 
         # A decode step gives every request one accepted token plus the
         # speculated tokens. A prefill step gives one column. Both the sampled

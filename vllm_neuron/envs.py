@@ -110,6 +110,12 @@ if TYPE_CHECKING:
     VLLM_NEURON_MEGA_SBUF_ALLOC: bool = True
     # Hybrid (recurrent-state) models: keep the state in vLLM's shared KV pool
     VLLM_NEURON_SHARED_STATE_POOL: bool = False
+    # Host-input models (interfaces.HasHostInputs): keep async scheduling (host-token join)
+    VLLM_NEURON_HOST_INPUTS_ASYNC: bool = True
+    # Override the scheduler's worst-case KV concurrency cap
+    VLLM_NEURON_MAX_KV_CONCURRENT: Optional[int] = None
+    # Serving forwards evaluate only the guards that tell the compiled graphs apart
+    VLLM_NEURON_SKIP_GUARD_EVAL: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -550,6 +556,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1 keeps it in vLLM's shared KV pool, as prefix caching does.
     "VLLM_NEURON_SHARED_STATE_POOL": lambda: bool(
         maybe_convert_bool(os.getenv("VLLM_NEURON_SHARED_STATE_POOL"))
+    ),
+    # Models with host inputs keep async scheduling: the runner joins on the previous
+    # step's sampled tokens right before the forward (docs/design/host-inputs.md). 0 turns
+    # async scheduling off for them, as speculative decoding does.
+    "VLLM_NEURON_HOST_INPUTS_ASYNC": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_HOST_INPUTS_ASYNC")) is not False
+    ),
+    # Overrides the scheduler's worst-case KV concurrency cap (KV tokens // max_model_len).
+    # Requests that outgrow the KV cache are then preempted and recomputed.
+    "VLLM_NEURON_MAX_KV_CONCURRENT": lambda: maybe_convert_int(
+        os.getenv("VLLM_NEURON_MAX_KV_CONCURRENT")
+    ),
+    # 1: serving forwards run under torch.compile's skip_guard_eval_unsafe stance, which
+    # evaluates only the guards that tell the warmed-up graphs apart (the ones that failed at
+    # least once). Every forward otherwise checks every guard of the graphs it tries, about
+    # one per graph input (weights included), on the step's critical path. Unsafe in
+    # torch's sense: it relies on warmup having compiled every graph a serving step can
+    # take, which fail_on_recompile already demands.
+    "VLLM_NEURON_SKIP_GUARD_EVAL": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_GUARD_EVAL"))
     ),
 }
 

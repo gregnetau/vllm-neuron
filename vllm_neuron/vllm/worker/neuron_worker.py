@@ -1452,7 +1452,16 @@ class NeuronWorker(WorkerBase):
                 "Dedicated recurrent-state pools: %.2f GiB per rank (outside the KV cache)",
                 state_pool / (1024**3),
             )
-        return max(available - state_pool, 0)
+        available = max(available - state_pool, 0)
+        # Model side caches allocated per attention KV byte (e.g. the QSA indexer keys).
+        side_ratio = self.model_runner.kv_side_cache_ratio()
+        if side_ratio:
+            logger.info(
+                "Model side caches: %.3f bytes per KV-cache byte (outside the KV cache)",
+                side_ratio,
+            )
+            available = int(available / (1.0 + side_ratio))
+        return available
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """
@@ -1849,15 +1858,19 @@ class NeuronWorker(WorkerBase):
 
         jobs: list[tuple] = []
         for bucket_size, kv_seg_size in sorted(buckets, reverse=True):
-            model_input = self.model_runner._build_prefill_synthetic_inputs(
-                bucket_size, kv_seg_size, device=device
-            )
-            jobs.append(
-                self._build_trace_job(
-                    model_input,
-                    native_compile_only=native_compile_only,
+            # Models with ``prefill_dense_context`` also get the trimmed-table variant.
+            for dense_ctx in self.model_runner.prefill_ctx_variants(
+                kv_seg_size, bucket_size
+            ):
+                model_input = self.model_runner._build_prefill_synthetic_inputs(
+                    bucket_size, kv_seg_size, device=device, dense_ctx=dense_ctx
                 )
-            )
+                jobs.append(
+                    self._build_trace_job(
+                        model_input,
+                        native_compile_only=native_compile_only,
+                    )
+                )
         return jobs
 
     def _build_decode_trace_jobs(
