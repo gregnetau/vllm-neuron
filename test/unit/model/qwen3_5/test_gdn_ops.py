@@ -109,6 +109,18 @@ def test_gated_rmsnorm_matches_hf(gdn_ops):
     )
 
 
+def test_gated_rmsnorm_sigmoid_gate_matches_hf(gdn_ops):
+    """``gate_act="sigmoid"`` (Qwen3.8-Flash-Next ``output_gate_type``) vs the HF gated norm."""
+    q4 = pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
+    x, gate = torch.randn(9, DV), torch.randn(9, DV)
+    norm = q4.Qwen4ExpTextRMSNormGated(DV, eps=1e-6, activation="sigmoid")
+    norm.weight.data = torch.rand(DV) + 0.5
+    torch.testing.assert_close(
+        gdn_ops.gated_rmsnorm(x, gate, norm.weight.data, 1e-6, gate_act="sigmoid"),
+        norm(x, gate),
+    )
+
+
 def test_layer_reference_matches_hf_with_chunked_prefill_then_decode(gdn_ops):
     """End-to-end GDN block: chunked prefill (2 pieces) + token decode == HF full forward."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig

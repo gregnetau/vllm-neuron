@@ -193,14 +193,20 @@ def chunk_gated_delta_rule(
 
 
 def gated_rmsnorm(
-    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gate_act: str = "silu",
 ) -> torch.Tensor:
-    """Per-head RMSNorm (plain ``weight``, not zero-centered) times SiLU(gate)."""
+    """Per-head RMSNorm (plain ``weight``, not zero-centered) times act(gate), act = SiLU
+    (Qwen3.5) or sigmoid (Qwen3.8-Flash-Next, ``output_gate_type="sigmoid"``)."""
     dtype = x.dtype
     x32 = x.float()
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
     x = weight * x32.to(dtype)
-    return (x * F.silu(gate.float())).to(dtype)
+    act = torch.sigmoid if gate_act == "sigmoid" else F.silu
+    return (x * act(gate.float())).to(dtype)
 
 
 def gdn_layer_reference(
