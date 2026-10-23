@@ -616,6 +616,46 @@ class NeuronPlatform(Platform):
             )
 
     @classmethod
+    def _configure_host_input_models(cls, vllm_config: "VllmConfig") -> None:
+        """Pick the scheduling mode for models with host inputs (interfaces.HasHostInputs).
+
+        The host builds these inputs from the true current tokens every step. Under async
+        scheduling the V1 runner prepares each step ahead and joins on the previous step's
+        sampled tokens right before the forward (``NeuronModelRunner._host_input_join``).
+        The join covers non-speculative decoding only. So async scheduling is turned off
+        when speculative decoding is configured, or when VLLM_NEURON_HOST_INPUTS_ASYNC=0.
+        VllmConfig resolves ``async_scheduling`` (None -> True) before this hook runs, so
+        set it here; the scheduler class choice below then picks the synchronous
+        NeuronScheduler.
+        """
+        from vllm_neuron import envs
+        from vllm_neuron.model.interfaces import HasHostInputs
+
+        if not cls._model_cls_implements(vllm_config.model_config, HasHostInputs):
+            return
+        scheduler_config = vllm_config.scheduler_config
+        if not scheduler_config.async_scheduling:
+            return
+        if vllm_config.speculative_config is not None:
+            reason = "speculative decoding is configured"
+        elif not envs.VLLM_NEURON_HOST_INPUTS_ASYNC:
+            reason = "VLLM_NEURON_HOST_INPUTS_ASYNC=0"
+        else:
+            logger.info(
+                "%s takes host inputs built from the current tokens every step; async "
+                "scheduling joins on the sampled tokens before each forward.",
+                ", ".join(sorted(vllm_config.model_config.architectures or [])),
+            )
+            return
+        logger.info(
+            "%s takes host inputs built from the current tokens every step; async "
+            "scheduling is turned off (%s).",
+            ", ".join(sorted(vllm_config.model_config.architectures or [])),
+            reason,
+        )
+        scheduler_config.async_scheduling = False
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Configure vLLM for vLLM Neuron platform."""
         from vllm_neuron.vllm.model_runner_v2_policy import (
@@ -778,6 +818,7 @@ class NeuronPlatform(Platform):
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
         cls._configure_stateful_models(vllm_config)
+        cls._configure_host_input_models(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         # TODO: Implement a CPU fallback based on the value from DeviceConfig

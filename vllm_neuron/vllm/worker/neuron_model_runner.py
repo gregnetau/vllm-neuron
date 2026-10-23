@@ -96,7 +96,7 @@ from vllm_neuron.metrics import (
     MODEL_LOAD_TIME,
     NEFF_EXECUTION_COUNT,
 )
-from vllm_neuron.model.interfaces import SupportsMRoPE
+from vllm_neuron.model.interfaces import HasHostInputs, SupportsMRoPE
 from vllm_neuron.model.kv_cache import KeyOnlyAttentionSpec
 from vllm_neuron.model.neuron_config import (
     NeuronConfig,
@@ -104,7 +104,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
-from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.eagle import EagleProposer, target_hidden_size_of
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     SUPPORTED_KV_SEGMENT_SIZES,
@@ -392,6 +392,133 @@ def _supports_async_reorder(model: Any) -> bool:
     """
     model = getattr(model, "_orig_mod", model)
     return getattr(model, "supports_async_reorder", False) is True
+
+
+HostInputSpecs = dict[str, tuple[tuple[int, ...], torch.dtype]]
+
+
+def _host_input_specs_of(model: Any) -> HostInputSpecs | None:
+    """Return the ``HasHostInputs`` specs of a loaded model, or None without the capability.
+
+    ``torch.compile`` wraps the module, so test the original. The spec-decode decorator
+    patches ``forward`` on the class, so the module itself is the model instance.
+
+    Args:
+        model: The loaded model, wrapped or unwrapped.
+
+    Returns:
+        A copy of kwarg name -> (per-token trailing shape, dtype), or None.
+    """
+    model = getattr(model, "_orig_mod", model)
+    if model is None or not isinstance(model, HasHostInputs):
+        return None
+    return {
+        name: (tuple(int(d) for d in shape), dtype)
+        for name, (shape, dtype) in model.host_input_specs().items()
+    }
+
+
+def host_input_req_rows(
+    num_real_tokens: np.ndarray, num_pad_tokens: np.ndarray, num_rows: int
+) -> np.ndarray:
+    """Map each row of the padded token layout to its ``input_batch`` row.
+
+    Request ``i`` (``input_batch`` row ``i``) owns ``num_real_tokens[i]`` rows followed by
+    ``num_pad_tokens[i]`` padding rows (prefill bucket padding). Rows past the last
+    request (decode batch padding, mixed-spec padding, DP padding) are padding too.
+
+    Args:
+        num_real_tokens: [num_reqs] scheduled (unpadded) token count per request.
+        num_pad_tokens: [num_reqs] per-request padding rows appended after the real ones.
+        num_rows: Total row count T of the padded ``input_ids``.
+
+    Returns:
+        [T] int64: the ``input_batch`` row of each token, -1 on padding rows.
+
+    Examples:
+        >>> host_input_req_rows(np.array([2, 1]), np.array([1, 0]), 6).tolist()
+        [0, 0, -1, 1, -1, -1]
+    """
+    num_real = np.asarray(num_real_tokens, dtype=np.int64)
+    num_pad = np.asarray(num_pad_tokens, dtype=np.int64)
+    num_reqs = num_real.shape[0]
+    req_ids = np.arange(num_reqs, dtype=np.int64)
+    # Interleave [real_0, pad_0, real_1, pad_1, ...] segments.
+    seg_vals = np.stack([req_ids, np.full(num_reqs, -1, dtype=np.int64)], 1).reshape(-1)
+    seg_lens = np.stack([num_real, num_pad], 1).reshape(-1)
+    rows = np.repeat(seg_vals, seg_lens)
+    if rows.shape[0] > num_rows:
+        raise ValueError(
+            f"Host-input layout has {rows.shape[0]} rows, more than the {num_rows} "
+            "padded input_ids rows."
+        )
+    return np.concatenate([rows, np.full(num_rows - rows.shape[0], -1, dtype=np.int64)])
+
+
+def host_input_zero_kwargs(
+    specs: HostInputSpecs | None, num_tokens: int, device: torch.device | str
+) -> dict[str, torch.Tensor]:
+    """Zero-filled host inputs ``[num_tokens, *shape]`` for warmup, capture and dummy runs.
+
+    Returns an empty dict when ``specs`` is None, so a model without the capability gets
+    no extra kwargs.
+    """
+    if not specs:
+        return {}
+    return {
+        name: torch.zeros((num_tokens, *shape), dtype=dtype, device=device)
+        for name, (shape, dtype) in specs.items()
+    }
+
+
+def build_step_host_inputs(
+    model: Any,
+    specs: HostInputSpecs,
+    input_ids: np.ndarray,
+    req_rows: np.ndarray,
+    positions: np.ndarray,
+    token_ids_cpu: np.ndarray,
+) -> dict[str, torch.Tensor]:
+    """Call ``build_host_inputs`` and check its result against the declared specs.
+
+    Padding rows (``req_rows == -1``) get position 0. A wrong name, shape or dtype raises
+    here, on the host, instead of tracing a new graph or failing a compiled-graph guard.
+
+    Args:
+        model: The loaded model, wrapped or unwrapped.
+        specs: The model's ``host_input_specs()``.
+        input_ids: [T] padded token ids.
+        req_rows: [T] ``input_batch`` row per token, -1 on padding rows.
+        positions: [T] absolute position per token.
+        token_ids_cpu: ``input_batch.token_ids_cpu``.
+
+    Returns:
+        name -> CPU tensor ``[T, *shape]``.
+    """
+    model = getattr(model, "_orig_mod", model)
+    req_rows = np.asarray(req_rows, dtype=np.int64)
+    positions = np.where(req_rows >= 0, np.asarray(positions, dtype=np.int64), 0)
+    input_ids = np.asarray(input_ids).astype(np.int64, copy=False)
+    num_tokens = input_ids.shape[0]
+    if req_rows.shape != (num_tokens,) or positions.shape != (num_tokens,):
+        raise ValueError(
+            f"Host-input rows mismatch: input_ids {input_ids.shape}, req_rows "
+            f"{req_rows.shape}, positions {positions.shape}."
+        )
+    out = model.build_host_inputs(input_ids, req_rows, positions, token_ids_cpu)
+    if set(out) != set(specs):
+        raise ValueError(
+            f"build_host_inputs returned {sorted(out)}, host_input_specs declares "
+            f"{sorted(specs)}."
+        )
+    for name, (shape, dtype) in specs.items():
+        tensor = out[name]
+        if tuple(tensor.shape) != (num_tokens, *shape) or tensor.dtype != dtype:
+            raise ValueError(
+                f"Host input {name!r}: got {tuple(tensor.shape)} {tensor.dtype}, "
+                f"expected {(num_tokens, *shape)} {dtype}."
+            )
+    return out
 
 
 def _supports_aux_hidden_states(model: Any) -> bool:
@@ -828,6 +955,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # first use, since a mutable class attribute would be shared between runners.
     _async_reorder_kwargs: dict | None = None
     _model_supports_async_reorder: bool | None = None
+    # interfaces.HasHostInputs: the specs resolve on first use after the model loads (the
+    # flag records whether they did; None specs mean no capability). The current step's CPU
+    # host inputs are set by _prepare_model_input and consumed by _execute_model_forward.
+    _host_input_specs_resolved: bool = False
+    _host_input_specs_cache: "HostInputSpecs | None" = None
+    _current_host_inputs: "dict[str, torch.Tensor] | None" = None
+    # Async scheduling with host inputs (the host-token join, see _host_input_join): the
+    # step's padded (req_rows, positions), recorded by _set_step_host_inputs and consumed
+    # at the join; and the async outputs whose sampled tokens this rank has not yet written
+    # into the InputBatch, oldest first.
+    _pending_host_input_rows: "tuple[np.ndarray, np.ndarray] | None" = None
+    _host_join_pending_outputs: "list | None" = None
+    # (sampling_metadata, key, device tensor) of the last on-device sampling params.
+    _sampling_params_cache: "tuple | None" = None
+    # Per KV-cache group device tensors reused while their inputs are unchanged:
+    # group id -> (source, key, tensor[, tensor]). See _full_block_table_clone,
+    # _bucketed_block_table and _state_pool_table.
+    _full_block_table_clones: "dict | None" = None
+    _bucketed_block_tables: "dict | None" = None
+    _state_pool_table_cache: "dict | None" = None
     _block_table_groups: "dict[int, _BlockTableGroupState] | None" = None
     _constant_tensors: "dict[tuple, torch.Tensor] | None" = None
     _swa_groups: "dict[int, _SwaGroupState] | None" = None
@@ -2304,7 +2451,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logger.info("Spec decode enabled. Loading draft model ...")
             # TODO: model loading logic could be extracted
             # Pass target model's padded hidden_size to draft model
-            target_hidden_size = self.model.config.hidden_size
+            target_hidden_size = target_hidden_size_of(self.model)
             # Layout of that padded hidden dim. A target that deinterleaves the
             # padded axis reports its group count; the default 1 means the
             # padding sits at the tail.
@@ -2964,6 +3111,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return real
         return _state_page_layout(spec.shapes, spec.dtypes), spec.page_size_bytes
 
+    def kv_side_cache_ratio(self) -> float:
+        """Bytes the model allocates outside the KV pool per byte of attention KV cache.
+
+        A model with a side cache per attention layer, addressed by that layer's block ids
+        (e.g. a sparse-attention indexer's keys), reports its bytes per cached token with
+        ``kv_side_bytes_per_token_per_attn_layer``. The ratio is that over one layer's
+        attention K/V bytes per token, 0 without the hook. The worker divides the KV budget
+        by 1 + ratio so the side caches fit next to the KV cache.
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        side = getattr(model, "kv_side_bytes_per_token_per_attn_layer", 0)
+        if not side:
+            return 0.0
+        for spec in self.get_kv_cache_spec().values():
+            if isinstance(spec, FullAttentionSpec) and not isinstance(
+                spec, MLAAttentionSpec
+            ):
+                return side / (spec.page_size_bytes / spec.block_size)
+        return 0.0
+
     def state_pool_bytes(self) -> int:
         """HBM per rank of the dedicated recurrent-state pools (0 without any), to keep out of
         the KV cache budget."""
@@ -2973,18 +3140,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 total += self._state_pool_pages(spec) * self._state_page(name, spec)[1]
         return total
 
-    def _state_pool_table(self, padded_num_reqs: int, n_blocks: int) -> torch.Tensor:
+    def _state_pool_table(
+        self, padded_num_reqs: int, n_blocks: int, group_id: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """[padded_num_reqs, n_blocks] dedicated-pool pages of each request's state blocks
         (-1 for padded rows). A request keeps its slot (pages 1 + slot * n_blocks + j) from
         its first step until it finishes or is preempted (_release_state_pool_slots); running
         requests can be out of the persistent batch for a step (e.g. during another request's
-        prefill) and keep their state."""
+        prefill) and keep their state.
+
+        Returns two distinct device tensors with the same contents, the table and its
+        "full" copy (torch.compile rejects one tensor bound to two graph inputs). The table
+        depends only on the shape and each row's slot, so with ``group_id`` the pair is
+        reused while those stay the same: one pair per group, because each group's table is
+        its own graph input. The graph only reads them."""
         slots = self._state_pool_slots
         for req_id in [r for r in slots if r not in self.requests]:
             self._state_pool_free.append(slots.pop(req_id))
-        table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
-        for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
+        row_slots = []
+        for req_id in self.input_batch.req_ids[:padded_num_reqs]:
             if req_id is None:
+                row_slots.append(-1)
                 continue
             if req_id not in slots:
                 if not self._state_pool_free:
@@ -2992,10 +3168,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "Recurrent-state pool exhausted: more live requests than max_num_seqs"
                     )
                 slots[req_id] = self._state_pool_free.pop(0)
-            table[i] = (
-                1 + slots[req_id] * n_blocks + torch.arange(n_blocks, dtype=torch.int32)
+            row_slots.append(slots[req_id])
+        signature = (padded_num_reqs, n_blocks, tuple(row_slots))
+        cache = self._state_pool_table_cache
+        if group_id is not None and cache is not None:
+            hit = cache.get(group_id)
+            if hit is not None and hit[0] == signature:
+                return hit[1], hit[2]
+        table = np.full((padded_num_reqs, n_blocks), -1, dtype=np.int32)
+        if row_slots:
+            slot_arr = np.asarray(row_slots, dtype=np.int32)
+            pages = (
+                1 + slot_arr[:, None] * n_blocks + np.arange(n_blocks, dtype=np.int32)
             )
-        return table.to(self.device)
+            rows = table[: len(row_slots)]
+            np.copyto(rows, pages, where=(slot_arr >= 0)[:, None])
+        host = torch.from_numpy(table)
+        pair = (host.to(self.device), host.clone().to(self.device))
+        if group_id is not None:
+            if self._state_pool_table_cache is None:
+                self._state_pool_table_cache = {}
+            self._state_pool_table_cache[group_id] = (signature, *pair)
+        return pair
 
     def _release_state_pool_slots(self, scheduler_output: "SchedulerOutput") -> None:
         """Free the state-pool slots of finished and preempted requests (a preempted request
@@ -4223,6 +4417,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         spec_decode_metadata = None
         self._jf_active_tokens = jf_tokens
 
+        # Host inputs (interfaces.HasHostInputs): the real JF columns belong to their
+        # request; PAD columns and padded requests are padding rows.
+        if self._host_input_specs():
+            req_rows_np = np.where(real_mask_np, req_indices_np, -1)
+            self._set_step_host_inputs(input_ids, req_rows_np, cache_positions)
+        else:
+            self._current_host_inputs = None
+
         # Clear leftover prompt embeddings
         self._current_inputs_embeds = None
         self._current_is_token_ids = None
@@ -4610,6 +4812,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            dense_prefill=True,
         )
 
         # Spec decoding
@@ -4699,6 +4902,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rotary_position_ids=rotary_position_ids,
         )
 
+        # Host inputs (interfaces.HasHostInputs) for the final padded layout: each request's
+        # real tokens, then its prefill padding (padding_map), then the decode/DP padding
+        # that _pad_to_compiled_shapes appended. Spec-verify rows are real rows of their
+        # request at positions num_computed + j.
+        if self._host_input_specs():
+            num_pad_tokens = np.array(
+                [padding_map.get(req_id, 0) for req_id in req_ids], dtype=np.int64
+            )
+            self._set_step_host_inputs(
+                input_ids,
+                host_input_req_rows(
+                    actual_num_tokens, num_pad_tokens, input_ids.shape[0]
+                ),
+                cache_positions,
+            )
+        else:
+            self._current_host_inputs = None
+
         # Multimodal path: gather encoder embeddings from on-device encoder cache.
         # Only during prefill — decode NEFF has no encoder inputs
         # (encoder contributions are already in KV cache from prefill).
@@ -4763,6 +4984,62 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rotary_position_ids,
             mm_kwargs,
         )
+
+    def _sampling_params_device_tensor(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor:
+        """The step's on-device sampling params ``[rows, 3]`` (top_k, top_p, temperature).
+
+        Built by ``build_sampling_params_tensor``, padded with neutral rows to the decode
+        bucket (the block-table rows) and replicated for a spec-decode verify step. The
+        result depends only on the InputBatch's sampling metadata, the request count, the
+        bucket and the verify flag. The InputBatch replaces ``sampling_metadata`` with a new
+        object whenever its sampling tensors change (``refresh_metadata``), so the device
+        tensor is reused while that object, the request count and the shape stay the same.
+        The graph only reads the tensor, so an earlier step still in flight may share it.
+        """
+        sampling_metadata = self.input_batch.sampling_metadata
+        num_reqs = self.input_batch.num_reqs
+        bt_rows = 0
+        if attn_metadata:
+            first_meta = next(iter(attn_metadata.values()))
+            bt_rows = first_meta["block_table_tensor"].shape[0]
+        key = (num_reqs, bt_rows, spec_decode_metadata is None)
+        cached = self._sampling_params_cache
+        if cached is not None and cached[0] is sampling_metadata and cached[1] == key:
+            return cached[2]
+
+        sampling_params_tensor = build_sampling_params_tensor(
+            sampling_metadata, num_reqs, self.device
+        )
+
+        # Pad sampling_params to match the decode batch bucket size.
+        # block_table rows == padded_num_reqs (1 token per request),
+        # but num_reqs may be smaller before padding.
+        if sampling_params_tensor.shape[0] < bt_rows:
+            # Padded rows get neutral sampling params (top_k=-1, top_p=1, temperature 0)
+            # rather than top_k = top_p = 0.
+            pad_rows = bt_rows - sampling_params_tensor.shape[0]
+            pad = torch.tensor(
+                [[-1.0, 1.0, 0.0]] * pad_rows,
+                dtype=sampling_params_tensor.dtype,
+                device=sampling_params_tensor.device,
+            )
+            sampling_params_tensor = torch.cat([sampling_params_tensor, pad], dim=0)
+
+        # Replicate sampling params for spec-decode verify step
+        # (no-op when speculative decoding is not active).
+        sampling_params_tensor = self._maybe_replicate_for_spec_decode(
+            sampling_params_tensor, spec_decode_metadata
+        )
+
+        sampling_params_tensor = sampling_params_tensor.to(self.device)
+        # Hold the metadata object itself: an identity check on a live object cannot
+        # match a later object that reuses a freed id.
+        self._sampling_params_cache = (sampling_metadata, key, sampling_params_tensor)
+        return sampling_params_tensor
 
     def _maybe_replicate_for_spec_decode(
         self,
@@ -5862,6 +6139,49 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ctx_for_blocks = ctx_bucket if ctx_bucket is not None else self.max_model_len
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
+    def _full_block_table_clone(
+        self, group_id: int, source: Any, blk_table_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """Device clone of a group's block table, reused while the table is unchanged.
+
+        ``source`` is the group's whole device block table (``block_table.gpu``), which
+        ``_save_block_table_to_device`` replaces with a new tensor whenever the host table
+        changes and never writes in place. The clone is therefore valid while ``source`` is
+        the same object and the row count is the same. One clone per group, because each
+        group's clone is its own graph input.
+        """
+        if self._full_block_table_clones is None:
+            self._full_block_table_clones = {}
+        key = tuple(blk_table_tensor.shape)
+        hit = self._full_block_table_clones.get(group_id)
+        if hit is not None and hit[0] is source and hit[1] == key:
+            return hit[2]
+        clone = blk_table_tensor.clone()
+        self._full_block_table_clones[group_id] = (source, key, clone)
+        return clone
+
+    def _bucketed_block_table(
+        self,
+        group_id: int,
+        source: Any,
+        blk_table_tensor: torch.Tensor,
+        bucket_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """``index_select(blk_table_tensor, 1, bucket_idx)``, reused while unchanged.
+
+        Valid while the group's whole device table (``source``, replaced and never written
+        in place) is the same object and the row count and bucket are the same.
+        """
+        if self._bucketed_block_tables is None:
+            self._bucketed_block_tables = {}
+        key = (tuple(blk_table_tensor.shape), int(bucket_idx.shape[0]))
+        hit = self._bucketed_block_tables.get(group_id)
+        if hit is not None and hit[0] is source and hit[1] == key:
+            return hit[2]
+        table = torch.index_select(blk_table_tensor, 1, bucket_idx)
+        self._bucketed_block_tables[group_id] = (source, key, table)
+        return table
+
     def _build_attention_metadata(
         self,
         padded_num_reqs: int,
@@ -5870,6 +6190,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        dense_prefill: bool = False,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -5884,6 +6205,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 slots (already MAX-reduced via `_get_dp_padding`). Drives the
                 `decode_context_length_buckets` pick for non-SWA decode
                 groups; ignored when bucketing is unset or the group is SWA.
+            dense_prefill: Allow the trimmed-table prefill variant of a model
+                with ``prefill_dense_context`` (``_select_prefill_dense``).
 
         Returns:
             AttentionMetadata object or None for simplified cases
@@ -5908,7 +6231,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # always traces with two distinct tensors. For SWA models, the
             # clone is also necessary because ``blk_table_tensor`` gets
             # reassigned to a trimmed view below.
-            full_blk_table_tensor = blk_table_tensor.clone()
+            full_blk_table_tensor = self._full_block_table_clone(
+                kv_cache_group_id, blk_table.block_table.gpu, blk_table_tensor
+            )
             # for dcp, slot mapping would set the slot for non-owned tokens to NULL_BLOCK_ID
             # A prefix upload sizes the device tensor for the token count of its own call
             # site. Another caller can ask for more tokens, because the jump-forward branch
@@ -5963,6 +6288,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_segment_size_buckets=(
                         self.neuron_config.kv_segment_size_buckets
                     ),
+                )
+            use_dense = False
+            if dense_prefill and not is_decode:
+                use_dense, kv_segment_size = self._select_prefill_dense(
+                    cached_seq_len + total_num_scheduled_tokens, kv_segment_size
                 )
 
             swa_kv_pos_offset = None
@@ -6040,8 +6370,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         ("bucket_idx", bucket_blocks),
                         lambda: torch.arange(bucket_blocks, device=self.device),
                     )
-                    blk_table_tensor = torch.index_select(
-                        blk_table_tensor, 1, bucket_idx
+                    blk_table_tensor = self._bucketed_block_table(
+                        kv_cache_group_id,
+                        blk_table.block_table.gpu,
+                        blk_table_tensor,
+                        bucket_idx,
                     )
                 swa_kv_pos_offset = self._cached_constant_tensor(
                     ("swa_kv_pos_offset", kv_cache_group_id, padded_num_reqs),
@@ -6050,6 +6383,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     ),
                 )
 
+            dense_blocks = (
+                self._prefill_dense_ctx_blocks(block_size) if use_dense else None
+            )
+            if (
+                dense_blocks is not None
+                and dense_blocks < blk_table_tensor.shape[1]
+                and not isinstance(spec, MambaSpec)
+            ):
+                # Model opt-in: the whole context fits the model's dense-path limit, so
+                # pass the trimmed table (same shape as the warmed dense variant).
+                dense_idx = self._cached_constant_tensor(
+                    ("bucket_idx", dense_blocks),
+                    lambda: torch.arange(dense_blocks, device=self.device),
+                )
+                blk_table_tensor = torch.index_select(blk_table_tensor, 1, dense_idx)
+
             state_in = None
             if kv_cache_group_id in getattr(self, "_mamba_spec_groups", ()):
                 state_in = torch.zeros(padded_num_reqs, dtype=torch.int32)
@@ -6057,10 +6406,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     state_in[i] = self._mamba_state_in.get(req_id, 0)
                 state_in = state_in.to(self.device)
             if kv_cache_group_id in getattr(self, "_state_pool_groups", ()):
-                blk_table_tensor = self._state_pool_table(
-                    padded_num_reqs, blk_table_tensor.shape[1]
+                blk_table_tensor, full_blk_table_tensor = self._state_pool_table(
+                    padded_num_reqs, blk_table_tensor.shape[1], kv_cache_group_id
                 )
-                full_blk_table_tensor = blk_table_tensor.clone()
             if kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
                 # Align mode: the running state's block only; token validity from the
                 # attention group's slots (state blocks before it may be the null block).
@@ -6101,6 +6449,100 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def _prefill_dense_context(self) -> int | None:
+        """The model's ``prefill_dense_context`` opt-in, or None without it.
+
+        Prefill steps whose whole context (cached + padded chunk) is at most this many
+        tokens get their attention block tables trimmed to it, so the model can choose a
+        cheaper path from the static shape (e.g. a sparse attention that selects every
+        block below some context). Every prefill target is then compiled in both variants.
+        Off with context parallelism.
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        ctx = getattr(model, "prefill_dense_context", None)
+        if not ctx or self.cp_world_size > 1:
+            return None
+        return int(ctx)
+
+    def _select_prefill_dense(
+        self, padded_ctx_len: int, kv_segment_size: int
+    ) -> tuple[bool, int]:
+        """Pick the dense prefill variant for a prefill step.
+
+        The trimmed table must cover the cached prefix plus the whole padded chunk (the
+        segmented kernel reads the chunk's K/V through it) and a whole KV segment, so a
+        larger segment moves down to the largest segment bucket within the dense context.
+
+        Args:
+            padded_ctx_len: Cached tokens plus the padded chunk.
+            kv_segment_size: The segment size picked for the step (0: full prefill).
+
+        Returns:
+            ``(use_dense, kv_segment_size)``.
+        """
+        dense_ctx = self._prefill_dense_context()
+        if not dense_ctx or padded_ctx_len > dense_ctx:
+            return False, kv_segment_size
+        if kv_segment_size > dense_ctx:
+            fitting = [
+                b for b in self.neuron_config.kv_segment_size_buckets if b <= dense_ctx
+            ]
+            if not fitting:
+                return False, kv_segment_size
+            kv_segment_size = max(fitting)
+        return True, kv_segment_size
+
+    def _prefill_dense_ctx_blocks(self, block_size: int) -> int | None:
+        """Block-table width of the dense prefill variant (aligned like the runtime table)."""
+        ctx = self._prefill_dense_context()
+        if ctx is None:
+            return None
+        alignment = 128 // block_size if block_size <= 128 else 1
+        blocks = -(-ctx // block_size)
+        return -(-blocks // alignment) * alignment
+
+    def prefill_ctx_variants(
+        self, kv_segment_size: int = 0, bucket_size: int = 0
+    ) -> list[bool]:
+        """Prefill graph variants to compile for a target (the ``dense_ctx`` flags).
+
+        ``[False]``, plus ``True`` (trimmed tables) when the model opts in with
+        ``prefill_dense_context`` and both the padded chunk and the KV segment fit the
+        trimmed table (the runtime moves larger segments down to a fitting bucket, see
+        ``_select_prefill_dense``).
+        """
+        ctx = self._prefill_dense_context()
+        fits = ctx and kv_segment_size <= ctx and bucket_size <= ctx
+        return [False, True] if fits else [False]
+
+    def _trim_prefill_metadata_dense(self, attn_metadata: dict) -> dict:
+        """Warmup counterpart of the runtime dense-variant trim."""
+        out = dict(attn_metadata)
+        for group in self.kv_cache_config.kv_cache_groups:
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            # One trimmed dict per group, shared by its layers like the runtime metadata:
+            # dynamo guards on tensor identity (duplicate inputs).
+            trimmed: dict[int, dict] = {}
+            for name in group.layer_names:
+                md = out.get(name)
+                if md is None:
+                    continue
+                if id(md) not in trimmed:
+                    n = self._prefill_dense_ctx_blocks(md["block_size"])
+                    bt = md["block_table_tensor"]
+                    if n is None or n >= bt.shape[1]:
+                        trimmed[id(md)] = md
+                    else:
+                        idx = torch.arange(n, device=bt.device)
+                        trimmed[id(md)] = dict(
+                            md,
+                            block_table_tensor=torch.index_select(bt, 1, idx),
+                            max_blocks_per_seq=n,
+                        )
+                out[name] = trimmed[id(md)]
+        return out
 
     def _build_warmup_attention_metadata(
         self,
@@ -6315,6 +6757,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket_size: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        dense_ctx: bool = False,
     ) -> dict:
         """Build synthetic inputs for prefill warmup.
 
@@ -6323,6 +6766,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size: Size of each KV segment bucket
             device: Override device for synthetic tensors. Defaults to
                 ``self.device``.
+            dense_ctx: Build the trimmed-table variant (``_prefill_dense_context``).
 
         Returns:
             dict: Keyword arguments for self.model() forward call
@@ -6359,6 +6803,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device=device,
             kv_segment_size=kv_segment_size,
         )
+        if dense_ctx:
+            attn_metadata = self._trim_prefill_metadata_dense(attn_metadata)
 
         # Create dummy sampling params for warmup
         dummy_sampling_params = torch.tensor(
@@ -6437,6 +6883,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dtype=torch.bool,
                 device=device,
             )
+        # Host inputs (interfaces.HasHostInputs), zero-filled; {} without the capability.
+        warmup_kwargs.update(self._host_input_warmup_kwargs(num_tokens, device))
         return warmup_kwargs
 
     def extract_prefill_graphs(
@@ -6464,17 +6912,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size,
             kv_segment_size,
         )
-        kwargs = self._build_prefill_synthetic_inputs(
-            bucket_size, kv_segment_size, device=device
-        )
-        try:
-            _ = self.capture_backend_model(**kwargs)
-        except CaptureComplete:
-            logger.debug(
-                "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
-                bucket_size,
-                kv_segment_size,
+        for dense_ctx in reversed(
+            self.prefill_ctx_variants(kv_segment_size, bucket_size)
+        ):
+            kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, device=device, dense_ctx=dense_ctx
             )
+            try:
+                _ = self.capture_backend_model(**kwargs)
+            except CaptureComplete:
+                logger.debug(
+                    "Graph capture for prefill completed: bucket_size=%s, "
+                    "kv_segment_size=%s, dense_ctx=%s",
+                    bucket_size,
+                    kv_segment_size,
+                    dense_ctx,
+                )
 
         # === Draft model graph capture ===
         if self.drafter is not None:
@@ -6554,19 +7007,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size,
             kv_segment_size,
         )
-        warmup_kwargs = self._build_prefill_synthetic_inputs(
-            bucket_size, kv_segment_size
-        )
         compile_start = time.perf_counter()
-        if self._tensor_replacer is not None:
-            set_active_context(
-                self._tensor_replacer.warmup_context(bucket_size, self.device)
+        for dense_ctx in reversed(
+            self.prefill_ctx_variants(kv_segment_size, bucket_size)
+        ):
+            warmup_kwargs = self._build_prefill_synthetic_inputs(
+                bucket_size, kv_segment_size, dense_ctx=dense_ctx
             )
-        model_output = self.model(**warmup_kwargs)
-        if self.use_async_scheduling:
-            self._materialize_warmup_output(model_output)
-        if self._tensor_replacer is not None:
-            set_active_context(None)
+            if self._tensor_replacer is not None:
+                set_active_context(
+                    self._tensor_replacer.warmup_context(bucket_size, self.device)
+                )
+            model_output = self.model(**warmup_kwargs)
+            if self.use_async_scheduling:
+                self._materialize_warmup_output(model_output)
+            if self._tensor_replacer is not None:
+                set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
         bucket_name = f"prefill_s{bucket_size}"
         if kv_segment_size > 0:
@@ -6812,6 +7268,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             )
 
+        # Host inputs (interfaces.HasHostInputs), zero-filled; {} without the capability.
+        decode_warmup_kwargs.update(self._host_input_warmup_kwargs(num_tokens, device))
+
         return decode_warmup_kwargs
 
     def _build_jf_dummy_inputs(
@@ -6888,6 +7347,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dtype=torch.bool,
                 device=device,
             )
+        # Host inputs (interfaces.HasHostInputs), zero-filled; {} without the capability.
+        jf_kwargs.update(self._host_input_warmup_kwargs(jf_num_tokens, device))
         return jf_kwargs
 
     def extract_decode_graphs(
@@ -7225,6 +7686,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     )
                 )
 
+            # Host inputs (interfaces.HasHostInputs), zero-filled; {} without the
+            # capability. Matches _build_jf_dummy_inputs and the runtime JF step.
+            jf_kwargs.update(self._host_input_warmup_kwargs(jf_num_tokens, device))
+
             compile_start = time.perf_counter()
             if self._tensor_replacer is not None:
                 set_active_context(
@@ -7301,6 +7766,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """
         if not self.use_async_scheduling:
             return False
+
+        if self._host_inputs_async():
+            # Host-token join: apply every queued step in order, not only the latest, so
+            # the write cursors stay exact on every rank (see _track_host_join_output).
+            if not self._drain_host_join_outputs():
+                return False
+            logger.debug("Materialized pending async outputs: %s", reason)
+            self._async_output_materialized_this_step = True
+            return True
 
         async_output = self.async_execution_buffer.get("async_output")
         if async_output is None:
@@ -7573,7 +8047,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     has_resumed_request = bool(
                         scheduler_output.scheduled_cached_reqs.resumed_req_ids
                     )
-                    if self._use_async_reorder() and not has_resumed_request:
+                    if self._host_inputs_async():
+                        # Host-token join: the join after _update_states applies the
+                        # queued tokens by request id, so drain here only when
+                        # _update_states would drop a live request's pending token
+                        # (see _host_join_needs_early_drain).
+                        if self._host_join_needs_early_drain(scheduler_output):
+                            self._materialize_pending_async_output(
+                                "batch composition changed"
+                            )
+                        self._batch_composition_changed = True
+                        self._transition_bonus_tensor = None
+                    elif self._use_async_reorder() and not has_resumed_request:
                         # Skip the device-to-host materialize: the in-graph reorder
                         # assembles the input_ids on the device. Keep the flag False so the
                         # execute path builds the reorder inputs. The swap remaps the future
@@ -7714,7 +8199,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Async scheduling: replace CPU-built input_ids with a device tensor
         # assembled from the previous step's NEFF output futures, eliminating
         # the device→host→device roundtrip in steady state.
-        if self.use_async_scheduling:
+        #
+        # A model with host inputs takes neither the swap nor the reorder: its host inputs
+        # need the true tokens on the host anyway, so _execute_model_forward joins on the
+        # previous step's tokens right before the forward and uploads the true input_ids
+        # with the host inputs (_host_input_join).
+        if self.use_async_scheduling and self._host_inputs_async():
+            self._async_reorder_kwargs = None
+            self._async_steps += 1
+        elif self.use_async_scheduling:
             # Build the in-graph reorder inputs for a decode-shape step, so the reorder
             # assembles the input_ids on the device.
             #
@@ -8320,6 +8813,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ),
         )
         self.async_execution_buffer["async_output"] = async_output
+        if self._host_inputs_async():
+            self._track_host_join_output(async_output)
         return async_output
 
     @staticmethod
@@ -9331,8 +9826,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions,
             )
 
-        # Move inputs to Neuron device
-        input_ids = input_ids.to(self.device)
+        # Move inputs to Neuron device. With the host-token join (async scheduling with
+        # host inputs) input_ids are uploaded at the join, after the true tokens are known.
+        host_join = self._host_inputs_async()
+        if not host_join:
+            input_ids = input_ids.to(self.device)
         positions = positions.to(self.device)
         logits_indices = logits_indices.to(self.device)
         if spec_decode_metadata is not None:
@@ -9360,39 +9858,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Prepare sampling params tensor for on-device sampling
         sampling_params_tensor = None
         if self.on_device_sampling:
-            sampling_metadata = self.input_batch.sampling_metadata
-            num_reqs = self.input_batch.num_reqs
-
-            sampling_params_tensor = build_sampling_params_tensor(
-                sampling_metadata, num_reqs, self.device
+            sampling_params_tensor = self._sampling_params_device_tensor(
+                attn_metadata, spec_decode_metadata
             )
-
-            # Pad sampling_params to match the decode batch bucket size.
-            # block_table rows == padded_num_reqs (1 token per request),
-            # but num_reqs may be smaller before padding.
-            if attn_metadata:
-                first_meta = next(iter(attn_metadata.values()))
-                bt_rows = first_meta["block_table_tensor"].shape[0]
-                if sampling_params_tensor.shape[0] < bt_rows:
-                    # Padded rows get neutral sampling params (top_k=-1, top_p=1, temperature 0)
-                    # rather than top_k = top_p = 0.
-                    pad_rows = bt_rows - sampling_params_tensor.shape[0]
-                    pad = torch.tensor(
-                        [[-1.0, 1.0, 0.0]] * pad_rows,
-                        dtype=sampling_params_tensor.dtype,
-                        device=sampling_params_tensor.device,
-                    )
-                    sampling_params_tensor = torch.cat(
-                        [sampling_params_tensor, pad], dim=0
-                    )
-
-            # Replicate sampling params for spec-decode verify step
-            # (no-op when speculative decoding is not active).
-            sampling_params_tensor = self._maybe_replicate_for_spec_decode(
-                sampling_params_tensor, spec_decode_metadata
-            )
-
-            sampling_params_tensor = sampling_params_tensor.to(self.device)
 
         # Execute model on Neuron device (compiled with vllm_neuron backend)
         model_kwargs = {
@@ -9439,6 +9907,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Multimodal kwargs (encoder_embedding_buffer + encoder_block_ids + encoder_positions)
         if mm_kwargs:
             model_kwargs.update(mm_kwargs)
+
+        # Host inputs (interfaces.HasHostInputs), built on the host by _prepare_model_input,
+        # or at the host-token join under async scheduling. Keep the join last before the
+        # forward: everything above is prepared while the previous step still runs.
+        if host_join:
+            input_ids_cpu, host_inputs = self._host_input_join(input_ids)
+            input_ids = input_ids_cpu.to(self.device)
+            model_kwargs["input_ids"] = input_ids
+            for name, tensor in host_inputs.items():
+                model_kwargs[name] = tensor.to(self.device)
+        elif self._current_host_inputs:
+            for name, tensor in self._current_host_inputs.items():
+                model_kwargs[name] = tensor.to(self.device)
+            self._current_host_inputs = None
+        elif self._host_input_specs():
+            raise RuntimeError(
+                "The model takes host inputs, but this step's input preparation built "
+                "none. Each input path must call _set_step_host_inputs."
+            )
 
         # Text prompt_embeds kwargs (inputs_embeds + is_token_ids).
         # Mutually exclusive with mm_kwargs (matches upstream's if/elif pattern).
@@ -11333,6 +11820,221 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         model_cls = get_model_cls(self.vllm_config.model_config.architectures)
         return getattr(model_cls, name, default)
+
+    def _host_input_specs(self) -> HostInputSpecs | None:
+        """The loaded model's ``interfaces.HasHostInputs`` specs, or None without it.
+
+        Resolved once, on the first call after the model loads. Host inputs need the true
+        current tokens on the host. With async scheduling the runner joins on the previous
+        step's sampled tokens right before the forward (``_host_input_join``); that join
+        covers non-speculative decoding only, so async speculative decoding is rejected
+        (the platform turns async off for it, ``NeuronPlatform._configure_host_input_models``).
+        """
+        if self._host_input_specs_resolved:
+            return self._host_input_specs_cache
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        specs = _host_input_specs_of(model)
+        if (
+            specs
+            and getattr(self, "use_async_scheduling", False)
+            and getattr(self, "speculative_config", None) is not None
+        ):
+            raise RuntimeError(
+                f"{type(getattr(model, '_orig_mod', model)).__name__} takes host inputs "
+                f"({', '.join(sorted(specs))}), which need the current tokens on the host; "
+                "async scheduling with speculative decoding is not supported "
+                "(async_scheduling=False)."
+            )
+        self._host_input_specs_cache = specs
+        self._host_input_specs_resolved = True
+        if specs:
+            logger.info("Model host inputs (built on the host every step): %s", specs)
+        return specs
+
+    def _host_input_warmup_kwargs(
+        self, num_tokens: int, device: torch.device | str | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Zero host inputs for a synthetic forward of ``num_tokens`` rows; {} without the
+        capability. Every warmup, capture, dummy and JF builder adds these, so each compiled
+        graph is traced with the kwargs the real step passes."""
+        return host_input_zero_kwargs(
+            self._host_input_specs(),
+            num_tokens,
+            self.device if device is None else device,
+        )
+
+    def _set_step_host_inputs(
+        self,
+        input_ids: torch.Tensor,
+        req_rows: np.ndarray,
+        positions: torch.Tensor,
+    ) -> None:
+        """Build this step's host inputs (CPU) for ``_execute_model_forward``.
+
+        Clears them first, and leaves them None without the capability.
+
+        Args:
+            input_ids: [T] final padded input_ids (CPU).
+            req_rows: [T] ``input_batch`` row per token, -1 on padding rows.
+            positions: [T] final padded cache positions (CPU).
+        """
+        self._current_host_inputs = None
+        self._pending_host_input_rows = None
+        specs = self._host_input_specs()
+        if not specs:
+            return
+        if self._host_inputs_async():
+            # The decode rows of input_ids are stale here (the previous step's tokens are
+            # still on the device). Record the layout; _host_input_join builds the inputs
+            # from the true tokens right before the forward.
+            self._pending_host_input_rows = (
+                np.asarray(req_rows, dtype=np.int64),
+                positions.numpy().astype(np.int64, copy=True),
+            )
+            return
+        self._current_host_inputs = build_step_host_inputs(
+            self.model,
+            specs,
+            input_ids.numpy(),
+            req_rows,
+            positions.numpy(),
+            self.input_batch.token_ids_cpu,
+        )
+
+    def _host_inputs_async(self) -> bool:
+        """True when the model takes host inputs and async scheduling is on.
+
+        The runner then prepares each step ahead while the previous one runs, and joins on
+        the previous step's sampled tokens only right before the forward. See
+        ``_host_input_join`` and docs/design/host-inputs.md.
+        """
+        return bool(getattr(self, "use_async_scheduling", False)) and bool(
+            self._host_input_specs()
+        )
+
+    def _track_host_join_output(self, async_output: Any) -> None:
+        """Queue an async output whose tokens this rank must write before the next join.
+
+        Upstream materializes async outputs on the output rank only (on its async-output
+        thread), so the other TP ranks never see the sampled tokens. Host inputs are built
+        on every rank from ``token_ids_cpu``, so every rank materializes every output on its
+        main thread, in step order. ``get_output`` is idempotent under a per-object lock, so
+        the output rank's async-output thread and this queue never apply a step twice.
+        """
+        if self._host_join_pending_outputs is None:
+            self._host_join_pending_outputs = []
+        self._host_join_pending_outputs.append(async_output)
+
+    def _drain_host_join_outputs(self) -> int:
+        """Materialize, oldest first, every queued async output. Returns how many."""
+        pending = self._host_join_pending_outputs
+        if not pending:
+            return 0
+        self._host_join_pending_outputs = []
+        for async_output in pending:
+            async_output.get_output()
+        return len(pending)
+
+    def _host_join_needs_early_drain(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether the queued async outputs must be applied before ``_update_states``.
+
+        Applying a step writes each token into the request's current InputBatch row,
+        looked up by request id, and appends it to ``output_token_ids``. A request that
+        ``_update_states`` takes out of the batch while it stays alive (unscheduled this
+        step) would lose its pending token, and a resumed request is re-seeded from its
+        ``output_token_ids``. Finished requests and new requests need nothing, and neither
+        does a zero-token step that keeps the batch (``_keep_batch_on_empty_step``). So the
+        early drain, which blocks before this step's preparation instead of at the join, is
+        needed only with a resumed request or a live request leaving the batch.
+        """
+        if not self._host_join_pending_outputs:
+            return False
+        if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return True
+        # A request id reused by a new request (abort and resubmit) would receive the old
+        # request's pending token at the join.
+        if any(
+            new_req.req_id in self.input_batch.req_id_to_index
+            for new_req in scheduler_output.scheduled_new_reqs
+        ):
+            return True
+        scheduled = scheduler_output.num_scheduled_tokens.keys()
+        finished = scheduler_output.finished_req_ids
+        if self._keep_batch_on_empty_step(scheduled, finished):
+            return False
+        return any(
+            req_id not in scheduled and req_id not in finished
+            for req_id in self.input_batch.req_id_to_index
+        )
+
+    def _host_input_join(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """The host-token join of async scheduling with host inputs.
+
+        Called right before the forward, after every other input of the step is built and
+        uploaded. It waits for the previous step's sampled tokens (the device-to-host copy
+        of the pending async outputs) and writes them into the InputBatch, then rebuilds
+        the step's real ``input_ids`` rows from ``token_ids_cpu`` at their positions and
+        builds the host inputs from those true tokens. The device then idles only for the
+        token copy, ``build_host_inputs`` and the upload.
+
+        The first row of each request this step must read a token the host has written:
+        the check against ``num_tokens_no_spec`` raises instead of feeding a stale token.
+        Later rows past that cursor (drafts, jump-forward tokens) are host-side already.
+
+        Args:
+            input_ids: [T] CPU input_ids of the step, as _prepare_model_input built them
+                (the decode rows may be stale).
+
+        Returns:
+            ``(input_ids, host_inputs)``: the true [T] CPU input_ids and the CPU host inputs.
+        """
+        rows = self._pending_host_input_rows
+        self._pending_host_input_rows = None
+        if rows is None:
+            raise RuntimeError(
+                "The model takes host inputs, but this step's input preparation recorded "
+                "no host-input layout. Each input path must call _set_step_host_inputs."
+            )
+        req_rows, positions = rows
+        self._drain_host_join_outputs()
+        token_ids_cpu = self.input_batch.token_ids_cpu
+        ids_np = input_ids.numpy().copy()
+        real = np.nonzero(req_rows >= 0)[0]
+        if real.size:
+            r = req_rows[real]
+            pos = positions[real]
+            written = self.input_batch.num_tokens_no_spec[r]
+            stale = pos >= written
+            # A request's rows are contiguous. Its first row this step is a committed token
+            # (prompt, or the token the previous step sampled), so it must be written by now.
+            # Later rows past the cursor are host-side tokens not committed yet (drafts,
+            # jump-forward tokens) and keep the value input preparation gave them.
+            first = np.ones(r.shape[0], dtype=bool)
+            first[1:] = r[1:] != r[:-1]
+            if (stale & first).any():
+                bad = np.nonzero(stale & first)[0][:8]
+                raise RuntimeError(
+                    "Host-token join: a real row reads a token the host has not written "
+                    f"(rows {r[bad].tolist()}, positions {pos[bad].tolist()}, written "
+                    f"{written[bad].tolist()})."
+                )
+            fresh = ~stale
+            ids_np[real[fresh]] = token_ids_cpu[r[fresh], pos[fresh]]
+        ids = torch.from_numpy(ids_np)
+        self._validate_token_ids(ids)
+        host_inputs = build_step_host_inputs(
+            self.model,
+            self._host_input_specs(),
+            ids_np,
+            req_rows,
+            positions,
+            token_ids_cpu,
+        )
+        return ids, host_inputs
 
     @staticmethod
     def _k_cache_alloc_shape(

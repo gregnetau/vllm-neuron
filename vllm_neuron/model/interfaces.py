@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+import numpy as np
 import torch
 from transformers import PretrainedConfig
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
@@ -214,4 +215,65 @@ class ServesTextOnly(Protocol):
     @classmethod
     def serves_text_only(cls) -> bool:
         """Return True when only the text tower is served."""
+        ...
+
+
+@runtime_checkable
+class HasHostInputs(Protocol):
+    """Models that take extra per-token tensors computed on the host every step.
+
+    Example: a hashed n-gram embedding whose table stays in host RAM. The host hashes the
+    token history and gathers the rows; the graph receives a ``[T, D]`` tensor aligned with
+    the padded ``input_ids`` rows.
+
+    The V1 runner calls ``build_host_inputs`` on every real step and passes each returned
+    tensor to ``forward`` as a keyword argument. Every compiled graph (prefill and decode
+    buckets, spec-verify, jump-forward, warmup, DP dummy batches, graph capture) is traced
+    with the same kwargs, zero-filled, at ``[T, *shape]`` and the declared dtype.
+
+    The host needs the true current tokens. Under async scheduling the runner joins on the
+    previous step's sampled tokens right before the forward; the platform turns async
+    scheduling off for these models with speculative decoding (docs/design/host-inputs.md).
+
+    Declare the protocol on the class registered in ``registry.get_models()`` (the platform
+    checks it with ``issubclass`` before the model is built), and implement the methods on
+    the module that ``from_configs`` returns (the runner checks that module with
+    ``isinstance`` and calls it). These are instance methods.
+    """
+
+    def host_input_specs(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Return kwarg name -> (per-token trailing shape, dtype).
+
+        For example ``{"ple_embeds": ((2560,), torch.bfloat16)}``. The result must not
+        change after the model is built.
+        """
+        ...
+
+    def build_host_inputs(
+        self,
+        input_ids: np.ndarray,
+        req_rows: np.ndarray,
+        positions: np.ndarray,
+        token_ids_cpu: np.ndarray,
+    ) -> dict[str, torch.Tensor]:
+        """Build the host inputs of one step.
+
+        Args:
+            input_ids: [T] int64, the padded batch rows as the graph sees them. Rows of a
+                request are contiguous and in position order. They include tokens not yet
+                in ``token_ids_cpu`` (spec-decode drafts, jump-forward tokens), so resolve
+                a request's earlier tokens from earlier rows of the same request first,
+                then from ``token_ids_cpu``.
+            req_rows: [T] int64, the ``input_batch`` row of each token; -1 for padding
+                rows (prefill bucket padding, decode batch padding, spec/JF padding).
+            positions: [T] int64, the absolute position of each token in its request; 0
+                on padding rows.
+            token_ids_cpu: [max_num_reqs, max_model_len] (``input_batch.token_ids_cpu``).
+                Valid up to the request's computed tokens; beyond that it may hold
+                scheduled drafts or stale values.
+
+        Returns:
+            CPU tensors ``[T, *shape]`` of the declared dtype, one per spec name. Padding
+            rows may hold any finite value.
+        """
         ...

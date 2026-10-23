@@ -63,6 +63,29 @@ def _kv_capacity_guidance() -> str:
     )
 
 
+def _kv_concurrency_override(max_concurrent: int) -> int:
+    """Apply ``VLLM_NEURON_MAX_KV_CONCURRENT`` to the worst-case KV concurrency cap.
+
+    For expected request lengths well below max_model_len: admit more requests than the
+    worst case allows; vLLM preempts (recomputes) if the KV cache runs out.
+
+    Args:
+        max_concurrent: Requests that fit the KV cache at max_model_len (0 if unknown).
+
+    Returns:
+        The override when set to a positive value, else ``max_concurrent``.
+    """
+    override = envs.VLLM_NEURON_MAX_KV_CONCURRENT
+    if override is None or override <= 0:
+        return max_concurrent
+    logger.info(
+        "KV concurrency cap %d -> %d (VLLM_NEURON_MAX_KV_CONCURRENT)",
+        max_concurrent,
+        override,
+    )
+    return override
+
+
 class SchedulerState(Enum):
     """Scheduler state for Neuron platform.
 
@@ -338,6 +361,7 @@ class NeuronScheduler(Scheduler):
                 total_kv_tokens // self.max_model_len if self.max_model_len > 0 else 0
             )
 
+        max_concurrent = _kv_concurrency_override(max_concurrent)
         self._max_kv_concurrent = (
             max_concurrent if max_concurrent > 0 else self.max_num_seqs
         )
