@@ -681,7 +681,9 @@ def _compute_slot_mapping_cpu(
             [(int(req_indices[i]), int(positions[i])) for i in oob_sample],
         )
         flat_indices = np.where(oob_mask, 0, flat_indices)
-    block_numbers = block_table_cpu.ravel()[flat_indices]
+    # int64 before the multiply: block tables are int32, and a recurrent-state group's block
+    # size is max_model_len, so block_id * block_size can pass 2**31.
+    block_numbers = block_table_cpu.ravel()[flat_indices].astype(np.int64)
 
     if cp_world_size > 1:
         virtual_block_offsets = positions % virtual_block_size
