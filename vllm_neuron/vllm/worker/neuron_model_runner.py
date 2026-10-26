@@ -2586,14 +2586,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # A request absent from the previous step (held back during another request's
         # prefill, for example) still has the rejected drafts of its own last spec step
         # to correct: use that step's row instead of the no-op dummy.
-        prev_sampled, dummy_rows = self._fill_from_last_spec_rows(
+        prev_sampled, dummy_rows, filled_draft_counts = self._fill_from_last_spec_rows(
             prev_sampled, dummy_rows, prev_future if use_real_prev else None
         )
         # A real row comes from a spec step with a full num_spec_tokens bucket, so its
         # draft count is num_spec (we never mid-trim draft counts —
         # NeuronAsyncScheduler clears spec_token_ids entirely near max_model_len).
+        # Filled rows carry their own count, which makes the position correction a no-op.
         draft_counts = [
-            0 if i in dummy_rows else num_spec for i in range(num_reqs_padded)
+            0 if i in dummy_rows else filled_draft_counts.get(i, num_spec)
+            for i in range(num_reqs_padded)
         ]
         prev_num_draft_tokens_tensor = torch.tensor(draft_counts, dtype=torch.int32).to(
             device
@@ -2624,10 +2626,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         prev_sampled: torch.Tensor,
         dummy_rows: set[int],
         prev_future: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, set[int]]:
+    ) -> tuple[torch.Tensor, set[int], dict[int, int]]:
         """Replace the dummy rows of real requests whose latest spec step is older than
-        the previous step with their row from that step. Returns the tensor and the rows
-        that stay dummies."""
+        the previous step with their row from that step. Returns the tensor, the rows
+        that stay dummies, and the draft count to pass for each filled row.
+
+        Only ``state_in`` (the last accepted token's state block) comes from a filled row.
+        Its step is at least two steps old, so the scheduler has already processed its
+        output and rolled ``num_computed_tokens`` back by the rejected drafts: the positions
+        it scheduled are already correct. Each filled row's draft count is therefore its
+        valid count - 1, which makes the on-device position correction a no-op. The step
+        has completed, so reading the row on the host does not wait on the device."""
         rows = self._last_spec_rows
         req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
         fill = [
@@ -2639,16 +2648,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and rows[req_ids[i]][0].shape[1] == prev_sampled.shape[1]
         ]
         if not fill:
-            return prev_sampled, dummy_rows
-        src = torch.cat([future[row : row + 1] for _, (future, row) in fill]).to(
-            prev_sampled.device
-        )
+            return prev_sampled, dummy_rows, {}
+        src = torch.cat([future[row : row + 1] for _, (future, row) in fill]).cpu()
+        vocab_size = getattr(self.input_batch, "vocab_size", None)
+        valid = src != -1
+        if vocab_size is not None:
+            valid &= src < vocab_size
+        draft_counts = {
+            i: max(int(n) - 1, 0) for (i, _), n in zip(fill, valid.sum(dim=1).tolist())
+        }
+        src = src.to(prev_sampled.device)
         idx = torch.tensor([i for i, _ in fill], dtype=torch.long).to(
             prev_sampled.device
         )
         # Out of place: in-place row writes can give non-contiguous NEFF inputs.
         prev_sampled = prev_sampled.index_copy(0, idx, src).contiguous()
-        return prev_sampled, dummy_rows - {i for i, _ in fill}
+        return prev_sampled, dummy_rows - {i for i, _ in fill}, draft_counts
 
     @staticmethod
     def _dummy_prev_sampled(
