@@ -117,6 +117,8 @@ def _runner(model=None, *, has_state=True, kv_segment_size=1024):
     runner.num_seqs_buckets = [1, 4]
     runner.kv_segment_size = kv_segment_size
     runner._has_state_layers = has_state
+    runner.num_speculative_tokens = 0
+    runner.draft_model = None
     runner._state_real_pages = {}
     runner._state_groups = frozenset()
     runner._state_pool_slot_pages = 1
@@ -313,7 +315,7 @@ def test_initialize_rejects_state_layer_the_model_does_not_declare():
     "change, match",
     [
         ({"mamba_cache_mode": "align"}, "Mamba cache mode"),
-        ({"num_speculative_blocks": 1}, "speculative state blocks"),
+        ({"num_speculative_blocks": 1}, "speculative state block per draft token"),
     ],
 )
 def test_initialize_rejects_unsupported_state_specs(change, match):
@@ -576,7 +578,6 @@ def _validation_runner(
     "kwargs, error, match",
     [
         ({"apc": True}, NotImplementedError, "prefix caching"),
-        ({"spec": object()}, NotImplementedError, "speculative decoding"),
         ({"shared": True}, NotImplementedError, "VLLM_NEURON_SHARED_STATE_POOL"),
         ({"buckets": (64, 512)}, ValueError, r"multiples of 128.*\[64\]"),
     ],

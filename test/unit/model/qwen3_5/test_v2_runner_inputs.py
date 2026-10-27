@@ -73,6 +73,8 @@ def _runner():
     runner.num_seqs_buckets = [1, 4]
     runner.kv_segment_size = 512
     runner._has_state_layers = True
+    runner.num_speculative_tokens = 0
+    runner.draft_model = None
     runner._state_real_pages = {}
     runner._kv_cache_config = None
     runner._inflight_graphs, runner._quarantined_slots = [], set()
