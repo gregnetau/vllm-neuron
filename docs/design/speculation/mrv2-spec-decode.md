@@ -65,8 +65,11 @@ cut from the host count, which is an upper bound), expert parallelism with data 
 (the spec / non-spec NEFF vote is not synchronized), debug logits, and a
 `rejection_sample_method` other than `standard` / `synthetic`. Structured outputs, tensor
 capture and decode context-length buckets are unsupported on V2 for every model. Prefix
-caching remains unsupported for recurrent-state models on V2 (V1 does not support MTP with
-prefix caching either).
+caching of recurrent-state models works with MTP on V2 (V1 does not support MTP with prefix
+caching): a verify step's state after each token is in its own pool page, and the checkpoint
+for a block boundary it reaches is copied from the page of the token on the boundary, using
+the accepted count committed on the device (see
+[Prefix caching on Model Runner V2](../hybrid-state-gdn.md#prefix-caching-on-model-runner-v2)).
 
 The runner repeats the checks in `NeuronModelRunnerV2._validate_spec_decode_config`, and
 requires every prefill bucket to exceed `1 + k` (models tell prefill from decode by
@@ -426,15 +429,16 @@ token counts (`B * (1 + k)`, then `B` per recurrent draft step).
 
 - Device validation (below). Nothing here has run on a Neuron device.
 - EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
-- KV transfer (DI) with speculative decoding, sliding-window targets, prefix caching with
-  MTP, decode context-length buckets on V2 for models without recurrent state.
+- KV transfer (DI) with speculative decoding, sliding-window targets, decode context-length
+  buckets on V2 for models without recurrent state.
 - A separate drafter NEFF (only needed if a draft model must compile with other options).
 
 ## Device validation
 
 Run on a trn2 instance with no other process on the devices. V2 needs
-`VLLM_USE_V2_MODEL_RUNNER=1` and no prefix caching (the script's default);
-`DECODE_CTX_BUCKETS` is optional:
+`VLLM_USE_V2_MODEL_RUNNER=1`; `DECODE_CTX_BUCKETS` and `PREFIX_CACHING=1` are optional (for
+prefix caching see
+[its device validation](../hybrid-state-gdn.md#prefix-caching-on-model-runner-v2)):
 
 ```bash
 # Qwen3.5-2B, TP=2, MTP with 2 draft tokens, 4 sequences, async scheduling (default)

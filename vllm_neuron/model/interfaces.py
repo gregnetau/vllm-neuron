@@ -198,8 +198,9 @@ class HasRecurrentState(Protocol):
     They declare the state layers in their ``KVSpec`` (``StateLayerSpec``). The runners
     report the state as vLLM ``MambaSpec`` KV groups; prefix caching uses vLLM's Mamba
     ``align`` mode. Model Runner V1 is the default for these models. Model Runner V2
-    (``VLLM_USE_V2_MODEL_RUNNER=1``) serves them with dedicated state pools, without
-    prefix caching or speculative decoding.
+    (``VLLM_USE_V2_MODEL_RUNNER=1``) serves them with dedicated state pools, also with
+    MTP speculative decoding and prefix caching (block-boundary checkpoints in vLLM's
+    blocks).
     """
 
     @classmethod
