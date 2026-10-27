@@ -107,3 +107,21 @@ def test_held_back_request_positions_are_not_corrected_twice():
     )
     assert out_pos.tolist() == [100, 101, 102]
     assert out_meta["gdn"]["state_in"].tolist() == [0]
+
+
+def test_request_without_drafts_in_a_spec_step_is_not_rolled_back():
+    """Near max_model_len the scheduler stops drafting for some requests, so a spec step
+    mixes rows with and without drafts. A row without drafts rejected nothing."""
+    r = _runner(["a", "b"])
+    prev = _spec_out([[5, 6, 7], [9, -1, -1]])  # a: 2 drafts accepted; b: no drafts
+    r._record_last_spec_rows(prev, ["a", "b"], {"a": [1, 2], "b": []})
+    r.speculative_config = types.SimpleNamespace(num_speculative_tokens=2)
+    r.async_execution_buffer = {
+        "futures_sampled_token_ids": prev,
+        "prev_req_ids_ordered": ["a", "b"],
+    }
+    r.device = "cpu"
+    _, prev_num_draft = r._get_prev_spec_tensors_for_on_device_correction(
+        None, num_reqs_padded=2, device="cpu"
+    )
+    assert prev_num_draft.tolist() == [2, 0]
