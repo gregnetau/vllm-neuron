@@ -1093,7 +1093,68 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return can_run_kernel(x) and two_programs()
 
+    def _use_batched_kernel(self, x: torch.Tensor) -> bool:
+        """gdn_kernels.gdn_decode_batched: B requests x S tokens (B > 1 or MTP verify), up to
+        fp8_kernels.MAX_TOKENS tokens. Each logical-core program owns half the value heads and
+        the key heads they read, so the key heads must split evenly over the two programs.
+        VLLM_NEURON_GDN_BATCHED_DECODE: 0 off, 1 (default) B > 1 and MTP, 2 also B = 1."""
+        from vllm_neuron import envs
+
+        from .fp8_kernels import MAX_TOKENS
+
+        mode = envs.VLLM_NEURON_GDN_BATCHED_DECODE
+        if mode == 0 or x.shape[0] > MAX_TOKENS:
+            return False
+        if mode == 1 and x.shape[0] == 1:  # B = 1, one token: gdn_decode
+            return False
+        if self.Hk % 2 or (self.Hv // 2) % (self.Hv // self.Hk):
+            return False
+        return self._use_decode_kernel(x, max_requests=MAX_TOKENS)
+
+    def _decode_batched(self, hidden_states, md):
+        """hidden_states [B*S, H] (S tokens per request; with MTP the state starts from block
+        state_in and the state after token j goes to block j) -> out_proj output [B*S, H]."""
+        from .gdn_kernels import gdn_decode_batched
+
+        # Padded batch rows (-1): writes keep -1 so the kernel skips them (out of bounds) and
+        # the null block, which attention may read, never receives float32 state; reads go to
+        # the null block (finite) so the padded rows stay finite.
+        bt = md["block_table_tensor"].to(torch.int32)
+        B = bt.shape[0]
+        S = hidden_states.shape[0] // B
+        assert hidden_states.shape[0] == B * S, (
+            "GDN decode: the same number of tokens per request"
+        )
+        slots_out = bt[:, :S].contiguous()
+        if "state_in" in md:  # one-hot select, not a 2-D gather
+            sel = md["state_in"].long().view(B, 1) == torch.arange(
+                bt.shape[1], device=bt.device
+            ).view(1, -1)
+            slots_in = torch.where(sel, bt, torch.zeros_like(bt)).sum(dim=1)
+        else:
+            slots_in = bt[:, 0]
+        slots_in = slots_in.clamp(min=0).to(torch.int32)
+        mixed, z, b, a = self._project(hidden_states.to(self.dtype))
+        o = gdn_decode_batched(
+            mixed,
+            z,
+            b,
+            a,
+            self.conv_weight,
+            self.A_log,
+            self.dt_bias,
+            self.norm_weight,
+            self.state_a,
+            self.state_b,
+            slots_in,
+            slots_out,
+            self.config.rms_norm_eps,
+        )
+        return self._out_proj(o)
+
     def _decode(self, hidden_states, md):
+        if self._use_batched_kernel(hidden_states):
+            return self._decode_batched(hidden_states, md)
         if not self._use_decode_kernel(hidden_states):
             return self._decode_torch(hidden_states, md)
         from .gdn_kernels import gdn_decode
@@ -1198,6 +1259,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """Speculative-decoding verify: S = 1 + k tokens per request (rows b*S .. b*S+S-1).
         The state starts from block state_in[b] (the state after the last accepted token of
         the previous step) and the state after token j is written to block j."""
+        if self._use_batched_kernel(hidden_states):
+            return self._decode_batched(hidden_states, md)
         bt_raw = md["block_table_tensor"].long()  # [B, 1 + k]; -1: padded batch row
         bt = bt_raw.clamp(min=0)  # reads from the null block 0
         B = bt.shape[0]
