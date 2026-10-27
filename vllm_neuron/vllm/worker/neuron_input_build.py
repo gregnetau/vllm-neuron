@@ -35,6 +35,7 @@ __all__ = [
     "PAD_SLOT_ID",
     "NeuronModelInput",
     "build_flat_positions",
+    "build_verify_layout",
     "build_prefill_linear_idx",
     "gather_block_rows_raw",
     "build_kernel_block_rows",
@@ -90,6 +91,10 @@ class NeuronModelInput:
     # Per-group per-row KV position offsets for sliding-window groups on
     # decode ([B] int32); None entries for full-attention groups and prefill.
     swa_kv_pos_offsets: tuple[torch.Tensor | None, ...] | None = None
+    # Speculative verify steps: scheduled drafts per row ([B] int32) and the tokens
+    # per row (1 + k). Other steps: None and 1.
+    num_draft_by_row: torch.Tensor | None = None
+    spec_width: int = 1
 
 
 def build_flat_positions(
@@ -129,6 +134,43 @@ def build_flat_positions(
     within = np.arange(req_indices.shape[0], dtype=np.int64) - starts[req_indices]
     positions = num_computed_tokens[req_indices] + within
     return positions, req_indices
+
+
+def build_verify_layout(
+    num_computed_tokens: np.ndarray, num_drafts: np.ndarray, width: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lay out a speculative verify step's real tokens in ``[rows, width]``.
+
+    Row ``r`` holds its last token and ``num_drafts[r]`` drafts in columns
+    ``0 .. num_drafts[r]`` of a ``width = 1 + k`` wide row; the remaining columns
+    are padding. Unlike :func:`build_flat_positions` the rows are not packed, so
+    a row with fewer drafts never shifts the rows after it.
+
+    Args:
+        num_computed_tokens: ``[num_reqs]`` computed counts in scheduler order (an
+            upper bound under async scheduling).
+        num_drafts: ``[num_reqs]`` scheduled drafts per row, ``0 .. width - 1``.
+        width: Tokens per row, ``1 + k``.
+
+    Returns:
+        Three ``[sum(1 + num_drafts)]`` int64 arrays: positions, row indices and
+        flat token indices (``row * width + column``).
+
+    Example:
+        >>> build_verify_layout(np.array([5, 9]), np.array([2, 0]), 3)
+        (array([5, 6, 7, 9]), array([0, 0, 0, 1]), array([0, 1, 2, 3]))
+    """
+    num_computed_tokens = np.asarray(num_computed_tokens, dtype=np.int64)
+    num_drafts = np.asarray(num_drafts, dtype=np.int64)
+    assert num_computed_tokens.shape == num_drafts.shape, (
+        f"num_computed {num_computed_tokens.shape} != num_drafts {num_drafts.shape}"
+    )
+    assert ((num_drafts >= 0) & (num_drafts < width)).all(), (
+        f"draft counts {num_drafts.tolist()} do not fit rows of width {width}"
+    )
+    positions, req_indices = build_flat_positions(num_computed_tokens, 1 + num_drafts)
+    columns = positions - num_computed_tokens[req_indices]
+    return positions, req_indices, req_indices * width + columns
 
 
 def build_prefill_linear_idx(

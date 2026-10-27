@@ -1395,6 +1395,11 @@ class NeuronWorker(WorkerBase):
             bytes_used_buffers += sum(
                 b.nbytes for b in self.model_runner.drafter.model.buffers()
             )
+        # Model Runner V2 runs its draft model inside the target graph (no drafter).
+        draft_model = getattr(self.model_runner, "draft_model", None)
+        if draft_model is not None:
+            bytes_used_params += sum(p.nbytes for p in draft_model.parameters())
+            bytes_used_buffers += sum(b.nbytes for b in draft_model.buffers())
         return bytes_used_params + bytes_used_buffers
 
     def _estimate_available_memory_neuron(self) -> int:
