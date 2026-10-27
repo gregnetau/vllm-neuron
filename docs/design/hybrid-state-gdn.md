@@ -59,8 +59,9 @@ are cached blocks) keeps the shared layout and the real page, as does
 ## Model Runner V2
 
 V1 is the default for these models. With `VLLM_USE_V2_MODEL_RUNNER=1`, Model Runner V2
-serves them without prefix caching, speculative decoding or the shared state pool. Those
-configurations, and those without segmented prefill, stay on V1. Both runners build the
+serves them, with or without MTP speculative decoding, but without prefix caching or the
+shared state pool. Those configurations, and those without segmented prefill, stay on V1.
+Both runners build the
 specs, pools and KV-block clearing with `vllm_neuron/vllm/worker/hybrid_state.py`. V2
 differs from V1 in two ways:
 
@@ -74,6 +75,14 @@ differs from V1 in two ways:
 
 Every prefill uses the first KV segment size, so V2 requires all prefill buckets to be
 multiples of 128 for these models.
+
+With MTP, V2 gives each slot `1 + k` pool pages (`1 + slot * (1 + k) + j`) and runs every
+decode step as a verify step whose GDN metadata carries `state_in`. Unlike V1 it does not
+pass `state_in` from the host or from the previous step's rejection output: the verify
+graph reads it from a slot-indexed device tensor of accepted counts that the previous
+graph of the same slot committed (`num_accepted - 1`), so a request held back for any
+number of steps resumes from its own last accepted block. See
+[Speculative decoding on Model Runner V2](speculation/mrv2-spec-decode.md).
 
 ## Prefix caching
 
