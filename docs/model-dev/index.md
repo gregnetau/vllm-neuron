@@ -61,6 +61,13 @@ Methodology for isolating where accuracy drift is introduced.
 Run the automated debugger pipeline and interpret results.
 :::
 
+:::{grid-item-card} Qwen3.8-Flash-Next development notes
+:link: qwen3-8-flash-next-notes
+:link-type: doc
+
+Design decisions, Trn2 constraints, measurements and open work from the qwen4_exp port.
+:::
+
 ::::
 
 :::{toctree}
@@ -75,4 +82,5 @@ NKI CPU simulator <nki_cpu_simulator>
 Debugging model code <debugging>
 Debugging accuracy issues <accuracy-debugging-guide>
 Accuracy debugger tools <how-to-use-accuracy-debugger>
+Qwen3.8-Flash-Next development notes <qwen3-8-flash-next-notes>
 :::
