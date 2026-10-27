@@ -353,6 +353,16 @@ class NeuronModelRunnerV2:
     # runner built without __init__ (tests) behaves as a model without host inputs.
     _host_input_specs: HostInputSpecs | None = None
     _host_token_ids: np.ndarray | None = None
+    # Prefix caching of a recurrent-state model (Mamba "align" mode, see
+    # hybrid_state.StateCheckpointer): enabled, the attention kernel block size, the
+    # prefix-cache block (KV-manager block of every group), the checkpointer, and the
+    # committed counts of a step without speculative decoding (ones). Class-level
+    # defaults: off.
+    _prefix_caching: bool = False
+    _kernel_block_size: int | None = None
+    _ckpt_block_size: int = 0
+    _ckpt: hybrid_state.StateCheckpointer | None = None
+    _ckpt_ones: torch.Tensor | None = None
 
     def __init__(self, vllm_config, device) -> None:
         """Initialize standalone runner state from the vLLM configuration.
@@ -383,6 +393,12 @@ class NeuronModelRunnerV2:
         # request slot (see hybrid_state and docs/design/hybrid-state-gdn.md). Read from
         # the registered class: the model is not loaded yet.
         self._has_state_layers = self._model_has_recurrent_state()
+        # Prefix caching of a recurrent-state model: vLLM's Mamba "align" mode (the
+        # platform selects it), with block-boundary state checkpoints in vLLM's shared
+        # pool and the running state in the dedicated pool.
+        self._prefix_caching = self._has_state_layers and bool(
+            getattr(cache_config, "enable_prefix_caching", False)
+        )
         # Speculative decoding (docs/design/speculation/mrv2-spec-decode.md): k drafts
         # per request and step, verified in a [B, 1 + k] decode graph. Zero when off.
         self.speculative_config = getattr(vllm_config, "speculative_config", None)
@@ -979,9 +995,7 @@ class NeuronModelRunnerV2:
         total = 0
         for name, spec in self.get_kv_cache_spec().items():
             if isinstance(spec, MambaSpec):
-                n_pages = hybrid_state.state_pool_pages(
-                    spec, self.max_num_reqs, dedicated=True
-                )
+                n_pages = hybrid_state.running_state_pool_pages(spec, self.max_num_reqs)
                 page = hybrid_state.state_page(name, spec, self._state_real_pages)[1]
                 total += n_pages * page
         return total
@@ -1007,13 +1021,16 @@ class NeuronModelRunnerV2:
         return 0.0
 
     def warm_up_hybrid_graphs(self) -> None:
-        """Compile the KV-block clearing graph of a recurrent-state model.
+        """Compile the KV-block clearing graph of a recurrent-state model, and with
+        prefix caching its two state-checkpoint copy graphs.
 
         Run after model warmup: a graph executed on device earlier would precede
         the parallel-trace forks. A no-op for other models.
         """
         if self._kv_clearer is not None:
             self._kv_clearer.warm_up()
+        if self._ckpt is not None:
+            self._ckpt.warm_up(*self._ckpt_counts())
 
     def get_kv_cache_spec(self) -> dict:
         """Build per-layer KV-cache specifications.
@@ -1038,7 +1055,13 @@ class NeuronModelRunnerV2:
 
         if self.model is None:
             raise RuntimeError("load_model() must run before get_kv_cache_spec()")
-        block_size = self.vllm_config.cache_config.block_size
+        # The attention kernel block (--block-size). Recorded on the first call: with
+        # prefix caching of a recurrent-state model the engine core later sets
+        # cache_config.block_size to the enlarged KV-manager block (in-process
+        # executors share the config object).
+        if self._kernel_block_size is None:
+            self._kernel_block_size = self.vllm_config.cache_config.block_size
+        block_size = self._kernel_block_size
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
@@ -1073,22 +1096,37 @@ class NeuronModelRunnerV2:
                     "the model declares recurrent-state layers, but its registered "
                     "class does not implement interfaces.HasRecurrentState"
                 )
-            # Dedicated pools only (the policy and _validate_recurrent_state_config
-            # keep prefix caching and the shared pool on V1). The MambaSpecs carry a
-            # placeholder of one attention page, so vLLM keeps the attention block at
-            # --block-size and no kernel-block split is needed. With speculative
-            # decoding each request holds 1 + k state blocks (the state after each
-            # verify token).
-            state_specs, self._state_real_pages = hybrid_state.build_state_cache_specs(
+            # The running state lives in dedicated pools (the policy and
+            # _validate_recurrent_state_config keep the shared pool on V1). With
+            # speculative decoding each request holds 1 + k state blocks (the state
+            # after each verify token).
+            prefix_caching = self._prefix_caching
+            state_specs, real_pages = hybrid_state.build_state_cache_specs(
                 state_layers,
                 specs,
                 kernel_block=block_size,
                 max_model_len=self.max_model_len,
-                prefix_caching=False,
-                dedicated=True,
+                prefix_caching=prefix_caching,
+                # Without prefix caching the MambaSpecs carry a placeholder of one
+                # attention page, so vLLM keeps the attention block at --block-size
+                # and no kernel-block split is needed. With it (Mamba "align" mode)
+                # vLLM's blocks hold the block-boundary checkpoints, so they carry the
+                # real page; vLLM enlarges the attention block to it, and the runner
+                # splits it back into kernel blocks (initialize_kv_cache).
+                dedicated=not prefix_caching,
                 num_spec_blocks=self.num_speculative_tokens,
                 placeholder_pages=1,
+                # The split blocks need no 256-token enlarged block (V1's kernel
+                # constraint); real pages of the served models are larger anyway.
+                align_pages=1 if prefix_caching else None,
             )
+            if prefix_caching:
+                # The dedicated pool's page is the checkpoint page (a raw page copy).
+                real_pages = {
+                    name: hybrid_state.state_page(name, spec, {})
+                    for name, spec in state_specs.items()
+                }
+            self._state_real_pages = real_pages
             specs.update(state_specs)
         return specs
 
@@ -1127,18 +1165,23 @@ class NeuronModelRunnerV2:
 
         Speculative decoding is checked by ``_validate_spec_decode_config``.
 
+        Prefix caching needs vLLM's Mamba ``align`` cache mode (the platform
+        selects it) and segmented prefill (``_build_neuron_config`` requires it).
+
         Raises:
-            NotImplementedError: For prefix caching or
-                ``VLLM_NEURON_SHARED_STATE_POOL``.
+            NotImplementedError: For ``VLLM_NEURON_SHARED_STATE_POOL``, or prefix
+                caching without Mamba ``align`` mode.
             ValueError: For a prefill bucket the segmented kernel cannot run.
         """
         from vllm_neuron.utils.bucket_utils import segmented_prefill_supports_q_len
 
         route = "; unset VLLM_USE_V2_MODEL_RUNNER to use the V1 runner"
-        if self.vllm_config.cache_config.enable_prefix_caching:
+        cache_config = self.vllm_config.cache_config
+        mode = getattr(cache_config, "mamba_cache_mode", "align")
+        if self._prefix_caching and mode != "align":
             raise NotImplementedError(
-                "The V2 runner does not support prefix caching for models with "
-                "recurrent state; pass --no-enable-prefix-caching" + route
+                "The V2 runner serves prefix caching for models with recurrent state "
+                f"in Mamba cache mode 'align' only; got {mode!r}" + route
             )
         if envs.VLLM_NEURON_SHARED_STATE_POOL:
             raise NotImplementedError(
@@ -1515,8 +1558,13 @@ class NeuronModelRunnerV2:
         buffer is bound only as attention KV, and each state layer gets two zeroed
         float32 halves of ``1 + max_num_reqs * (1 + k)`` pages, bound with
         ``bind_state_cache``. A draft model's attention layers (speculative
-        decoding) are bound like the target's. Chunked attention, Mamba ``align``
-        mode (prefix caching), and FP8-packed configurations route to MRv1.
+        decoding) are bound like the target's. With prefix caching (Mamba ``align``
+        mode) the state specs carry the real page: every group's block is the
+        attention block enlarged to it, each attention manager block is viewed and
+        addressed as ``block // --block-size`` kernel blocks, the dedicated pools
+        still hold the running state, and vLLM's state blocks in the shared buffer
+        hold the block-boundary checkpoints (``hybrid_state.StateCheckpointer``).
+        Chunked attention and FP8-packed configurations route to MRv1.
 
         Args:
             kv_cache_config: Grouped full-attention KV-cache configuration.
@@ -1714,8 +1762,8 @@ class NeuronModelRunnerV2:
         state_pool_pages: dict[int, int] = {}
         for group_idx in sorted(state_groups):
             group = kv_cache_config.kv_cache_groups[group_idx]
-            state_pool_pages[group_idx] = hybrid_state.state_pool_pages(
-                group.kv_cache_spec, self.max_num_reqs, dedicated=True
+            state_pool_pages[group_idx] = hybrid_state.running_state_pool_pages(
+                group.kv_cache_spec, self.max_num_reqs
             )
             pages = {}
             for name in group.layer_names:
@@ -1726,20 +1774,39 @@ class NeuronModelRunnerV2:
                 pages[name] = (layout, page_bytes)
             state_layer_pages[group_idx] = pages
 
+        # Prefix caching (Mamba "align"): every group's KV-manager block is the
+        # prefix-cache block, the attention block enlarged to the state page. Each
+        # attention manager block is split into `ratio` kernel blocks of --block-size.
+        state_pages_per_slot = 1 + self.num_speculative_tokens
+        kernel_ratios = [1] * len(resolved_block_sizes)
+        host_block_sizes = list(resolved_block_sizes)
+        min_widths = [
+            state_pages_per_slot if g in state_groups else 0
+            for g in range(len(resolved_block_sizes))
+        ]
+        ckpt_block = 0
+        if self._prefix_caching and state_groups:
+            ckpt_block, ratio = self._prefix_cache_geometry(resolved_block_sizes)
+            blocks_per_seq = -(-self.max_model_len // ckpt_block)
+            for g in range(len(resolved_block_sizes)):
+                if g in state_groups:
+                    # Manager block ids (the checkpoint blocks), position-indexed over
+                    # the whole sequence plus the speculative blocks.
+                    min_widths[g] = blocks_per_seq + self.num_speculative_tokens + 1
+                else:
+                    kernel_ratios[g] = ratio
+                    host_block_sizes[g] = ckpt_block // ratio
+                    min_widths[g] = blocks_per_seq * ratio
+
         # This is the first authoritative block geometry the worker receives. The constructor ran
         # before the executor applied Neuron's backend default, so configure the host block rows from
         # the same validated group specs that size the scheduler and device KV cache.
         # A state group's block spans max_model_len, but with speculative decoding a
         # request holds 1 + k of them.
-        state_pages_per_slot = 1 + self.num_speculative_tokens
         self.request_state.configure_block_sizes(
-            resolved_block_sizes,
-            min_widths=[
-                state_pages_per_slot if g in state_groups else 0
-                for g in range(len(resolved_block_sizes))
-            ],
+            host_block_sizes, min_widths=min_widths, kernel_ratios=kernel_ratios
         )
-        self.block_sizes = list(resolved_block_sizes)
+        self.block_sizes = list(host_block_sizes)
         # Trimmed kernel block-row width per group: None for full-attention
         # groups, the window-derived width for sliding-window groups. Computed
         # once here so runtime and synthetic warmup inputs agree by
@@ -1822,13 +1889,16 @@ class NeuronModelRunnerV2:
         for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
             if group_idx in state_groups:
                 continue
+            # Split groups view manager block b as kernel blocks b * r .. b * r + r - 1
+            # (the same bytes of each K / V half), for any number of KV heads.
+            ratio = kernel_ratios[group_idx]
             for name in group.layer_names:
                 spec = spec_by_layer[name]
                 kv_shape = (
                     2,
-                    num_blocks,
+                    num_blocks * ratio,
                     spec.num_kv_heads,
-                    spec.block_size,
+                    spec.block_size // ratio,
                     spec.head_size,
                 )
                 k_cache, v_cache, typed = shared_kv_slices(
@@ -1842,9 +1912,23 @@ class NeuronModelRunnerV2:
         if self.draft_model is not None:
             self.draft_model.bind_kv_cache(kv_caches)
         kv_clearer = None
+        checkpointer = None
         if state_caches:
             self.model.bind_state_cache(state_caches)
-            kv_clearer = self._build_kv_block_clearer(kv_caches)
+            kv_clearer = self._build_kv_block_clearer(kv_caches, max(kernel_ratios))
+            if ckpt_block:
+                checkpointer = self._build_state_checkpointer(
+                    kv_cache_config,
+                    sorted(state_groups),
+                    state_caches,
+                    raw_by_layer,
+                    {
+                        n: p
+                        for pages in state_layer_pages.values()
+                        for n, p in pages.items()
+                    },
+                    state_pages_per_slot,
+                )
             if kv_clearer is not None:
                 self.model.set_runner_clears_kv_blocks(True)
                 if self.draft_model is not None and hasattr(
@@ -1858,6 +1942,23 @@ class NeuronModelRunnerV2:
         # Pool pages per slot: 1 + num_speculative_blocks (checked above).
         self._state_pool_slot_pages = state_pages_per_slot
         self._kv_clearer = kv_clearer
+        if checkpointer is not None:
+            self._ckpt = checkpointer
+            self._ckpt_block_size = ckpt_block
+            self._ckpt_ones = torch.ones(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            logger.info(
+                "V2 prefix caching for recurrent state (Mamba align): %d-token "
+                "prefix-cache blocks (attention manager blocks split into %d kernel "
+                "blocks of %d tokens); block-boundary state checkpoints are vLLM "
+                "blocks in the shared KV pool, the running state stays in the "
+                "dedicated pool (%d checkpoint layer views)",
+                ckpt_block,
+                max(kernel_ratios),
+                ckpt_block // max(kernel_ratios),
+                len(checkpointer.ckpt),
+            )
         if state_caches:
             pool_bytes = sum(
                 state_pool_pages[g] * page_bytes
@@ -1903,11 +2004,12 @@ class NeuronModelRunnerV2:
             raise NotImplementedError(
                 f"recurrent-state layer {name!r} must have its own MambaSpec KV group"
             )
-        if layer_spec.mamba_cache_mode != "none":
+        expected_mode = "align" if self._prefix_caching else "none"
+        if layer_spec.mamba_cache_mode != expected_mode:
             raise NotImplementedError(
-                f"V2 runner supports only Mamba cache mode 'none' (dedicated state "
-                f"pools); got {layer_spec.mamba_cache_mode!r} for layer {name!r} "
-                "(prefix caching routes to V1)"
+                f"V2 runner needs Mamba cache mode {expected_mode!r} (prefix caching "
+                f"{'on' if self._prefix_caching else 'off'}); got "
+                f"{layer_spec.mamba_cache_mode!r} for layer {name!r}"
             )
         if layer_spec.num_speculative_blocks != self.num_speculative_tokens:
             raise NotImplementedError(
@@ -1921,19 +2023,101 @@ class NeuronModelRunnerV2:
                 f"MambaSpec layer {name!r} is not a recurrent-state layer of the model"
             )
 
+    def _prefix_cache_geometry(self, block_sizes: list[int]) -> tuple[int, int]:
+        """Return the prefix-cache block and the kernel blocks per attention block.
+
+        In Mamba ``align`` mode every KV group's block is the enlarged attention block
+        (vLLM unifies the page sizes to the state page), so a state checkpoint lines up
+        with an attention prefix block and vLLM hashes at that granularity (no partial
+        hits).
+
+        Args:
+            block_sizes: The KV-manager block size of each group.
+
+        Returns:
+            ``(block, ratio)``: the block in tokens, and ``block // --block-size``.
+
+        Raises:
+            ValueError: For unequal group block sizes, a block that is not a multiple
+                of the kernel block, or a block too small for a verify step.
+        """
+        sizes = set(block_sizes)
+        kernel = self._kernel_block_size or self.vllm_config.cache_config.block_size
+        if len(sizes) != 1:
+            raise ValueError(
+                "V2 prefix caching for recurrent state needs one block size for every "
+                f"KV cache group; got {block_sizes}"
+            )
+        block = sizes.pop()
+        if block % kernel:
+            raise ValueError(
+                f"prefix-cache block {block} is not a multiple of the attention kernel "
+                f"block {kernel}"
+            )
+        k = self.num_speculative_tokens
+        if k and block <= 2 * k + 1:
+            # A verify step, with the async scheduler's optimistic count, then reaches
+            # at most one block boundary (checkpoint_boundaries).
+            raise ValueError(
+                f"prefix-cache block {block} must exceed 2 * num_speculative_tokens + 1"
+            )
+        return block, block // kernel
+
+    def _build_state_checkpointer(
+        self,
+        kv_cache_config,
+        state_groups: list[int],
+        state_caches: dict[str, list[torch.Tensor]],
+        raw_by_layer: dict[str, torch.Tensor],
+        layer_pages: dict[str, tuple],
+        pages_per_slot: int,
+    ) -> hybrid_state.StateCheckpointer:
+        """Build the prefix-cache checkpoint copies of a recurrent-state model.
+
+        Args:
+            kv_cache_config: The KV cache config.
+            state_groups: The state KV groups, ascending.
+            state_caches: The dedicated pool halves of each state layer.
+            raw_by_layer: The shared raw buffer of each layer.
+            layer_pages: ``(layout, page bytes)`` of each state layer.
+            pages_per_slot: Pool pages per slot.
+
+        Returns:
+            The checkpointer (compiled for the device, eager on CPU).
+        """
+        groups = kv_cache_config.kv_cache_groups
+        layer_groups = [(g, list(groups[g].layer_names)) for g in state_groups]
+        names = [n for _, layer_names in layer_groups for n in layer_names]
+        pool_views = {
+            n: [hybrid_state.state_page_rows(h) for h in state_caches[n]] for n in names
+        }
+        ckpt_views = hybrid_state.shared_state_views(
+            {n: raw_by_layer[n] for n in names}, {n: layer_pages[n][1] for n in names}
+        )
+        return hybrid_state.StateCheckpointer(
+            pool_views,
+            ckpt_views,
+            layer_groups,
+            pages_per_slot,
+            self.device,
+            compiled=not self._is_cpu_mode(),
+        )
+
     def _build_kv_block_clearer(
-        self, kv_caches: dict
+        self, kv_caches: dict, ratio: int = 1
     ) -> hybrid_state.KVBlockClearer | None:
         """Return the clearer of newly allocated attention blocks, or None.
 
-        Block ids are global across KV groups. With dedicated pools the shared
+        Block ids are global across KV groups. Without prefix caching the shared
         buffer never holds float32 state, so clearing is defensive, kept for
-        parity with V1 (where the same model was validated). The model then
-        skips its own in-graph clearing. CPU runs keep the model's clearing,
-        as V1 does.
+        parity with V1 (where the same model was validated); with it, the state
+        checkpoints are blocks of the shared buffer. The model then skips its own
+        in-graph clearing. CPU runs keep the model's clearing, as V1 does.
 
         Args:
             kv_caches: ``{layer_name: [k_cache, v_cache]}`` of the attention layers.
+            ratio: Kernel blocks per KV-manager block (1 unless prefix caching
+                enlarged the attention blocks).
 
         Returns:
             The clearer, or None on CPU or for a model without the hook.
@@ -1947,9 +2131,9 @@ class NeuronModelRunnerV2:
         for entry in kv_caches.values():
             for cache in entry:
                 caches.setdefault(id(cache), cache)
-        # One manager block per kernel block: the state specs' one-page placeholder
-        # keeps the attention block at --block-size.
-        return hybrid_state.KVBlockClearer(list(caches.values()), 1, self.device)
+        # Without prefix caching one manager block per kernel block: the state specs'
+        # one-page placeholder keeps the attention block at --block-size.
+        return hybrid_state.KVBlockClearer(list(caches.values()), ratio, self.device)
 
     # ------------------------------------------------------------------
     # Execute and sample: async two-phase loop.
@@ -2039,6 +2223,8 @@ class NeuronModelRunnerV2:
             slot_mappings=model_input.slot_mappings,
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
             always_cached_seq_len=state_prefill,
+            # Prefix caching splits the attention groups' manager blocks.
+            block_sizes=self.block_sizes if self._prefix_caching else None,
         )
         if model_input.num_draft_by_row is not None:
             # The verify graph rebuilds each group's metadata once (slot mappings from
@@ -2187,6 +2373,11 @@ class NeuronModelRunnerV2:
                 for g in range(len(self.block_sizes))
             ]
 
+        if self._ckpt is not None:
+            # A request admitted with a cached prefix resumes from the state checkpoint
+            # at the prefix's last block boundary (before its prefill reads the page).
+            self._restore_prefix_checkpoints(scheduler_output)
+
         with record_function_or_nullcontext("neuron_model_runner: prepare_input"):
             model_input = self._prepare_model_input(scheduler_output)
         if self._host_input_specs:
@@ -2254,6 +2445,10 @@ class NeuronModelRunnerV2:
 
         # Store the state returned by this forward before the next step.
         self.apply_committed_state(*bundle)
+        if self._ckpt is not None:
+            # Checkpoint the state at a block boundary this step reached, from the
+            # counts it committed (device order: before any later step reads it).
+            self._save_prefix_checkpoints(scheduler_output, model_input)
 
         # Post-forward KV-connector work (DI): wait_for_save + finished sends/receives. Runs on EVERY
         # rank (execute_model runs on all ranks, unlike get_output). Carried on the pending step -- not
@@ -2301,6 +2496,96 @@ class NeuronModelRunnerV2:
             ),
         )
         return None
+
+    # ------------------------------------------------------------------
+    # Prefix caching of recurrent state (Mamba "align" mode).
+    # ------------------------------------------------------------------
+    def _ckpt_counts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The device computed counts and committed counts (ones without spec decode)."""
+        rs = self.request_state
+        accepted = rs.num_accepted if rs.num_accepted is not None else self._ckpt_ones
+        return rs.num_computed_tokens, accepted
+
+    def _ckpt_blocks(self, slot: int, column: int) -> list[int]:
+        """The block of each state group at ``column`` of a slot's rows (0: none)."""
+        rs = self.request_state
+        return [
+            int(rs.block_table(g)[slot, column])
+            if column < rs.num_blocks(g, slot)
+            else 0
+            for g in self._ckpt.group_ids
+        ]
+
+    def _restore_prefix_checkpoints(self, scheduler_output) -> None:
+        """Copy the cached state of each new request's prefix to its slot.
+
+        vLLM admits a request with ``num_computed_tokens`` > 0 when its prompt starts
+        with cached blocks; in ``align`` mode the hit ends on a block boundary, and the
+        state group's block there holds the state after exactly that many tokens. The
+        prefill then reads it as the initial state (``cached_seq_len > 0``).
+
+        Raises:
+            RuntimeError: If the hit is not block aligned or has no state block.
+        """
+        block = self._ckpt_block_size
+        rs = self.request_state
+        entries = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_computed = int(new_req.num_computed_tokens)
+            if num_computed <= 0:
+                continue
+            slot = rs.req_id_to_index[new_req.req_id]
+            blocks = self._ckpt_blocks(slot, num_computed // block - 1)
+            if num_computed % block or not all(blocks):
+                raise RuntimeError(
+                    f"request {new_req.req_id!r} was admitted with {num_computed} cached "
+                    f"tokens, but the recurrent state is checkpointed per {block}-token "
+                    f"block (state blocks {blocks})"
+                )
+            entries.append((slot, blocks))
+        if entries:
+            self._ckpt.restore(entries)
+
+    def _save_prefix_checkpoints(self, scheduler_output, model_input) -> None:
+        """Checkpoint the state of every row whose step can reach a block boundary.
+
+        The host proposes the candidates (:func:`hybrid_state.checkpoint_boundaries`);
+        the copy graph keeps a candidate only if the device counts this step committed
+        reach it, and copies the state of the token on the boundary. A prefill chunk
+        or a plain decode step ends exactly where the scheduler counts (one candidate
+        at most); a verify step's accepted count is known only on the device, and
+        under async scheduling the host count is optimistic by the in-flight step's
+        rejected drafts (at most ``k``).
+        """
+        rs = self.request_state
+        block = self._ckpt_block_size
+        is_verify = self.num_speculative_tokens > 0 and not model_input.is_prefill
+        slack = (
+            self.num_speculative_tokens
+            if is_verify and self.use_async_scheduling
+            else 0
+        )
+        active_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs] + list(
+            scheduler_output.scheduled_cached_reqs.req_ids
+        )
+        entries = []
+        for row, req_id in enumerate(active_req_ids):
+            slot = int(model_input.idx_mapping_np[row])
+            num_computed = int(rs.scheduler_num_computed_tokens[slot])
+            num_scheduled = int(scheduler_output.num_scheduled_tokens[req_id])
+            if is_verify:
+                boundaries = hybrid_state.checkpoint_boundaries(
+                    num_computed, num_scheduled, block, slack=slack
+                )
+            else:
+                end = num_computed + num_scheduled
+                boundaries = [end] if end % block == 0 else []
+            for boundary in boundaries:
+                blocks = self._ckpt_blocks(slot, boundary // block - 1)
+                if any(blocks):
+                    entries.append((slot, boundary, blocks))
+        if entries:
+            self._ckpt.save(entries, *self._ckpt_counts())
 
     def sample_tokens(self, grammar_output=None):
         """Format the pending step's output (phase 2). The state bundle was already applied in phase 1.
@@ -3628,11 +3913,17 @@ class NeuronModelRunnerV2:
             swa_width = self._swa_num_blocks[g]
             if g in self._state_groups:
                 # Recurrent-state group: the dedicated-pool pages of each row's slot.
+                # (With prefix caching the group's host rows hold the checkpoint
+                # blocks, a whole sequence wide; the graph sees the slot's pages only.)
                 rows = build_state_pool_rows(
                     idx_mapping_np,
                     padded_num_reqs,
                     self._state_pool_slot_pages,
-                    rs.block_table(g).shape[1],
+                    (
+                        self._state_pool_slot_pages
+                        if self._prefix_caching
+                        else rs.block_table(g).shape[1]
+                    ),
                     output_device=device,
                 )
                 offsets = None
@@ -3685,6 +3976,17 @@ class NeuronModelRunnerV2:
             padded = np.full(padded_num_tokens, NULL_BLOCK_ID, dtype=np.int64)
             padded[token_index] = flat
             slot_mappings.append(padded)
+        if self._prefix_caching and self._state_groups:
+            # The models tell a state group's valid tokens by slot > 0. In align mode
+            # the state blocks below the running one are the null block (and a chunk
+            # after a prefix hit spans such blocks), so use an attention group's slots.
+            attn_slots = slot_mappings[
+                next(
+                    g for g in range(len(slot_mappings)) if g not in self._state_groups
+                )
+            ]
+            for g in self._state_groups:
+                slot_mappings[g] = attn_slots
         slot_mapping = slot_mappings[0]
 
         # row_to_slot [R] (common): the sampling_params row-select on both flavors + the decode store
