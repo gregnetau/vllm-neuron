@@ -13,11 +13,16 @@ rejected) or an oracle that proposes the HF greedy continuation with deliberate 
 steps accept all, some or none of their drafts. Greedy outputs must equal the HF model's
 greedy continuation in every configuration.
 
+Every test runs for the dense model and for the sparse MoE one (``qwen3_5_moe``: every MLP,
+also the MTP head's, is a Qwen3_5SparseMoeBlock on the plugin's MoE ops' PyTorch fallbacks).
+
 Scenarios: requests arriving together, a long chunked prefill arriving while others decode
 (held back, or interleaved with decode steps), partial acceptance, and a request that runs to
 max_model_len (drafts trimmed by the scheduler near the end).
 """
 
+import inspect
+import itertools
 import json
 import os
 import sys
@@ -67,15 +72,38 @@ _TINY_QWEN3_5 = {
     },
 }
 
+# The sparse MoE checkpoint: same shapes, every MLP replaced by routed experts.
+_TINY_QWEN3_5_MOE = {
+    **{k: v for k, v in _TINY_QWEN3_5.items() if k != "intermediate_size"},
+    "architectures": ["Qwen3_5MoeForCausalLM"],
+    "model_type": "qwen3_5_moe_text",
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 48,
+}
+# The sparse MoE Qwen3.5 (qwen3_5_moe) is not on this branch: dense only.
+CHECKPOINTS = {"dense": _TINY_QWEN3_5}
+
 
 # ---------------------------------------------------------------- models (stubbed NKI)
 
 
-def _restore_stubbed_modules_now():
+def _restore_stubbed_modules_now(before):
     """Undo test_model_smoke's sys.modules stubs (as the conftest fixture does at
     teardown), keeping the models built against them. The runner and the schedulers
-    import vLLM lazily and need the real modules back."""
+    import vLLM lazily and need the real modules back. ``before``: sys.modules names
+    before the stubs; qwen3_5 modules imported against the stubs since (moe.py, imported
+    by model.py) are dropped too, so later imports and Dynamo's module guards see the
+    real ones."""
     import conftest
+
+    for name in [
+        n
+        for n in sys.modules
+        if n not in before and n.startswith("vllm_neuron.model.qwen3_5")
+    ]:
+        del sys.modules[name]
 
     for name, prev in conftest._REPLACED.items():
         if prev is conftest._MISSING:
@@ -139,19 +167,21 @@ class _GreedyTarget(torch.nn.Module):
         return logits.argmax(dim=-1).to(torch.int32), hidden, logits
 
 
-def _build_models():
+def _build_models(moe=False):
     """HF reference, Neuron target and MTP head (same random weights), built against
     test_model_smoke's stubs, which are then removed."""
+    before = set(sys.modules)
     import test_model_smoke as smoke
     import test_v2_runner_inputs as base
     from conftest import ROOT, _load
 
-    hf_model, model = base._hf_and_model()
+    hf_model, model = base._hf_and_model(moe)
     for i in ATTN_LAYERS:
         _torch_attention(model.model.layers[i].self_attn)
     mtp_mod = _load("vllm_neuron.model.qwen3_5.mtp", ROOT / "model/qwen3_5/mtp.py")
     hf_cfg = dict(hf_model.config.to_dict(), mtp_num_hidden_layers=1)
     mtp = mtp_mod.Qwen3_5MTP.from_configs(hf_cfg, NUM_LAYERS, None)
+    assert mtp.model.layers[0].is_moe == moe
     mtp.num_speculative_tokens = K  # set by load_draft_model when serving
     torch.manual_seed(11)
     with torch.no_grad():
@@ -166,7 +196,7 @@ def _build_models():
     mtp._materialize_buffers()
     _torch_attention(mtp.model.layers[0].self_attn)
     del smoke
-    _restore_stubbed_modules_now()
+    _restore_stubbed_modules_now(before)
     return hf_model, model, mtp
 
 
@@ -270,7 +300,9 @@ class _FullMetadataSpeculator(torch.nn.Module):
 # ---------------------------------------------------------------- engine harness
 
 
-def _vllm_config(tmp_path, *, async_scheduling, decode_steps):
+def _vllm_config(
+    tmp_path, checkpoint, *, async_scheduling, decode_steps, decode_ctx_buckets=None
+):
     from vllm.config import (
         CacheConfig,
         ModelConfig,
@@ -280,7 +312,7 @@ def _vllm_config(tmp_path, *, async_scheduling, decode_steps):
         VllmConfig,
     )
 
-    (tmp_path / "config.json").write_text(json.dumps(_TINY_QWEN3_5))
+    (tmp_path / "config.json").write_text(json.dumps(CHECKPOINTS[checkpoint]))
     model_config = ModelConfig(
         model=str(tmp_path),
         skip_tokenizer_init=True,
@@ -317,6 +349,9 @@ def _vllm_config(tmp_path, *, async_scheduling, decode_steps):
             }
         },
     )
+    if decode_ctx_buckets is not None:
+        neuron_config = vllm_config.additional_config["neuron_config"]
+        neuron_config["decode_context_length_buckets"] = decode_ctx_buckets
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     return vllm_config
 
@@ -469,10 +504,15 @@ class _Engine:
         raise AssertionError("engine did not finish")
 
 
+@pytest.fixture(scope="module", params=list(CHECKPOINTS))
+def checkpoint(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def models():
+def models(checkpoint):
     torch.manual_seed(3)
-    return _build_models()
+    return _build_models(moe=checkpoint == "moe")
 
 
 def _prompts(seed, lengths):
@@ -528,7 +568,7 @@ def _arrivals(prompts):
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("decode_steps", [0, 1], ids=["holdback", "interleave"])
 def test_oracle_drafts_partial_acceptance_match_hf(
-    tmp_path, models, scenario, async_scheduling, decode_steps
+    tmp_path, checkpoint, models, scenario, async_scheduling, decode_steps
 ):
     _, model, _ = models
     prompts, expected = scenario
@@ -542,7 +582,10 @@ def test_oracle_drafts_partial_acceptance_match_hf(
             corrupt |= {("b", p, 0), ("b", p, 1)}
 
     vllm_config = _vllm_config(
-        tmp_path, async_scheduling=async_scheduling, decode_steps=decode_steps
+        tmp_path,
+        checkpoint,
+        async_scheduling=async_scheduling,
+        decode_steps=decode_steps,
     )
     engine = _Engine(
         vllm_config,
@@ -578,11 +621,13 @@ def test_oracle_drafts_partial_acceptance_match_hf(
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
-def test_real_mtp_head_matches_hf(tmp_path, models, scenario, async_scheduling):
+def test_real_mtp_head_matches_hf(
+    tmp_path, checkpoint, models, scenario, async_scheduling
+):
     _, model, mtp = models
     prompts, expected = scenario
     vllm_config = _vllm_config(
-        tmp_path, async_scheduling=async_scheduling, decode_steps=1
+        tmp_path, checkpoint, async_scheduling=async_scheduling, decode_steps=1
     )
     engine = _Engine(vllm_config, model, mtp)
     engine.run(_arrivals(prompts))
@@ -642,11 +687,13 @@ def _reference_mtp_drafts(mtp, hf_model, tokens):
     return drafts[0].tolist()
 
 
-def test_all_drafts_rejected_and_logprobs(tmp_path, models):
+def test_all_drafts_rejected_and_logprobs(tmp_path, checkpoint, models):
     hf_model, model, _ = models
     prompts = dict(zip(["x", "y"], _prompts(9, [17, 25])))
     expected = {r: _hf_greedy(hf_model, p, 9) for r, p in prompts.items()}
-    vllm_config = _vllm_config(tmp_path, async_scheduling=True, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=True, decode_steps=0
+    )
     engine = _Engine(
         vllm_config,
         model,
@@ -679,11 +726,13 @@ def _logprob_rows(lists):
     ]
 
 
-def test_runner_state_after_scenario(tmp_path, models, scenario):
+def test_runner_state_after_scenario(tmp_path, checkpoint, models, scenario):
     """Pool pages are 1 + k per slot and state_in follows the accepted count."""
     _, model, _ = models
     prompts, expected = scenario
-    vllm_config = _vllm_config(tmp_path, async_scheduling=False, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=False, decode_steps=0
+    )
     engine = _Engine(
         vllm_config,
         model,
@@ -723,13 +772,25 @@ def test_runner_state_after_scenario(tmp_path, models, scenario):
     assert sorted({int(a[slot]) for _, a, _ in seen}) == [1, 3]
 
 
-def test_policy_and_runner_gate_spec_decode(tmp_path, monkeypatch):
+def test_policy_and_runner_gate_spec_decode(tmp_path, checkpoint, models):
     from vllm_neuron.vllm import model_runner_v2_policy as policy
 
-    vllm_config = _vllm_config(tmp_path, async_scheduling=True, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=True, decode_steps=0
+    )
     result = policy.get_neuron_model_runner_v2_policy(vllm_config)
     assert result.default_enabled is False  # V1 stays the default
     assert not any("speculative" in f for f in result.unsupported_features)
+    # vLLM's MTP draft config for the checkpoint, as load_draft_model resolves it: the
+    # MoE target's head is Qwen3_5MoeMTP, built with the MoE FFN from that config.
+    draft_config = vllm_config.speculative_config.draft_model_config
+    assert draft_config.architecture == (
+        "Qwen3_5MoeMTP" if checkpoint == "moe" else "Qwen3_5MTP"
+    )
+    mtp = models[2]
+    with torch.device("meta"):
+        draft = type(mtp).from_configs(draft_config.hf_config, NUM_LAYERS)
+    assert type(draft.model.layers[0].mlp) is type(mtp.model.layers[0].mlp)
     vllm_config.speculative_config.method = "eagle3"
     result = policy.get_neuron_model_runner_v2_policy(vllm_config)
     assert any("eagle3" in f for f in result.unsupported_features)
@@ -748,3 +809,235 @@ def test_policy_and_runner_gate_spec_decode(tmp_path, monkeypatch):
     ]
     with pytest.raises(ValueError, match=r"must exceed 1 \+ num_speculative_tokens"):
         NeuronModelRunnerV2(vllm_config, torch.device("cpu"))
+
+
+# ------------------------------------------------- decode context-length buckets
+
+CTX_BUCKETS = [128, 256]
+# The in-graph position checks read tensor values: eager runs only (not SPEC_DYNAMO).
+_EAGER_GRAPH_CHECKS = not os.environ.get("SPEC_DYNAMO")
+CTX_SCENARIO = {
+    # (request id, prompt length, max_tokens, arrival step)
+    "short": (20, 40, 0),
+    "x": (110, 40, 0),  # decodes across the 128 boundary next to "short"
+    # Later: two chunks while the others decode, then across 256 into the max_model_len
+    # graph next to "c", which outlives it (the bucket drops back to 128).
+    "y": (240, 30, 30),
+    "c": (9, 48, 30),
+}
+
+
+@pytest.fixture(scope="module")
+def ctx_scenario(models):
+    hf_model = models[0]
+    lengths = [v[0] for v in CTX_SCENARIO.values()]
+    prompts = dict(zip(CTX_SCENARIO, _prompts(13, lengths)))
+    expected = {
+        r: _hf_greedy(hf_model, prompts[r], min(n, MAX_MODEL_LEN - len(prompts[r])))
+        for r, (_, n, _) in CTX_SCENARIO.items()
+    }
+    return prompts, expected
+
+
+def _record_ctx_steps(monkeypatch, runner):
+    """Record every verify step's bucket, scheduler counts and per-layer table widths, and
+    check inside the graph that no position of the step's target tokens falls past its
+    attention table."""
+    from vllm_neuron.vllm.worker import neuron_forward_adapter as adapter_mod
+
+    steps = []
+    original = runner._build_forward_adapter_kwargs
+
+    def record(model_input, **kw):
+        kwargs = original(model_input, **kw)
+        if model_input.num_draft_by_row is not None:
+            rs = runner.request_state
+            slots = model_input.idx_mapping_np.astype(int)
+            steps.append(
+                {
+                    "bucket": model_input.decode_ctx_bucket,
+                    "num_computed": rs.scheduler_num_computed_tokens[slots].tolist(),
+                    "widths": {
+                        name: meta["block_table_tensor"].shape[1]
+                        for name, meta in kwargs["attn_metadata"].items()
+                    },
+                }
+            )
+        return kwargs
+
+    monkeypatch.setattr(runner, "_build_forward_adapter_kwargs", record)
+
+    build_verify_inputs = adapter_mod._build_verify_inputs
+
+    def checked_verify_inputs(**kw):
+        out = build_verify_inputs(**kw)
+        positions, metadata = out[2], out[3]
+        for meta in metadata.values():
+            if "state_in" not in meta:
+                limit = meta["block_table_tensor"].shape[1] * meta["block_size"]
+                assert int(positions.max()) < limit, (int(positions.max()), limit)
+        return out
+
+    if _EAGER_GRAPH_CHECKS:
+        monkeypatch.setattr(adapter_mod, "_build_verify_inputs", checked_verify_inputs)
+    return steps
+
+
+def _check_ctx_steps(runner, steps):
+    from vllm_neuron.vllm.worker.neuron_input_build import select_decode_ctx_bucket
+
+    groups = runner._kv_cache_config.kv_cache_groups
+    full = {
+        name: runner.request_state.block_table(g).shape[1]
+        for g, group in enumerate(groups)
+        for name in group.layer_names
+    }
+    state_layers = {
+        name for g in runner._state_groups for name in groups[g].layer_names
+    }
+    assert steps
+    for step in steps:
+        bucket = step["bucket"]
+        assert bucket == select_decode_ctx_bucket(
+            max(step["num_computed"]), 2 * K, CTX_BUCKETS, MAX_MODEL_LEN
+        )
+        attn_width = full[f"layers.{ATTN_LAYERS[0]}.self_attn"]
+        if bucket < MAX_MODEL_LEN:
+            attn_width = -(-bucket // BLOCK)
+        for name, width in step["widths"].items():
+            # State groups (1 + k pages) are never trimmed; every attention group,
+            # the MTP head's layer included, is trimmed alike.
+            assert width == (full[name] if name in state_layers else attn_width), name
+    buckets = [s["bucket"] for s in steps]
+    assert set(buckets) == {*CTX_BUCKETS, MAX_MODEL_LEN}
+    # A verify step whose rows all sit below a boundary but whose verify / draft
+    # positions straddle it runs in the next bucket.
+    for boundary in CTX_BUCKETS:
+        assert any(
+            max(s["num_computed"]) < boundary < max(s["num_computed"]) + 2 * K
+            and s["bucket"] > boundary
+            for s in steps
+        ), boundary
+    # Batches mix short and long contexts: the longest row picks the bucket.
+    assert any(
+        min(s["num_computed"]) < CTX_BUCKETS[0] and s["bucket"] > CTX_BUCKETS[0]
+        for s in steps
+    )
+    # The bucket follows the batch down again when a long request finishes.
+    assert any(a > b for a, b in itertools.pairwise(buckets))
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("draft", ["oracle", "mtp"])
+def test_decode_ctx_buckets_match_hf(
+    tmp_path, monkeypatch, checkpoint, models, ctx_scenario, async_scheduling, draft
+):
+    """Requests cross the 128 and 256 buckets (and reach the max_model_len graph) in
+    the middle of their generation, with MTP verify steps straddling each boundary and
+    batches mixing short and long contexts; greedy outputs equal HF's."""
+    _, model, mtp = models
+    prompts, expected = ctx_scenario
+    vllm_config = _vllm_config(
+        tmp_path,
+        checkpoint,
+        async_scheduling=async_scheduling,
+        decode_steps=1,
+        decode_ctx_buckets=CTX_BUCKETS,
+    )
+    if draft == "oracle":
+        # Partial acceptance around both boundaries.
+        corrupt = {("x", p, 1) for p in range(MAX_MODEL_LEN) if p % 3 == 0}
+        corrupt |= {("y", p, 0) for p in range(MAX_MODEL_LEN) if p % 4 == 1}
+        engine = _Engine(
+            vllm_config,
+            model,
+            lambda runner: _OracleDraft(runner, expected, corrupt),
+            oracle=True,
+        )
+    else:
+        engine = _Engine(vllm_config, model, mtp)
+        # The MTP head's draft steps build their slot mapping from the trimmed table:
+        # their positions (up to num_computed + 2k - 1) stay inside it.
+        head_globals = inspect.unwrap(type(mtp).forward).__globals__
+        slot_mapping = head_globals["_slot_mapping"]
+        draft_tables = []
+
+        def checked_slot_mapping(positions, block_table, block_size):
+            limit = block_table.shape[1] * block_size
+            assert int(positions.max()) < limit, (int(positions.max()), limit)
+            draft_tables.append(block_table.shape[1])
+            return slot_mapping(positions, block_table, block_size)
+
+        if _EAGER_GRAPH_CHECKS:
+            monkeypatch.setitem(head_globals, "_slot_mapping", checked_slot_mapping)
+    runner = engine.runner
+    assert runner.decode_ctx_buckets == CTX_BUCKETS
+    assert runner.decode_ctx_headroom == 2 * K
+    steps = _record_ctx_steps(monkeypatch, runner)
+    arrivals = {}
+    for req_id, (_, max_tokens, step) in CTX_SCENARIO.items():
+        arrivals.setdefault(step, []).append((req_id, prompts[req_id], max_tokens))
+    engine.run(arrivals)
+    _check(engine, expected, prompts)
+    assert engine.num_draft > 0
+    if draft == "oracle":
+        assert 0 < engine.num_accepted < engine.num_draft
+    else:
+        # The head's in-graph drafts (its attention reads the trimmed table) equal a
+        # from-scratch run of the head over each committed sequence.
+        for req_id, tokens, drafts in engine.drafts[::5]:
+            assert drafts == _reference_mtp_drafts(mtp, models[0], tokens), req_id
+        # Its draft steps ran on the trimmed tables of every bucket.
+        assert set(draft_tables) >= {8, 16} or not _EAGER_GRAPH_CHECKS
+    _check_ctx_steps(runner, steps)
+
+
+def test_decode_ctx_bucket_config_and_warmup_inputs(tmp_path, checkpoint, models):
+    from vllm_neuron.vllm import model_runner_v2_policy as policy
+    from vllm_neuron.vllm.worker.neuron_model_runner_v2 import NeuronModelRunnerV2
+
+    _, model, mtp = models
+    vllm_config = _vllm_config(
+        tmp_path,
+        checkpoint,
+        async_scheduling=True,
+        decode_steps=0,
+        decode_ctx_buckets=CTX_BUCKETS,
+    )
+    # The policy admits the buckets for a recurrent-state model with MTP.
+    result = policy.get_neuron_model_runner_v2_policy(vllm_config)
+    assert not any("context-length" in f for f in result.unsupported_features)
+    engine = _Engine(vllm_config, model, mtp)
+    runner = engine.runner
+    assert runner.neuron_config.decode_context_length_buckets == CTX_BUCKETS
+    groups = runner._kv_cache_config.kv_cache_groups
+    attn = [g for g in range(len(groups)) if g not in runner._state_groups]
+    # One verify graph per (row bucket, ctx bucket); each fixes the attention tables'
+    # width, the state tables keep theirs.
+    for ctx_bucket, width in ((128, 8), (256, 16), (MAX_MODEL_LEN, 24), (None, 8)):
+        for rows in runner.num_seqs_buckets:
+            model_input = runner._build_decode_synthetic_inputs(
+                rows, ctx_bucket=ctx_bucket
+            )
+            assert model_input.spec_width == 1 + K
+            assert model_input.decode_ctx_bucket == (ctx_bucket or 128)
+            for g, table in enumerate(model_input.block_tables):
+                state_width = runner.request_state.block_table(g).shape[1]
+                assert table.shape == (rows, width if g in attn else state_width), (
+                    g,
+                    ctx_bucket,
+                )
+    assert runner._decode_graph_name(4, 256) == f"decode_b4_s{1 + K}_ctx256"
+    with pytest.raises(ValueError, match="not configured"):
+        runner._build_decode_synthetic_inputs(1, ctx_bucket=192)
+    # Prefill graphs keep the whole table.
+    prefill = runner._build_prefill_synthetic_inputs(CHUNK)
+    assert prefill.decode_ctx_bucket is None
+    for g in attn:
+        assert prefill.block_tables[g].shape[1] == 24
+    # Invalid bucket lists fail at construction (multiples of 128 below max_model_len).
+    neuron_config = vllm_config.additional_config["neuron_config"]
+    for bad in ([100], [256, 128], [MAX_MODEL_LEN]):
+        neuron_config["decode_context_length_buckets"] = bad
+        with pytest.raises(ValueError, match="decode_context_length_buckets"):
+            NeuronModelRunnerV2(vllm_config, torch.device("cpu"))
