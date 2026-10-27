@@ -68,13 +68,71 @@ V2_COMPATIBLE_SCHEDULER_CLASSES = frozenset(
 )
 
 
-def _has_recurrent_state(model_config: object) -> bool:
-    """Whether the registered Neuron model class implements ``HasRecurrentState``."""
-    from vllm_neuron.model.interfaces import HasRecurrentState
+def _model_cls_implements(model_config: object, protocol_name: str) -> bool:
+    """Whether the registered Neuron model class implements an interfaces protocol."""
+    from vllm_neuron.model import interfaces
     from vllm_neuron.model.registry import get_model_cls
 
     model_cls = get_model_cls(_model_architectures(model_config))
-    return model_cls is not None and issubclass(model_cls, HasRecurrentState)
+    return model_cls is not None and issubclass(
+        model_cls, getattr(interfaces, protocol_name)
+    )
+
+
+def _has_recurrent_state(model_config: object) -> bool:
+    """Whether the registered Neuron model class implements ``HasRecurrentState``."""
+    return _model_cls_implements(model_config, "HasRecurrentState")
+
+
+def _serves_text_only(model_config: object) -> bool:
+    """Whether the registered Neuron model class implements ``ServesTextOnly``."""
+    return _model_cls_implements(model_config, "ServesTextOnly")
+
+
+def _resolves_segmented_prefill(vllm_config: object, neuron_cfg: dict) -> bool:
+    """Whether the V2 runner resolves segmented (chunked) prefill for a configuration.
+
+    Mirrors ``NeuronModelRunnerV2._build_neuron_config``: explicit
+    ``kv_segment_size_buckets`` enable it; otherwise the default is one segment size
+    equal to ``max_num_batched_tokens`` when that is a supported segment size below
+    ``max_model_len``, except for a non-packed FP8 KV cache whose model does not read
+    it in segmented prefill.
+
+    Args:
+        vllm_config: Configuration to inspect.
+        neuron_cfg: The ``additional_config["neuron_config"]`` dictionary.
+
+    Returns:
+        ``True`` when prefill is segmented.
+    """
+    from vllm_neuron.utils.bucket_utils import get_default_kv_segment_size_buckets
+
+    if "kv_segment_size_buckets" in neuron_cfg:
+        return bool(neuron_cfg["kv_segment_size_buckets"])
+    model_config = getattr(vllm_config, "model_config", None)
+    max_model_len = getattr(model_config, "max_model_len", None)
+    max_batched = getattr(
+        getattr(vllm_config, "scheduler_config", None), "max_num_batched_tokens", None
+    )
+    if not isinstance(max_model_len, int) or not isinstance(max_batched, int):
+        return False
+    cache_dtype = getattr(getattr(vllm_config, "cache_config", None), "cache_dtype", "")
+    if (
+        isinstance(cache_dtype, str)
+        and cache_dtype.startswith("fp8")
+        and not neuron_cfg.get("fp8_packed_kv", False)
+    ):
+        from vllm_neuron.model.registry import get_model_cls
+
+        model_cls = get_model_cls(_model_architectures(model_config))
+        if not getattr(model_cls, "SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV", False):
+            return False
+    return (
+        get_default_kv_segment_size_buckets(
+            min(max_batched, max_model_len), max_model_len
+        )
+        is not None
+    )
 
 
 def _model_architectures(model_config: object) -> list[str]:
@@ -175,6 +233,12 @@ def get_neuron_model_runner_v2_policy(
     cache_config = getattr(vllm_config, "cache_config", None)
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     unsupported: list[str] = []
+    # The plugin's model classes do not declare vLLM's IsHybrid or SupportsMultiModal
+    # interfaces, but model_config reflects vLLM's own class for the architecture (e.g.
+    # Qwen3_5ForConditionalGeneration is hybrid and multimodal there), since the Neuron
+    # classes are registered only in the worker. Read the Neuron class's capabilities.
+    recurrent_state = model_config is not None and _has_recurrent_state(model_config)
+    text_only = model_config is not None and _serves_text_only(model_config)
 
     dense_generate = model_config is not None
     if model_config is None:
@@ -199,7 +263,7 @@ def get_neuron_model_runner_v2_policy(
                 and not neuron_envs.VLLM_NEURON_ALLOW_V2_WIDE_EP
             ):
                 unsupported.append("Mixture-of-Experts with data parallelism")
-        if getattr(model_config, "is_hybrid", False):
+        if getattr(model_config, "is_hybrid", False) and not recurrent_state:
             unsupported.append("hybrid model")
             dense_generate = False
         if getattr(model_config, "is_attention_free", False):
@@ -208,7 +272,10 @@ def get_neuron_model_runner_v2_policy(
         if getattr(model_config, "is_encoder_decoder", False):
             unsupported.append("encoder-decoder model")
             dense_generate = False
-        if getattr(model_config, "multimodal_config", None) is not None:
+        if (
+            getattr(model_config, "multimodal_config", None) is not None
+            and not text_only
+        ):
             unsupported.append("multimodal model")
             dense_generate = False
         if getattr(model_config, "enable_prompt_embeds", False):
@@ -234,12 +301,21 @@ def get_neuron_model_runner_v2_policy(
         if unsupported_arch is not None:
             unsupported.append(f"model architecture {unsupported_arch}")
             dense_generate = False
-        # Hybrid models with recurrent-state layers (interfaces.HasRecurrentState): only the
-        # V1 runner allocates their state. The plugin's model classes do not declare vLLM's
-        # IsHybrid interface, so the is_hybrid check above does not see them.
-        if _has_recurrent_state(model_config):
-            unsupported.append("recurrent-state (hybrid) model")
+        # Hybrid models with recurrent-state layers (interfaces.HasRecurrentState) default to
+        # V1 while V2 support is validated, but are not recorded unsupported, so an explicit
+        # VLLM_USE_V2_MODEL_RUNNER=1 request is honored (same pattern as MoE and SWA). V2
+        # keeps the state in dedicated pools without speculative state blocks; the
+        # features below need V1 (speculative decoding is rejected for every model below).
+        if recurrent_state:
             dense_generate = False
+            if getattr(cache_config, "enable_prefix_caching", False):
+                unsupported.append("prefix caching for a recurrent-state model")
+            if neuron_envs.VLLM_NEURON_SHARED_STATE_POOL:
+                unsupported.append("shared recurrent-state pool")
+            if not _resolves_segmented_prefill(
+                vllm_config, _neuron_config_dict(vllm_config)
+            ):
+                unsupported.append("recurrent-state model without segmented prefill")
 
     if getattr(vllm_config, "diffusion_config", None) is not None:
         unsupported.append("diffusion model")
