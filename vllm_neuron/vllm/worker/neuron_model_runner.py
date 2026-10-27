@@ -377,6 +377,13 @@ class _SwaGroupState:
         )
 
 
+def _prefill_end(req_state: CachedRequestState) -> int:
+    """Tokens a request computes before it decodes: its prompt, or, when it resumes after a
+    preemption, every token it holds (the recompute covers its output tokens too; the last
+    one is the first decode input). The scheduler classifies requests the same way."""
+    return max(req_state.num_prompt_tokens, req_state.num_tokens - 1)
+
+
 def _supports_async_reorder(model: Any) -> bool:
     """Return True when the forward of the model consumes the in-graph reorder arguments.
 
@@ -5450,13 +5457,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return input_ids, positions, rotary_position_ids, padding_map
 
         # Check if any requests need padding (prefill requests)
-        # NOTE: A request is in prefill if num_computed_tokens < num_prompt_tokens.
-        # We cannot use "num_computed_tokens == 0" because prefix caching may have
-        # already set num_computed_tokens to a non-zero value for cached tokens.
+        # NOTE: A request is in prefill if num_computed_tokens < _prefill_end (its prompt,
+        # or all its tokens when it resumes after a preemption). We cannot use
+        # "num_computed_tokens == 0" because prefix caching may have already set
+        # num_computed_tokens to a non-zero value for cached tokens.
         has_prefill = any(
             req_id in self.requests
             and self.requests[req_id].num_computed_tokens
-            < self.requests[req_id].num_prompt_tokens
+            < _prefill_end(self.requests[req_id])
             for req_id in req_ids
         )
 
@@ -5501,8 +5509,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             req_state = self.requests[req_id]
             # NOTE: Use same prefill detection as has_prefill above (handles prefix caching)
-            num_prompt_tokens = req_state.num_prompt_tokens
-            is_prefill = req_state.num_computed_tokens < num_prompt_tokens
+            is_prefill = req_state.num_computed_tokens < _prefill_end(req_state)
 
             scheduled_tokens_padded = scheduler_output.num_scheduled_tokens_padded[
                 req_id
@@ -9478,7 +9485,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Check if batch row ``i`` is a request in decode phase.
 
         A request is in decode phase when all its prompt tokens have been
-        computed, i.e. ``num_computed_tokens >= num_prompt_tokens``.
+        computed, i.e. ``num_computed_tokens >= num_prompt_tokens`` (all its tokens
+        when it resumes after a preemption, ``_prefill_end``).
         Prefix-caching may set ``num_computed_tokens`` to a non-zero value
         before the first forward pass, so we cannot simply check for zero.
 
@@ -9492,7 +9500,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Unknown request — be conservative, treat as prefill
             return False
         num_computed = self.input_batch.num_computed_tokens_cpu[i]
-        return num_computed >= req_state.num_prompt_tokens
+        return num_computed >= _prefill_end(req_state)
 
     def _is_decode(self) -> bool:
         """Check if current batch is decode-only (no prefill requests).
@@ -11281,7 +11289,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             req_state = self.requests[req_id]
             num_computed = self.input_batch.num_computed_tokens_cpu[req_index]
             num_scheduled = num_scheduled_tokens.get(req_id, 0)
-            if num_computed + num_scheduled < req_state.num_prompt_tokens:
+            # A resumed request recomputes its output tokens too (num_tokens).
+            if num_computed + num_scheduled < req_state.num_tokens:
                 partial_prefill_req_ids.add(req_id)
 
         return partial_prefill_req_ids

@@ -63,6 +63,17 @@ def _kv_capacity_guidance() -> str:
     )
 
 
+def _prefill_end(request: Request) -> int:
+    """Tokens a request computes before it decodes: its prompt, or, when it resumes after a
+    preemption, every token it holds (the recompute covers its output tokens too; the last
+    one is the first decode input).
+
+    A decoding request has computed at least ``num_tokens - 1`` tokens (more under async
+    scheduling, which counts the steps in flight), so it is never classified as a prefill.
+    """
+    return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+
 def _kv_concurrency_override(max_concurrent: int) -> int:
     """Apply ``VLLM_NEURON_MAX_KV_CONCURRENT`` to the worst-case KV concurrency cap.
 
@@ -202,6 +213,10 @@ class NeuronScheduler(Scheduler):
         # Current scheduler state (updated after each schedule() call)
         self._state: SchedulerState = SchedulerState.IDLE
         self._kv_exhaustion_warned: bool = False
+        # Free KV blocks when a prefill step that hid the decodes scheduled nothing (the
+        # cache cannot hold the waiting request); None when no prefill is stalled. See
+        # _prefill_stalled().
+        self._prefill_stall_free_blocks: int | None = None
 
         # Prefill-async pipeline (pure kv_producer only -- prefill-only, decode is
         # remote; kv_both is excluded because it decodes locally). A do_remote_decode
@@ -449,7 +464,7 @@ class NeuronScheduler(Scheduler):
                     request = self.requests.get(req_id)
                     if request is None or request.is_finished():
                         continue
-                    if request.num_computed_tokens < request.num_prompt_tokens:
+                    if request.num_computed_tokens < _prefill_end(request):
                         continue
                     if not self.structured_output_manager.should_advance(request):
                         continue
@@ -679,8 +694,9 @@ class NeuronScheduler(Scheduler):
     def _is_prefill_request(self, request: Request) -> bool:
         """Check if a request is in prefill phase.
 
-        A request is in prefill if it hasn't finished processing all prompt tokens.
-        This is independent of which queue (waiting/running) it's in.
+        A request is in prefill if it hasn't finished processing all prompt tokens (all its
+        tokens when it resumes after a preemption, ``_prefill_end``). This is independent of
+        which queue (waiting/running) it's in.
 
         Args:
             request: The request to check.
@@ -688,7 +704,7 @@ class NeuronScheduler(Scheduler):
         Returns:
             True if request is in prefill phase, False if in decode phase.
         """
-        return request.num_computed_tokens < request.num_prompt_tokens
+        return request.num_computed_tokens < _prefill_end(request)
 
     def _kv_in_use(self) -> int:
         """Requests currently pinning KV blocks against the worst-case cap
@@ -775,7 +791,7 @@ class NeuronScheduler(Scheduler):
             for new_req in scheduler_output.scheduled_new_reqs:
                 request = self.requests.get(new_req.req_id)
                 if request is not None:
-                    if new_req.num_computed_tokens < request.num_prompt_tokens:
+                    if new_req.num_computed_tokens < _prefill_end(request):
                         has_prefill = True
                         break
 
@@ -786,7 +802,7 @@ class NeuronScheduler(Scheduler):
                     request = self.requests.get(req_id)
                     if request is not None:
                         num_computed = cached_reqs.num_computed_tokens[i]
-                        if num_computed < request.num_prompt_tokens:
+                        if num_computed < _prefill_end(request):
                             has_prefill = True
                             break
 
@@ -841,6 +857,7 @@ class NeuronScheduler(Scheduler):
         - Decode batch capacity
         - Prefill batch capacity (max 1 prefill at a time)
         - KV cache concurrency cap (worst-case max_model_len per request)
+        - A stalled prefill (_prefill_stalled)
 
         Note: We don't check bucket fit here because chunked prefill allows
         long prompts to be processed in multiple iterations. Each chunk will
@@ -862,6 +879,9 @@ class NeuronScheduler(Scheduler):
 
         # Check prefill batch capacity (only 1 prefill at a time)
         if len(self.waiting) >= self.max_prefills_per_batch:
+            return False
+
+        if self._prefill_stalled():
             return False
 
         # Prevent livelock: don't admit a new prefill if running requests
@@ -889,6 +909,26 @@ class NeuronScheduler(Scheduler):
                 )
             return False
 
+        return True
+
+    def _prefill_stalled(self) -> bool:
+        """Whether to hold the waiting requests back so the running decodes can run.
+
+        A prefill step hides the decodes, so the base scheduler can only preempt the prefill
+        request itself to make room. When the KV cache cannot hold the waiting request (for
+        example a preempted request being recomputed, once the overcommit of
+        ``VLLM_NEURON_MAX_KV_CONCURRENT`` has filled the cache), that step schedules nothing,
+        and retrying it every step would never run the decodes that hold the blocks. The
+        stall ends once blocks are freed (a request finishes or is preempted) or no request
+        is running.
+        """
+        stall = self._prefill_stall_free_blocks
+        if stall is None:
+            return False
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if not self.running or free > stall:
+            self._prefill_stall_free_blocks = None
+            return False
         return True
 
     @staticmethod
@@ -990,7 +1030,7 @@ class NeuronScheduler(Scheduler):
 
             # Use num_computed_tokens from SchedulerOutput (pre-increment value)
             num_computed = req_num_computed.get(req_id, request.num_computed_tokens)
-            is_prefill = num_computed < request.num_prompt_tokens
+            is_prefill = num_computed < _prefill_end(request)
 
             # A last-token re-compute (the prompt is already available; only
             # the final token is re-computed for sampling) is decode-shaped
@@ -1071,7 +1111,7 @@ class NeuronScheduler(Scheduler):
                 for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
                 if self.requests.get(req_id)
                 and req_num_computed.get(req_id, 0)
-                < self.requests[req_id].num_prompt_tokens
+                < _prefill_end(self.requests[req_id])
             )
             if original_total > 0:
                 batch_overhead_pct = (total_padding_this_batch / original_total) * 100
@@ -1167,6 +1207,7 @@ class NeuronScheduler(Scheduler):
             and self._kv_in_use() < self._max_kv_concurrent
         )
         running_holdback: list[Request] = []
+        decodes_hidden_for_prefill = False
         max_num_running_reqs_override: int | None = None
         decode_running = [
             req for req in self.running if not self._is_prefill_request(req)
@@ -1195,6 +1236,7 @@ class NeuronScheduler(Scheduler):
         elif self.has_prefill_in_running:
             # 3.1 Ongoing prefill segments in running queue - hide decode requests
             running_holdback = decode_running
+            decodes_hidden_for_prefill = bool(running_holdback)
             self.running = [
                 req for req in self.running if self._is_prefill_request(req)
             ]
@@ -1233,6 +1275,7 @@ class NeuronScheduler(Scheduler):
         elif can_start_prefill:
             # 3.2 New requests waiting for prefill - hide decode requests
             running_holdback = self.running
+            decodes_hidden_for_prefill = bool(running_holdback)
             self.running = []
             if running_holdback:
                 self._interleave_decodes_left = self._decode_steps_between_chunks
@@ -1338,6 +1381,20 @@ class NeuronScheduler(Scheduler):
             scheduler_output = self._call_base_schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs = original_max_num_running_reqs
+
+        if (
+            decodes_hidden_for_prefill
+            and scheduler_output.total_num_scheduled_tokens == 0
+        ):
+            self._prefill_stall_free_blocks = (
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+            )
+            logger.debug(
+                "Prefill stalled: no KV room with %d decode request(s) hidden, "
+                "%d free blocks; running the decodes until blocks are freed",
+                len(running_holdback),
+                self._prefill_stall_free_blocks,
+            )
 
         # Step 5: Restore holdbacks
         self.running = self.running + running_holdback
