@@ -150,6 +150,44 @@ def test_mtp_needs_v1_for_other_models_and_kv_transfer():
     )
 
 
+@pytest.mark.parametrize("spec", [None, SimpleNamespace(method="mtp")])
+def test_hybrid_decode_ctx_buckets_are_honored_when_forced(monkeypatch, spec):
+    # V2 trims the attention tables per decode context bucket for recurrent-state
+    # models, with and without MTP; V1 stays the default.
+    cfg = _vllm_config(
+        spec=spec,
+        max_model_len=65536,
+        neuron_config={"decode_context_length_buckets": [16384]},
+    )
+    assert policy.get_neuron_model_runner_v2_policy(cfg) == (
+        policy.NeuronModelRunnerPolicy(False, ())
+    )
+    assert _decide(monkeypatch, cfg, forced=False) == (False, None)
+    assert _decide(monkeypatch, cfg, forced=True) == (True, None)
+
+
+def test_decode_ctx_buckets_keep_their_other_gates():
+    buckets = {"decode_context_length_buckets": [16384]}
+    # Models without recurrent state still need V1 for them.
+    dense = _vllm_config(
+        arch="LlamaForCausalLM",
+        is_hybrid=False,
+        multimodal=False,
+        neuron_config=buckets,
+    )
+    assert policy.get_neuron_model_runner_v2_policy(dense).unsupported_features == (
+        "decode context-length bucketing",
+    )
+    # The bucket is not synchronized across DP ranks that share graph collectives.
+    ep_dp = _vllm_config(neuron_config=buckets)
+    ep_dp.parallel_config = SimpleNamespace(
+        data_parallel_size=2, enable_expert_parallel=True
+    )
+    assert "decode context-length bucketing with expert and data parallelism" in (
+        policy.get_neuron_model_runner_v2_policy(ep_dp).unsupported_features
+    )
+
+
 def test_hybrid_shared_state_pool_needs_v1(monkeypatch):
     monkeypatch.setenv("VLLM_NEURON_SHARED_STATE_POOL", "1")
     cfg = _vllm_config()
