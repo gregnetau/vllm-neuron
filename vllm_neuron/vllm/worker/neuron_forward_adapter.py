@@ -264,12 +264,16 @@ def _compute_next_device_state_multi(
 
     # The last committed token of each row feeds the next step.
     last_col = torch.clamp(committed_by_slot.to(torch.int64) - 1, min=0, max=width - 1)
-    token_by_slot = sampled_2d.to(token_ids.dtype)[row_idx]  # [max_num_reqs, width]
-    # One-hot select rather than torch.gather along dim 1: neuronx-cc fails the 2-D
-    # gather here (NCC_ISMP902, simplifier "tuple index out of range").
-    cols = torch.arange(width, dtype=torch.int64, device=token_by_slot.device)
-    pick = (cols.view(1, -1) == last_col.view(-1, 1)).to(token_by_slot.dtype)
-    last_by_slot = (token_by_slot * pick).sum(dim=1, keepdim=True)
+    # One 1-D gather per column, and a select for the last committed token: neuronx-cc
+    # fails 2-D gathers here (NCC_ISMP902, simplifier "tuple index out of range").
+    token_by_slot = [
+        sampled_2d[:, col].reshape(-1).to(token_ids.dtype)[row_idx]
+        for col in range(width)
+    ]  # width x [max_num_reqs]
+    last_by_slot = torch.zeros_like(token_by_slot[0])
+    for col in range(width):
+        last_by_slot = torch.where(last_col == col, token_by_slot[col], last_by_slot)
+    last_by_slot = last_by_slot.view(-1, 1)
     new_last_sampled = torch.where(
         commit.view(-1, 1),
         last_by_slot.to(last_sampled_tokens.dtype),
@@ -285,7 +289,7 @@ def _compute_next_device_state_multi(
         store = commit & (committed_by_slot > col) & (dest < max_model_len)
         append_col = torch.clamp(dest, max=max_model_len - 1)
         old_token_at_append = token_ids[state_rows, append_col]
-        token_to_store = torch.where(store, token_by_slot[:, col], old_token_at_append)
+        token_to_store = torch.where(store, token_by_slot[col], old_token_at_append)
         token_ids.index_put_((state_rows, append_col), token_to_store)
         stored = stored + store.to(total_len.dtype)
     new_token_ids = token_ids
