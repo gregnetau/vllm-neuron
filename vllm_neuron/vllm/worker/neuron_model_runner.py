@@ -2603,12 +2603,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         prev_sampled, dummy_rows, filled_draft_counts = self._fill_from_last_spec_rows(
             prev_sampled, dummy_rows, prev_future if use_real_prev else None
         )
-        # A real row comes from a spec step with a full num_spec_tokens bucket, so its
-        # draft count is num_spec (we never mid-trim draft counts —
-        # NeuronAsyncScheduler clears spec_token_ids entirely near max_model_len).
-        # Filled rows carry their own count, which makes the position correction a no-op.
+        # A real row of the previous step passes the drafts that step verified for the
+        # request: num_spec, or 0 once NeuronAsyncScheduler stopped drafting for it near
+        # max_model_len (the step then mixes rows with and without drafts). Filled rows
+        # carry their own count, which makes the position correction a no-op.
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+
+        def _prev_step_drafts(i: int) -> int:
+            # Rows of the previous step: the drafts that step really verified for the
+            # request (fewer than num_spec when the scheduler stopped drafting for it).
+            rec = self._last_spec_rows.get(req_ids[i]) if i < len(req_ids) else None
+            if use_real_prev and rec is not None and rec[0] is prev_future:
+                return num_spec if rec[2] is None else rec[2]
+            return num_spec
+
         draft_counts = [
-            0 if i in dummy_rows else filled_draft_counts.get(i, num_spec)
+            0 if i in dummy_rows else filled_draft_counts.get(i, _prev_step_drafts(i))
             for i in range(num_reqs_padded)
         ]
         prev_num_draft_tokens_tensor = torch.tensor(draft_counts, dtype=torch.int32).to(
@@ -2617,10 +2627,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         return prev_sampled, prev_num_draft_tokens_tensor
 
-    def _record_last_spec_rows(self, sampled_token_ids, req_ids: list[str]) -> None:
+    def _record_last_spec_rows(
+        self,
+        sampled_token_ids,
+        req_ids: list[str],
+        spec_tokens: dict[str, list[int]] | None = None,
+    ) -> None:
         """Remember each request's row of its latest spec-step output (device future
-        [bs, num_spec + 1]), for the correction of a later step it is part of; a request in
-        a non-spec step drops its row. Rows of finished requests are dropped."""
+        [bs, num_spec + 1]) and its number of drafts in that step, for the correction of a
+        later step it is part of; a request in a non-spec step drops its row. Rows of
+        finished requests are dropped.
+
+        The draft count matters near max_model_len, where the scheduler stops drafting for
+        some requests: a spec step then mixes rows with and without drafts."""
         rows = self._last_spec_rows
         is_spec = (
             isinstance(sampled_token_ids, torch.Tensor)
@@ -2629,7 +2648,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
         for i, req_id in enumerate(req_ids):
             if is_spec:
-                rows[req_id] = (sampled_token_ids, i)
+                n_drafts = (
+                    len(spec_tokens.get(req_id, ()))
+                    if spec_tokens is not None
+                    else None
+                )
+                rows[req_id] = (sampled_token_ids, i, n_drafts)
             else:
                 rows.pop(req_id, None)
         for req_id in [r for r in rows if r not in self.requests]:
@@ -2663,7 +2687,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ]
         if not fill:
             return prev_sampled, dummy_rows, {}
-        src = torch.cat([future[row : row + 1] for _, (future, row) in fill]).cpu()
+        src = torch.cat([future[row : row + 1] for _, (future, row, _) in fill]).cpu()
         vocab_size = getattr(self.input_batch, "vocab_size", None)
         valid = src != -1
         if vocab_size is not None:
@@ -10656,7 +10680,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 req_ids_output_copy
             )
             self._record_last_spec_rows(
-                sampler_output.sampled_token_ids, req_ids_output_copy
+                sampler_output.sampled_token_ids,
+                req_ids_output_copy,
+                getattr(scheduler_output, "scheduled_spec_decode_tokens", None),
             )
             return model_runner_output
 
