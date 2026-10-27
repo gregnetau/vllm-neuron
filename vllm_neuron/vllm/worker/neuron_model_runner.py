@@ -24,7 +24,6 @@ import numpy as np
 import torch
 from vllm import ModelRegistry
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
@@ -39,11 +38,10 @@ from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
 from vllm_neuron.model.state_cache import (
-    page_layout as _state_page_layout,
-    padded_state_page_bytes as _padded_state_page_bytes,
     paired_half_views as _paired_half_views,
     state_half_elems as _state_half_elems,
 )
+from vllm_neuron.vllm.worker import hybrid_state
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.lnc import get_explicit_compiler_lnc_arg
 from vllm.v1.kv_cache_interface import (
@@ -130,28 +128,6 @@ logger = logging.getLogger(__name__)
 NULL_BLOCK_ID = 0
 # Read-side sentinel for block tables; write-side padding uses NULL_BLOCK_ID.
 PAD_SLOT_ID = -1
-
-
-# Manager blocks cleared per call of the compiled KV-clearing graph (fixed shape: one compile).
-_KV_CLEAR_CHUNK = 8
-# Recurrent-state pages are padded to a whole number of this many attention-block tokens:
-# vLLM enlarges the attention block to (state page / attention page) * block_size tokens, and
-# the decode attention kernels need that to be a multiple of 128.
-_STATE_PAGE_ALIGN_TOKENS = 256
-
-
-def _zero_kv_blocks(
-    caches: list[torch.Tensor], kernel_blocks: torch.Tensor
-) -> torch.Tensor:
-    """Zero kernel blocks [N] of every KV cache tensor [num_kernel_blocks, ...] in place."""
-    for cache in caches:
-        zeros = torch.zeros(
-            (kernel_blocks.shape[0],) + tuple(cache.shape[1:]),
-            dtype=cache.dtype,
-            device=cache.device,
-        )
-        cache.index_put_((kernel_blocks,), zeros)
-    return kernel_blocks.sum()
 
 
 # State-page copies per call of the compiled Mamba-align copy graph (fixed shape).
@@ -3118,8 +3094,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             or self.device.type == "cpu"
         ):
             return
-        from vllm_neuron.envs import get_compile_backend_name
-
         groups, caches, ratios = [], [], set()
         for gi, (group, bs) in enumerate(
             zip(kv_cache_config.kv_cache_groups, block_sizes)
@@ -3139,10 +3113,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._kv_clear_block_tokens = kv_cache_config.kv_cache_groups[
             groups[0]
         ].kv_cache_spec.block_size
-        self._kv_clear_ratio = ratios.pop()
-        self._kv_clear_caches = caches
-        self._kv_clear_fn = torch.compile(
-            _zero_kv_blocks, backend=get_compile_backend_name(), dynamic=False
+        self._kv_clearer = hybrid_state.KVBlockClearer(
+            caches, ratios.pop(), self.device
         )
         self.model.set_runner_clears_kv_blocks(True)
         drafter_model = (
@@ -3166,14 +3138,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._clear_kv_blocks([0])
 
     def _clear_kv_blocks(self, manager_blocks: list[int]) -> None:
-        ratio = self._kv_clear_ratio
-        for start in range(0, len(manager_blocks), _KV_CLEAR_CHUNK):
-            chunk = manager_blocks[start : start + _KV_CLEAR_CHUNK]
-            chunk = chunk + [0] * (_KV_CLEAR_CHUNK - len(chunk))
-            kernel_blocks = (
-                torch.tensor(chunk)[:, None] * ratio + torch.arange(ratio)
-            ).reshape(-1)
-            self._kv_clear_fn(self._kv_clear_caches, kernel_blocks.to(self.device))
+        self._kv_clearer.clear_blocks(manager_blocks)
 
     def _clear_new_attention_blocks(self, scheduler_output: "SchedulerOutput") -> None:
         if not getattr(self, "_kv_clear_groups", None):
@@ -3219,9 +3184,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         shared pool stay unused; their spec reports a one-block placeholder page (see
         _build_state_cache_specs). Prefix caching keeps cached state blocks, so it uses the
         shared pool."""
-        if not self._dedicated_state_pool() or spec.mamba_cache_mode != "none":
-            return 0
-        return 1 + self.max_num_reqs * (1 + spec.num_speculative_blocks)
+        return hybrid_state.state_pool_pages(
+            spec, self.max_num_reqs, self._dedicated_state_pool()
+        )
 
     def _dedicated_state_pool(self) -> bool:
         """Recurrent state in dedicated pools rather than vLLM's shared KV pool."""
@@ -3232,10 +3197,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _state_page(self, layer_name: str, spec: "MambaSpec") -> tuple:
         """(layout, page bytes) of a recurrent-state layer's real page: the spec's own, or the
         one recorded for a dedicated pool, whose spec carries a placeholder page."""
-        real = getattr(self, "_state_real_pages", {}).get(layer_name)
-        if real is not None:
-            return real
-        return _state_page_layout(spec.shapes, spec.dtypes), spec.page_size_bytes
+        return hybrid_state.state_page(
+            layer_name, spec, getattr(self, "_state_real_pages", {})
+        )
 
     def kv_side_cache_ratio(self) -> float:
         """Bytes the model allocates outside the KV pool per byte of attention KV cache.
@@ -12565,15 +12529,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     if n_pages:
                         # Dedicated pool (see _state_pool_pages): the shared raw tensor is
                         # bound only as attention KV, so graphs see each pool byte once.
-                        state_caches[layer_name] = [
-                            torch.zeros(
-                                n_pages,
-                                page_bytes // 8,
-                                dtype=torch.float32,
-                                device=self.device,
+                        state_caches.update(
+                            hybrid_state.allocate_state_pool(
+                                {layer_name: (layout, page_bytes)}, n_pages, self.device
                             )
-                            for _ in range(2)
-                        ]
+                        )
                     else:
                         state_caches[layer_name] = list(
                             _paired_half_views(
@@ -12682,49 +12642,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise NotImplementedError(
                     "MTP for models with recurrent state supports up to 2 draft tokens."
                 )
-        attn_page = max((s.page_size_bytes for s in attn_specs.values()), default=1)
-        # Pad the state page to whole _STATE_PAGE_ALIGN_TOKENS attention blocks.
-        kernel_block = self.vllm_config.cache_config.block_size
-        align = _STATE_PAGE_ALIGN_TOKENS
-        align_pages = max(1, align // kernel_block) if align % kernel_block == 0 else 1
-        specs = {}
         # With a dedicated pool the state never lives in vLLM's shared pool, but vLLM still
         # allocates its (1 + k) blocks per request there. Report a placeholder page of one
         # 256-token attention block instead of the real (padded) page: each unused block then
         # costs one attention block, and vLLM no longer enlarges the attention block to the
         # state page (2048 tokens with FP8 KV). The real page is kept for the pool.
-        dedicated = self._dedicated_state_pool()
-        self._state_real_pages = {}
-        for layer in state_layers:
-            layout = _state_page_layout(layer.shapes, layer.dtypes)
-            page = _padded_state_page_bytes(layout.page_bytes, attn_page, align_pages)
-            # Power-of-two attention pages per state page, so the enlarged attention block
-            # divides max_model_len (e.g. Qwen3.8-27B with FP8 KV would otherwise give 1792-token
-            # blocks, block tables of 1064 entries, and odd-stride FP8 DMAs neuronx-cc rejects).
-            page = attn_page * (1 << (page // attn_page - 1).bit_length())
-            shapes, dtypes = tuple(layer.shapes), tuple(layer.dtypes)
-            if dedicated:
-                self._state_real_pages[layer.name] = (layout, page)
-                page, shapes, dtypes = (
-                    attn_page * align_pages,
-                    ((1,),),
-                    (torch.float32,),
-                )
-            if cache_config.enable_prefix_caching:
-                block_size = page // attn_page * kernel_block
-                mode = "align"
-            else:
-                # One state page per request: a single block spans the whole context.
-                block_size, mode = self.max_model_len, "none"
-            specs[layer.name] = MambaSpec(
-                block_size=block_size,
-                shapes=shapes,
-                dtypes=dtypes,
-                page_size_padded=page,
-                mamba_type=MambaAttentionBackendEnum[layer.mamba_type],
-                mamba_cache_mode=mode,
-                num_speculative_blocks=num_spec_blocks,
-            )
+        kernel_block = cache_config.block_size
+        specs, self._state_real_pages = hybrid_state.build_state_cache_specs(
+            state_layers,
+            attn_specs,
+            kernel_block=kernel_block,
+            max_model_len=self.max_model_len,
+            prefix_caching=cache_config.enable_prefix_caching,
+            dedicated=self._dedicated_state_pool(),
+            num_spec_blocks=num_spec_blocks,
+            placeholder_pages=hybrid_state.state_page_align_pages(kernel_block),
+        )
         return specs
 
     def _kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> list[int]:
