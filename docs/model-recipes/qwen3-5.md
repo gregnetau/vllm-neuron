@@ -64,7 +64,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | torch.compile, native route (`BACKEND=neuron_native`) | ✅ (slower, see [Compilation](#compilation)) |
 | | CPU mode (unit tests) | ✅ |
 | **Runner** | Model Runner V1 | ✅ |
-| | Model Runner V2 | ❌ (hybrid models and speculative decoding route to V1) |
+| | Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`; hybrid state and MTP) | 🧪 (opt-in; V1 is the default, see [the design note](../design/speculation/mrv2-spec-decode.md)) |
 
 **Status legend:**
 
@@ -283,6 +283,16 @@ MODEL=<path-to-checkpoint>/Qwen3.5-35B-A3B MTP_TOKENS=2 GPU_MEM_UTIL=0.9 \
 
 With `GPU_MEM_UTIL=0.9` and the default `KV_CAP_FRACTION=0.15` the KV/state pool is about
 3.2 GiB per rank (`0.15 * 0.9 * 24 GiB`), leaving about 3.7 GiB for compiled graphs and scratch.
+
+Model Runner V2 with MTP (`VLLM_USE_V2_MODEL_RUNNER=1`, see
+[the V2 design note](../design/speculation/mrv2-spec-decode.md#sparse-moe-targets)) serves the
+MoE checkpoint like the dense ones; it is validated on CPU only (HF parity through the V2
+runner and the real schedulers on a small random MoE checkpoint):
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<path-to-checkpoint>/Qwen3.5-35B-A3B TP=4 MTP_TOKENS=2 \
+    MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" GPU_MEM_UTIL=0.9 examples/vllm_neuron/models/qwen3_5/serve.sh
+```
 
 ### Prefix caching
 
@@ -586,7 +596,9 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
   segmented prefill kernel replaced the PyTorch prefill attention.
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
-- **Model Runner V2 is not supported.** Hybrid models and speculative decoding run on V1.
+- **Model Runner V2 is opt-in** (`VLLM_USE_V2_MODEL_RUNNER=1`): hybrid state and MTP run on V2
+  only when forced, without prefix caching or `DECODE_CTX_BUCKETS`; the MoE checkpoint on V2 is
+  validated on CPU only.
 - **`logprobs` requests fail with MTP**: with on-device rejection sampling the runner returns
   no log-probabilities for the speculative tokens, and vLLM's endpoint fails (HTTP 500). Serve
   without `MTP_TOKENS` when `logprobs` are needed.
@@ -655,7 +667,8 @@ Next:
 4. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
 5. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
    draft's `lm_head`.
-6. **Model Runner V2** together with MTP: speculative decoding and hybrid state on V2.
+6. **Model Runner V2** together with MTP: device parity runs (Qwen3.8-27B, Qwen3.5-35B-A3B)
+   before V2 becomes the default.
 7. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, plus latency and throughput sweeps over context length and batch size.
 
