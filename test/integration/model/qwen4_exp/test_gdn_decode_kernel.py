@@ -9,15 +9,21 @@ by 12 PyTorch decode steps from zero, then one step runs through both paths from
 Padded batch rows (block table -1) must leave every page untouched and give zero output.
 
 Needs one Neuron device and NKI; skipped otherwise. Select the NeuronCore with the usual
-runtime environment (e.g. ``NEURON_RT_VISIBLE_CORES``):
+runtime environment (e.g. ``NEURON_RT_VISIBLE_CORES``). The compiled programs contain collective
+operations even on one logical core, so the runtime needs ``NEURON_RT_ROOT_COMM_ID`` to load them
+(defaulted below to a local port):
 
-    pytest test/integration/model/qwen4_exp/test_gdn_decode_kernel.py -v -s
+    NEURON_RT_VISIBLE_CORES=0 pytest test/integration/model/qwen4_exp/test_gdn_decode_kernel.py -v -s
 """
 
+import os
 import types
 
 import pytest
 import torch
+
+# Without it nrt_load rejects the programs ("cannot load NEFF with collective operations").
+os.environ.setdefault("NEURON_RT_ROOT_COMM_ID", "localhost:62182")
 
 
 def _neuron_available() -> bool:
@@ -125,7 +131,8 @@ def test_gdn_decode_kernel_matches_torch(B, pad):
         torch.zeros(B, H, device=dev), max_requests=m.DECODE_KERNEL_MAX_REQUESTS
     )
     for _ in range(12):
-        f_torch(torch.randn(B, H, generator=g).bfloat16().to(dev), bt.to(dev))
+        y = f_torch(torch.randn(B, H, generator=g).bfloat16().to(dev), bt.to(dev))
+        y.cpu()  # wait: unsynchronised steps can overrun the runtime's execution queue
     x = torch.randn(B, H, generator=g).bfloat16()
     sa0, sb0 = (
         m.state_a.cpu().reshape(PAGES, HALF),
