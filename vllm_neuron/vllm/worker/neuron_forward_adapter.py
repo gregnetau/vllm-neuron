@@ -265,7 +265,11 @@ def _compute_next_device_state_multi(
     # The last committed token of each row feeds the next step.
     last_col = torch.clamp(committed_by_slot.to(torch.int64) - 1, min=0, max=width - 1)
     token_by_slot = sampled_2d.to(token_ids.dtype)[row_idx]  # [max_num_reqs, width]
-    last_by_slot = torch.gather(token_by_slot, 1, last_col.view(-1, 1))
+    # One-hot select rather than torch.gather along dim 1: neuronx-cc fails the 2-D
+    # gather here (NCC_ISMP902, simplifier "tuple index out of range").
+    cols = torch.arange(width, dtype=torch.int64, device=token_by_slot.device)
+    pick = (cols.view(1, -1) == last_col.view(-1, 1)).to(token_by_slot.dtype)
+    last_by_slot = (token_by_slot * pick).sum(dim=1, keepdim=True)
     new_last_sampled = torch.where(
         commit.view(-1, 1),
         last_by_slot.to(last_sampled_tokens.dtype),
