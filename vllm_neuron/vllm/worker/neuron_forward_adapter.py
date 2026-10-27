@@ -349,9 +349,12 @@ def _build_verify_inputs(
     )
 
     new_metadata: dict[str, dict] = {}
+    # One rebuilt dict per KV group (the runner tags each group's dict with its
+    # constant kv_group index); untagged metadata is rebuilt per layer.
     by_group: dict[int, dict] = {}
     for layer_name, meta in attn_metadata.items():
-        new_meta = by_group.get(id(meta))
+        group = meta.get("kv_group")
+        new_meta = by_group.get(group) if group is not None else None
         if new_meta is None:
             new_meta = dict(meta)
             if "state_in" in meta:
@@ -367,7 +370,8 @@ def _build_verify_inputs(
                 null_slot = torch.full_like(slots, NULL_SLOT)
                 slots = torch.where(token_valid & (block_ids >= 0), slots, null_slot)
                 new_meta["slot_mapping"] = slots.reshape(-1)
-            by_group[id(meta)] = new_meta
+            if group is not None:
+                by_group[group] = new_meta
         new_metadata[layer_name] = new_meta
     return (
         input_ids,
