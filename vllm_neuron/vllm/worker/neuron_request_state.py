@@ -9,7 +9,9 @@ Authority table:
 
 * Device-authoritative mutable state consists of the ``torch.int32`` tensors
   ``token_ids``, ``num_computed_tokens``, ``total_len``, and
-  ``last_sampled_tokens``.
+  ``last_sampled_tokens``, plus ``draft_tokens`` and ``num_accepted`` with
+  speculative decoding (the drafts each slot's last step proposed and the
+  tokens it committed).
 * Host-authoritative immutable metadata consists of the ``np.int32`` arrays
   ``prompt_len``, ``prefill_len``, and ``max_seq_len``.
 * ``scheduler_num_computed_tokens`` is host advisory progress used for
@@ -123,8 +125,10 @@ class NeuronRequestState:
         vocab_size: int,
         device: torch.device,
         block_sizes: list[int],
+        num_speculative_tokens: int = 0,
     ) -> None:
         self.max_num_reqs = max_num_reqs
+        self.num_speculative_tokens = num_speculative_tokens
         self.max_model_len = max_model_len
         self.vocab_size = vocab_size
         self.device = device
@@ -148,6 +152,19 @@ class NeuronRequestState:
         self.last_sampled_tokens = torch.zeros(
             max_num_reqs, 1, dtype=torch.int32, device=device
         )
+        # Speculative decoding: the drafts each slot's last step proposed, and the
+        # number of tokens it committed (1 after a prefill). A verify step reads the
+        # slot's drafts as its input and resumes recurrent state from block
+        # num_accepted - 1; both are written by the compiled graph.
+        self.draft_tokens: torch.Tensor | None = None
+        self.num_accepted: torch.Tensor | None = None
+        if num_speculative_tokens:
+            self.draft_tokens = torch.zeros(
+                max_num_reqs, num_speculative_tokens, dtype=torch.int32, device=device
+            )
+            self.num_accepted = torch.ones(
+                max_num_reqs, dtype=torch.int32, device=device
+            )
 
         # Host-authoritative immutable metadata.
         self.prompt_len = np.zeros(max_num_reqs, dtype=np.int32)
@@ -195,7 +212,9 @@ class NeuronRequestState:
     # ------------------------------------------------------------------
     # block rows (host NumPy, per KV group)
     # ------------------------------------------------------------------
-    def configure_block_sizes(self, block_sizes: list[int]) -> None:
+    def configure_block_sizes(
+        self, block_sizes: list[int], min_widths: list[int] | None = None
+    ) -> None:
         """Configure empty rows for the resolved KV-cache groups.
 
         Replace the constructor's placeholder geometry with validated group
@@ -204,6 +223,9 @@ class NeuronRequestState:
 
         Args:
             block_sizes: Block size for each KV-cache group.
+            min_widths: Optional minimum row width per group. A recurrent-state
+                group with speculative blocks holds ``1 + k`` blocks although its
+                block spans ``max_model_len``.
 
         Raises:
             AssertionError: If requests are active or no block size is given.
@@ -211,12 +233,19 @@ class NeuronRequestState:
         assert self.num_reqs == 0, "cannot change block sizes while requests are active"
         sizes = list(block_sizes)
         assert sizes, "at least one KV cache block size is required"
+        mins = [0] * len(sizes) if min_widths is None else list(min_widths)
+        assert len(mins) == len(sizes), (
+            f"min_widths has {len(mins)} groups, expected {len(sizes)}"
+        )
         tables = [
             np.zeros(
-                (self.max_num_reqs, block_row_width(self.max_model_len, block_size)),
+                (
+                    self.max_num_reqs,
+                    max(block_row_width(self.max_model_len, block_size), min_width),
+                ),
                 dtype=np.int32,
             )
-            for block_size in sizes
+            for block_size, min_width in zip(sizes, mins)
         ]
         counts = np.zeros((len(sizes), self.max_num_reqs), dtype=np.int32)
         self.block_sizes = sizes
@@ -469,6 +498,11 @@ class NeuronRequestState:
             seed = 0
         last_sampled_row = torch.tensor([[seed]], dtype=torch.int32, device=self.device)
         sampling_row = _sampling_row(sampling_params, self.device).unsqueeze(0)
+        if self.draft_tokens is not None:
+            draft_row = torch.zeros(
+                (1, self.num_speculative_tokens), dtype=torch.int32, device=self.device
+            )
+            num_accepted_row = torch.ones(1, dtype=torch.int32, device=self.device)
 
         # All checks passed. Use the caller's safe release path when replacing
         # a request that already has a slot.
@@ -510,6 +544,11 @@ class NeuronRequestState:
         self.total_len[row].copy_(total_len_row)
         self.last_sampled_tokens[row].copy_(last_sampled_row)
         self.sampling_params[row].copy_(sampling_row)
+        if self.draft_tokens is not None:
+            # The slot's prefill overwrites both; reset so nothing of the previous
+            # occupant can be read.
+            self.draft_tokens[row].copy_(draft_row)
+            self.num_accepted[row].copy_(num_accepted_row)
         return slot
 
     def remove_request(self, req_id: str) -> int | None:
