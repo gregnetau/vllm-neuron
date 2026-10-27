@@ -70,6 +70,7 @@ def build_attention_metadata(
     slot_mappings: Sequence[torch.Tensor] | None = None,
     swa_kv_pos_offsets: Sequence[torch.Tensor | None] | None = None,
     always_cached_seq_len: bool = False,
+    block_sizes: Sequence[int] | None = None,
 ) -> dict[str, dict]:
     """Build per-layer attention metadata for dense model execution.
 
@@ -104,6 +105,9 @@ def build_attention_metadata(
         always_cached_seq_len: Include ``cached_seq_len`` even without a KV
             segment size. Recurrent-state models read it on every prefill
             (zero means "start from zero state").
+        block_sizes: Optional per-group block size of ``block_tables`` (the kernel
+            block of a group whose KV-manager blocks are split; default: the
+            group spec's block size).
 
     Returns:
         A mapping from layer name to its group's shared metadata dictionary.
@@ -118,7 +122,11 @@ def build_attention_metadata(
             "block_table_tensor": block_table,
             "slot_mapping": group_slot_mapping,
             "max_query_len": max_query_len,
-            "block_size": group.kv_cache_spec.block_size,
+            "block_size": (
+                block_sizes[group_idx]
+                if block_sizes is not None
+                else group.kv_cache_spec.block_size
+            ),
             "max_blocks_per_seq": block_table.shape[1],
             "decode_token_threshold": decode_token_threshold,
         }

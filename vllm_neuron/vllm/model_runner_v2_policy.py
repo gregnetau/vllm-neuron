@@ -304,12 +304,12 @@ def get_neuron_model_runner_v2_policy(
         # Hybrid models with recurrent-state layers (interfaces.HasRecurrentState) default to
         # V1 while V2 support is validated, but are not recorded unsupported, so an explicit
         # VLLM_USE_V2_MODEL_RUNNER=1 request is honored (same pattern as MoE and SWA). V2
-        # keeps the state in dedicated pools (1 + k state blocks per request with MTP);
-        # the features below need V1 (speculative decoding is gated further down).
+        # keeps the running state in dedicated pools (1 + k state blocks per request with
+        # MTP), also with prefix caching (Mamba "align" mode; block-boundary checkpoints
+        # are vLLM blocks of the shared pool), with or without MTP; the features below
+        # need V1 (speculative decoding is gated further down).
         if recurrent_state:
             dense_generate = False
-            if getattr(cache_config, "enable_prefix_caching", False):
-                unsupported.append("prefix caching for a recurrent-state model")
             if neuron_envs.VLLM_NEURON_SHARED_STATE_POOL:
                 unsupported.append("shared recurrent-state pool")
             if not _resolves_segmented_prefill(

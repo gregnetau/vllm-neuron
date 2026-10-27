@@ -25,7 +25,11 @@ tensor. Store integer state as ``int32`` to match sampled-token tensors.
 
 Store block IDs and valid counts in a minimal NumPy table for each KV-cache
 group. The supported configuration uses a pure row-width calculation without
-context-parallel sizing or allocation-to-kernel block expansion.
+context-parallel sizing. A group may split each KV-manager block into ``r``
+kernel blocks (``configure_block_sizes(kernel_ratios=...)``; prefix caching of
+recurrent-state models enlarges the attention blocks to the state page): its
+rows then hold kernel block IDs ``b * r + i``, so every consumer of the rows
+(kernel tables, slot mappings, context trims) works in kernel blocks.
 
 Slot allocation invariant:
 
@@ -213,7 +217,10 @@ class NeuronRequestState:
     # block rows (host NumPy, per KV group)
     # ------------------------------------------------------------------
     def configure_block_sizes(
-        self, block_sizes: list[int], min_widths: list[int] | None = None
+        self,
+        block_sizes: list[int],
+        min_widths: list[int] | None = None,
+        kernel_ratios: list[int] | None = None,
     ) -> None:
         """Configure empty rows for the resolved KV-cache groups.
 
@@ -226,6 +233,10 @@ class NeuronRequestState:
             min_widths: Optional minimum row width per group. A recurrent-state
                 group with speculative blocks holds ``1 + k`` blocks although its
                 block spans ``max_model_len``.
+            kernel_ratios: Optional kernel blocks per KV-manager block per group
+                (default 1). ``block_sizes`` are then the kernel block sizes, and
+                the rows store each manager block ``b`` as kernel blocks
+                ``b * r .. b * r + r - 1``.
 
         Raises:
             AssertionError: If requests are active or no block size is given.
@@ -236,6 +247,10 @@ class NeuronRequestState:
         mins = [0] * len(sizes) if min_widths is None else list(min_widths)
         assert len(mins) == len(sizes), (
             f"min_widths has {len(mins)} groups, expected {len(sizes)}"
+        )
+        ratios = [1] * len(sizes) if kernel_ratios is None else list(kernel_ratios)
+        assert len(ratios) == len(sizes) and all(r >= 1 for r in ratios), (
+            f"kernel_ratios {ratios} must be positive, one per group"
         )
         tables = [
             np.zeros(
@@ -249,8 +264,29 @@ class NeuronRequestState:
         ]
         counts = np.zeros((len(sizes), self.max_num_reqs), dtype=np.int32)
         self.block_sizes = sizes
+        self.kernel_ratios = ratios
         self._block_tables = tables
         self._num_blocks = counts
+
+    def _to_kernel_blocks(
+        self, block_ids: tuple[list[int], ...]
+    ) -> tuple[list[int], ...]:
+        """Expand KV-manager block IDs to kernel block IDs for split groups.
+
+        Args:
+            block_ids: Manager block-ID lists grouped by KV cache.
+
+        Returns:
+            The lists stored in the rows (unchanged for groups with ratio 1).
+        """
+        if all(r == 1 for r in self.kernel_ratios) or len(block_ids) != len(
+            self.kernel_ratios
+        ):
+            return block_ids
+        return tuple(
+            ids if r == 1 else [b * r + i for b in ids for i in range(r)]
+            for ids, r in zip(block_ids, self.kernel_ratios)
+        )
 
     def block_table(self, group: int) -> np.ndarray:
         """Return the block-ID table for one KV-cache group.
@@ -471,6 +507,7 @@ class NeuronRequestState:
             f"prefill_len ({prefill_len})"
         )
         self._check_block_groups(block_ids)
+        block_ids = self._to_kernel_blocks(block_ids)
         self._check_fresh_capacity(block_ids)
         resident = req_id in self.req_id_to_index
         assert resident or self.free_indices, (
@@ -604,6 +641,7 @@ class NeuronRequestState:
         # advisory count and block rows unchanged.
         if new_block_ids is not None:
             self._check_block_groups(new_block_ids)
+            new_block_ids = self._to_kernel_blocks(new_block_ids)
             self._check_append_capacity(slot, new_block_ids)
         self.scheduler_num_computed_tokens[slot] = scheduler_num_computed_tokens
         if new_block_ids is not None:
