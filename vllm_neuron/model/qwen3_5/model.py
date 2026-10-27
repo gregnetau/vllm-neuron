@@ -433,8 +433,10 @@ class Qwen3_5Attention(nn.Module):
 
     def _write_kv(self, k, v, slot_mapping, block_size):
         """k, v [Nkv, T, Dh] -> paged cache (same scheme as Qwen3)."""
-        block_indices = slot_mapping // block_size
-        position_indices = slot_mapping % block_size
+        # int64 like the head index: HLO cannot concatenate S32 and S64 index arrays
+        # (Model Runner V2 passes an int32 slot mapping).
+        block_indices = (slot_mapping // block_size).long()
+        position_indices = (slot_mapping % block_size).long()
         k_flat = self._to_cache(
             k.reshape(-1, self.head_dim), self.k_scale, self.k_cache
         )
@@ -717,8 +719,10 @@ class Qwen3_5Attention(nn.Module):
         output = self._o_proj(attn).reshape(B * S_decode, hidden)
 
         # Manual KV cache update (same as Qwen3)
-        block_indices = slot_mapping // block_size
-        position_indices = slot_mapping % block_size
+        # int64 like the head index: HLO cannot concatenate S32 and S64 index arrays
+        # (Model Runner V2 passes an int32 slot mapping).
+        block_indices = (slot_mapping // block_size).long()
+        position_indices = (slot_mapping % block_size).long()
         num_tokens = slot_mapping.shape[0]
         if K_new.dim() == 2:  # [B*S, Dh] rows (kv heads == 1)
             k_new = K_new.reshape(nkh, B * S_decode, self.head_dim)
