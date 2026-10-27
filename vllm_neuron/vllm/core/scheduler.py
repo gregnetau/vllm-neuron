@@ -1615,3 +1615,14 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
                 request.spec_token_ids = []
             else:
                 request.spec_token_ids = self._spec_token_placeholders
+        # No step may mix requests with and without drafts. The verify graph lays the
+        # batch out as [requests, 1 + num_spec] tokens, so a request with one token
+        # shifts every later request's tokens by num_spec rows (wrong positions, state
+        # blocks and outputs). While any running request has drafting disabled, nobody
+        # drafts; the others resume when it finishes, a few steps later. Held-back
+        # requests are included: they may be scheduled together next step.
+        if is_spec and any(
+            getattr(r, "_async_spec_disabled", False) for r in self.running
+        ):
+            for r in self.running:
+                r.spec_token_ids = []
