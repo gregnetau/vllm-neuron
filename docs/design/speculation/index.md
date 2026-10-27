@@ -10,6 +10,7 @@ in the features guide and the EAGLE3 tutorials for
 | --- | --- |
 | [Speculative decoding (EAGLE3)](speculative_decoding_design.md) | EAGLE3 autoregressive drafter internals on Neuron |
 | [Speculative decoding (DFlash)](dflash_speculative_decoding_design.md) | DFlash block-parallel drafter internals on Neuron |
+| [Speculative decoding on Model Runner V2](mrv2-spec-decode.md) | Fixed-layout verify graph, in-graph commit, device-resident accepted count (MTP) |
 
 :::{toctree}
 :maxdepth: 1
@@ -17,4 +18,5 @@ in the features guide and the EAGLE3 tutorials for
 
 speculative_decoding_design
 dflash_speculative_decoding_design
+mrv2-spec-decode
 :::
