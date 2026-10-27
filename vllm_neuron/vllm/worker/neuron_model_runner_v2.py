@@ -1451,6 +1451,8 @@ class NeuronModelRunnerV2:
         self.kv_caches = kv_caches
         self.state_caches = state_caches
         self._state_groups = frozenset(state_groups)
+        # Pool pages per slot: 1 + num_speculative_blocks (zero, checked above).
+        self._state_pool_slot_pages = 1
         self._kv_clearer = kv_clearer
         if state_caches:
             pool_bytes = sum(

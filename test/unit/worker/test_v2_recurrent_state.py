@@ -613,3 +613,49 @@ def test_fp8_kv_keeps_segmented_prefill_for_models_that_read_it(arch, expected):
     runner.max_model_len = 4096
     runner.max_num_reqs = 4
     assert runner._build_neuron_config().kv_segment_size_buckets == expected
+
+
+def test_kv_cache_manager_blocks_feed_the_runner():
+    # vLLM's KV cache manager on the V2 config: one state block per state group and
+    # request, attention blocks of --block-size; the runner admits them as is.
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.request import Request
+
+    runner = _initialized_runner()
+    manager = KVCacheManager(
+        runner._kv_cache_config,
+        max_model_len=MAX_MODEL_LEN,
+        # resolve_kv_cache_block_sizes: the LCM of the group block sizes.
+        scheduler_block_size=MAX_MODEL_LEN,
+        hash_block_size=MAX_MODEL_LEN,
+        enable_caching=False,
+    )
+    state_groups, attn_groups = _state_and_attn_groups(runner)
+    for slot, req_id in enumerate("ab"):
+        request = Request(
+            req_id, list(range(1, 701)), SamplingParams(max_tokens=8), None
+        )
+        block_ids = manager.allocate_slots(request, 512).get_block_ids()
+        for g in state_groups:
+            assert len(block_ids[g]) == 1
+        assert len(block_ids[attn_groups[0]]) == 512 // BLOCK
+        # Newly allocated attention blocks are listed for clearing; state blocks are not.
+        to_zero = set(manager.take_new_block_ids())
+        assert to_zero == set(block_ids[attn_groups[0]])
+        new_req = SimpleNamespace(
+            req_id=req_id,
+            prompt_token_ids=request.prompt_token_ids,
+            prefill_token_ids=request.prompt_token_ids,
+            sampling_params=request.sampling_params,
+            num_computed_tokens=0,
+            block_ids=block_ids,
+        )
+        step = _step(new=[new_req], scheduled={req_id: 512}, zero=sorted(to_zero))
+        runner.update_states(step)
+        model_input = runner._prepare_model_input(step)
+        assert _state_rows(model_input, runner).tolist() == [[1 + slot]]
+        for g in state_groups:
+            sm = model_input.slot_mappings[g]
+            assert int(sm[0]) == block_ids[g][0] * MAX_MODEL_LEN
+            assert int(sm[511]) == block_ids[g][0] * MAX_MODEL_LEN + 511
