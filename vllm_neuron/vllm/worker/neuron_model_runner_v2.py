@@ -62,7 +62,10 @@ from .neuron_input_build import (
     build_swa_kernel_block_rows,
     build_verify_layout,
     compute_swa_num_blocks,
+    decode_ctx_headroom,
+    decode_ctx_num_blocks,
     gather_block_rows_raw,
+    select_decode_ctx_bucket,
 )
 from .neuron_request_state import NO_LOGPROBS, NeuronRequestState
 
@@ -373,6 +376,14 @@ class NeuronModelRunnerV2:
         self.num_seqs_buckets = list(self.neuron_config.num_seqs_buckets)
         self.prefill_token_capacity = max(self.num_batched_tokens_buckets)
         self.decode_row_capacity = max(self.num_seqs_buckets)
+        # Decode context-length buckets (docs/design/vllm/decode-context-length-bucketing.md):
+        # each decode step trims the attention groups' block tables to the smallest
+        # bucket covering the batch, so a decode graph per (row bucket, ctx bucket).
+        # None: every decode graph reads the whole max_model_len table.
+        self.decode_ctx_buckets: list[int] | None = (
+            self.neuron_config.decode_context_length_buckets
+        )
+        self.decode_ctx_headroom = decode_ctx_headroom(self.num_speculative_tokens)
         if self.num_speculative_tokens and min(self.num_batched_tokens_buckets) <= (
             1 + self.num_speculative_tokens
         ):
@@ -497,6 +508,16 @@ class NeuronModelRunnerV2:
         # state-bundle outputs back onto their inputs (the store-version chain).
         self.compile_options = {"alias_meta_to_neuron": True}
         logger.info("Using the standalone V2 Neuron model runner.")
+        if self.decode_ctx_buckets is not None:
+            logger.info(
+                "V2 decode context-length buckets %s + max_model_len %d: decode graphs "
+                "per (num_seqs bucket, ctx bucket), a step picks the smallest bucket "
+                ">= max computed tokens + %d; attention block tables are trimmed, "
+                "recurrent-state tables are not.",
+                self.decode_ctx_buckets,
+                self.max_model_len,
+                self.decode_ctx_headroom,
+            )
         if self.speculative_config is not None:
             logger.info(
                 "V2 speculative decoding: method=%s k=%d draft=%s; verify graphs "
@@ -1332,8 +1353,58 @@ class NeuronModelRunnerV2:
         neuron_cfg_dict["num_batched_tokens_buckets"] = prefill_buckets
         neuron_cfg_dict["num_seqs_buckets"] = decode_buckets
         neuron_cfg_dict["kv_segment_size_buckets"] = segment_buckets
-        neuron_cfg_dict["decode_context_length_buckets"] = None
+        neuron_cfg_dict["decode_context_length_buckets"] = (
+            self._resolve_decode_ctx_buckets(
+                neuron_cfg_dict.get("decode_context_length_buckets")
+            )
+        )
         return NeuronConfig.from_dict(neuron_cfg_dict)
+
+    def _resolve_decode_ctx_buckets(self, configured) -> list[int] | None:
+        """Validate ``decode_context_length_buckets`` for the models V2 buckets.
+
+        V2 trims decode attention block tables per context bucket for models with
+        recurrent state (Qwen3.5 / Qwen3.8, with or without MTP); other models keep
+        the full table (the policy routes them to V1, and a forced V2 ignores the
+        option, as before).
+
+        Args:
+            configured: The configured buckets, or ``None``.
+
+        Returns:
+            The validated buckets, or ``None`` when unset or not served.
+
+        Raises:
+            ValueError: For an invalid bucket list.
+            NotImplementedError: With expert parallelism across DP ranks, which
+                would need the bucket synchronized across the group.
+        """
+        if configured is None:
+            return None
+        if not self._has_state_layers:
+            logger.warning(
+                "The V2 runner ignores decode_context_length_buckets=%s for models "
+                "without recurrent state; every decode graph reads the whole "
+                "max_model_len context. Unset VLLM_USE_V2_MODEL_RUNNER to use the V1 "
+                "runner.",
+                configured,
+            )
+            return None
+        from vllm_neuron.utils.bucket_utils import (
+            validate_decode_context_length_buckets,
+        )
+
+        buckets = validate_decode_context_length_buckets(
+            list(configured) if isinstance(configured, tuple) else configured,
+            self.max_model_len,
+        )
+        if self._dp_collectives_active():
+            raise NotImplementedError(
+                "The V2 runner does not synchronize the decode context bucket across "
+                "data-parallel ranks (expert parallelism with data_parallel_size > 1); "
+                "unset decode_context_length_buckets or VLLM_USE_V2_MODEL_RUNNER"
+            )
+        return list(buckets)
 
     def _raw_neuron_config(self) -> dict:
         additional = getattr(self.vllm_config, "additional_config", None)
@@ -2661,10 +2732,14 @@ class NeuronModelRunnerV2:
         device: torch.device | None = None,
     ) -> None:
         """Capture one decode graph in the current process."""
-        logger.info("Capturing decode graphs for: batch_size=%s", batch_size)
+        logger.info(
+            "Capturing decode graphs for: %s",
+            self._decode_graph_name(batch_size, ctx_bucket),
+        )
         model_input = self._build_decode_synthetic_inputs(
             batch_size,
             device=device,
+            ctx_bucket=ctx_bucket,
         )
         # Scope the decode graph's per-graph compiler args (mirrors V1's
         # _plain_decode_capture); a no-op (None) when per-graph tuning is off.
@@ -2681,17 +2756,25 @@ class NeuronModelRunnerV2:
         # Scope the decode graph's per-graph compiler args (mirrors V1's
         # _plain_decode_forward); a no-op (None) when per-graph tuning is off.
         with scoped_compiler_args(self.resolve_graph_compiler_args("decode")):
-            self._warmup(self._build_decode_synthetic_inputs(batch_size))
+            self._warmup(
+                self._build_decode_synthetic_inputs(batch_size, ctx_bucket=ctx_bucket)
+            )
         compile_elapsed = time.perf_counter() - compile_start
-        bucket_name = f"decode_b{batch_size}"
-        if self.num_speculative_tokens:
-            bucket_name += f"_s{1 + self.num_speculative_tokens}"
-        if ctx_bucket is not None:
-            bucket_name += f"_ctx{ctx_bucket}"
         COMPILATION_TIME.labels(
             model_name=self.vllm_config.model_config.model,
-            bucket_name=bucket_name,
+            bucket_name=self._decode_graph_name(batch_size, ctx_bucket),
         ).set(compile_elapsed)
+
+    def _decode_graph_name(self, batch_size: int, ctx_bucket: int | None) -> str:
+        """Name a decode graph: ``decode_b{B}``, ``_s{1 + k}`` for a verify graph,
+        ``_ctx{S}`` for its context bucket (the worker passes ``max_model_len``
+        without context-length buckets)."""
+        name = f"decode_b{batch_size}"
+        if self.num_speculative_tokens:
+            name += f"_s{1 + self.num_speculative_tokens}"
+        if ctx_bucket is not None:
+            name += f"_ctx{ctx_bucket}"
+        return name
 
     def parallel_compile(self) -> None:
         """Compile captured HLOs once across this tensor-parallel group."""
@@ -2770,16 +2853,18 @@ class NeuronModelRunnerV2:
         to dispatch and must materialize as a Python int before any device op.
 
         On V2 the four extra inputs the V1 runner reduces are structurally
-        constant (``decode_context_length_buckets`` forced None; speculative /
+        constant (``decode_context_length_buckets`` rejected when DP collectives
+        are active; speculative /
         KV transfer / structured outputs route to V1), asserted below so a gate
         change fails loudly instead of silently desyncing the group.
         """
+        if not self._dp_collectives_active():
+            return prefill_tokens, decode_rows
+        # _resolve_decode_ctx_buckets rejects the buckets here.
         assert self.neuron_config.decode_context_length_buckets is None, (
             "V2 DP sync assumes decode_context_length_buckets is None; "
             "syncing the decode context bucket across DP ranks is not implemented"
         )
-        if not self._dp_collectives_active():
-            return prefill_tokens, decode_rows
         assert self.speculative_config is None, (
             "V2 DP sync assumes no speculative decoding across EP-spanning DP ranks "
             "(_validate_spec_decode_config rejects it)"
@@ -3189,6 +3274,7 @@ class NeuronModelRunnerV2:
         kv_segment_size: int,
         device: torch.device | None = None,
         num_drafts: np.ndarray | None = None,
+        ctx_bucket: int | None = None,
     ) -> NeuronModelInput:
         """Pad host vectors and assemble a fixed-shape model input.
 
@@ -3209,6 +3295,9 @@ class NeuronModelRunnerV2:
             num_drafts: Scheduled drafts per active row (speculative decoding).
                 A decode step of a speculative configuration is a verify step
                 (``[rows, 1 + k]`` tokens) whatever the counts.
+            ctx_bucket: Decode context-length bucket of a decode step (warmup
+                compiles each one). ``None`` selects the smallest bucket covering
+                the rows. Ignored for prefill and without context-length buckets.
 
         Returns:
             The fixed-shape device operands and host metadata.
@@ -3260,6 +3349,20 @@ class NeuronModelRunnerV2:
         assert total_scored == 0 or positions_flat.max() < self.max_model_len, (
             f"position >= max_model_len ({self.max_model_len})"
         )
+        decode_ctx_bucket = None
+        if not is_prefill:
+            decode_ctx_bucket = self._decode_ctx_bucket_for_step(
+                int(num_computed.max()) if num_active else 0, ctx_bucket
+            )
+            # By construction (headroom >= 1 + k): no scored position past the bucket.
+            assert (
+                decode_ctx_bucket is None
+                or total_scored == 0
+                or positions_flat.max() < decode_ctx_bucket
+            ), (
+                f"position {int(positions_flat.max())} >= decode ctx bucket "
+                f"{decode_ctx_bucket}"
+            )
 
         # Block rows per KV group: raw (zero-padded) feeds the slot mapping; kernel (-1 sentinel) is
         # the attention block table. Both are padded to the flavor's row capacity. Sliding-window
@@ -3294,11 +3397,14 @@ class NeuronModelRunnerV2:
                     output_device=device,
                 )
             else:
+                # Decode context-length buckets trim only these (attention) tables;
+                # the state groups' 1 + k pages do not grow with the context.
                 rows = build_kernel_block_rows(
                     rs,
                     g,
                     idx_mapping_np,
                     padded_num_reqs,
+                    num_columns=self._decode_ctx_trim_width(g, decode_ctx_bucket),
                     output_device=device,
                 )
                 offsets = None
@@ -3442,6 +3548,68 @@ class NeuronModelRunnerV2:
                 _to_dev(num_draft_by_row) if num_draft_by_row is not None else None
             ),
             spec_width=spec_width,
+            decode_ctx_bucket=decode_ctx_bucket,
+        )
+
+    def _decode_ctx_bucket_for_step(
+        self, max_num_computed: int, ctx_bucket: int | None = None
+    ) -> int | None:
+        """Return the decode context-length bucket of a decode step, or None.
+
+        The smallest of ``decode_context_length_buckets + [max_model_len]`` that
+        covers ``max_num_computed + decode_ctx_headroom``: every position the step's
+        target tokens and MTP draft steps read or write. A verify step's positions
+        come from the device counts, which never exceed the scheduler's (an upper
+        bound under async scheduling), so they stay below the bucket.
+
+        Args:
+            max_num_computed: Largest scheduler computed-token count of the rows.
+            ctx_bucket: An explicit bucket (warmup), checked to be configured and
+                to cover the rows.
+
+        Returns:
+            The bucket, or ``None`` without context-length buckets.
+
+        Raises:
+            ValueError: For an explicit bucket that is not configured or too small.
+        """
+        buckets = getattr(self, "decode_ctx_buckets", None)
+        if buckets is None:
+            return None
+        selected = select_decode_ctx_bucket(
+            max_num_computed, self.decode_ctx_headroom, buckets, self.max_model_len
+        )
+        if ctx_bucket is None:
+            return selected
+        if ctx_bucket not in (*buckets, self.max_model_len):
+            raise ValueError(
+                f"decode ctx bucket {ctx_bucket} is not configured; expected one of "
+                f"{[*buckets, self.max_model_len]}"
+            )
+        if ctx_bucket < selected:
+            raise ValueError(
+                f"decode ctx bucket {ctx_bucket} does not cover {max_num_computed} "
+                f"computed tokens + {self.decode_ctx_headroom}"
+            )
+        return ctx_bucket
+
+    def _decode_ctx_trim_width(self, group: int, ctx_bucket: int | None) -> int | None:
+        """Return the trimmed kernel block-table width of an attention group, or None.
+
+        None (the whole row) without a bucket, for the ``max_model_len`` fallback
+        bucket and for recurrent-state groups. Sliding-window groups never reach
+        here on decode (their window trim is tighter).
+        """
+        if (
+            ctx_bucket is None
+            or ctx_bucket >= self.max_model_len
+            or group in self._state_groups
+        ):
+            return None
+        return decode_ctx_num_blocks(
+            ctx_bucket,
+            self.block_sizes[group],
+            self.request_state.block_table(group).shape[1],
         )
 
     # ------------------------------------------------------------------
@@ -3492,6 +3660,7 @@ class NeuronModelRunnerV2:
         self,
         batch_size: int | None = None,
         device: torch.device | None = None,
+        ctx_bucket: int | None = None,
     ) -> NeuronModelInput:
         """Build a synthetic input for one configured decode graph shape.
 
@@ -3501,6 +3670,9 @@ class NeuronModelRunnerV2:
         Args:
             batch_size: Optional configured decode row capacity.
             device: Optional tensor destination. Defaults to the runner device.
+            ctx_bucket: Decode context-length bucket of the graph (the attention
+                block tables' width). ``None`` or without context-length buckets:
+                the smallest bucket, or the whole table.
 
         Returns:
             Synthetic fixed-shape decode input.
@@ -3527,6 +3699,7 @@ class NeuronModelRunnerV2:
             kv_segment_size=0,
             device=device,
             num_drafts=num_drafts,
+            ctx_bucket=ctx_bucket,
         )
 
     # ------------------------------------------------------------------
