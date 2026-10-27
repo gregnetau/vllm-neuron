@@ -317,7 +317,10 @@ def _build_verify_inputs(
     drafts in a ``1 + k`` wide row, then padding. Positions start at the slot's
     device computed count, which is exact even when the scheduler's count is
     optimistic (async scheduling); slot mappings of attention groups follow from
-    the positions. Recurrent-state groups (metadata with ``state_in``) resume from
+    the positions, through the group's kernel block table (head-trimmed to the
+    step's decode context bucket, which covers every position of the step: the
+    bucket is chosen from the scheduler's counts, never below the device counts).
+    Recurrent-state groups (metadata with ``state_in``) resume from
     block ``num_accepted - 1``. Padding tokens and padded rows get the pad token
     and slot 0 of the null block.
 
@@ -370,13 +373,20 @@ def _build_verify_inputs(
             else:
                 block_table = meta["block_table_tensor"]
                 block_size = meta["block_size"]
-                blocks = torch.clamp(
-                    positions_2d // block_size, max=block_table.shape[1] - 1
-                )
+                table_blocks = block_table.shape[1]
+                position_blocks = positions_2d // block_size
+                blocks = torch.clamp(position_blocks, max=table_blocks - 1)
                 block_ids = torch.gather(block_table.to(torch.int64), 1, blocks)
                 slots = block_ids * block_size + positions_2d % block_size
                 null_slot = torch.full_like(slots, NULL_SLOT)
-                slots = torch.where(token_valid & (block_ids >= 0), slots, null_slot)
+                write = token_valid & (block_ids >= 0)
+                if table_blocks * block_size < max_model_len:
+                    # A decode context-length bucket trimmed the table. The runner
+                    # picks a bucket that covers every position of the step, so this
+                    # never drops a real token; it keeps a violation from writing
+                    # into the table's last block.
+                    write = write & (position_blocks < table_blocks)
+                slots = torch.where(write, slots, null_slot)
                 new_meta["slot_mapping"] = slots.reshape(-1)
             if group is not None:
                 by_group[group] = new_meta

@@ -1907,10 +1907,13 @@ class NeuronWorker(WorkerBase):
 
         if self.vllm_config.use_v2_model_runner:
             jobs: list[tuple] = []
-            for batch_size, _ctx_bucket in sorted(targets, reverse=True):
+            # One graph per (row bucket, decode context bucket); the runner ignores
+            # the context bucket without decode_context_length_buckets.
+            for batch_size, ctx_bucket in sorted(targets, reverse=True):
                 model_input = self.model_runner._build_decode_synthetic_inputs(
                     batch_size,
                     device=device,
+                    ctx_bucket=ctx_bucket,
                 )
                 jobs.append(
                     self._build_trace_job(
