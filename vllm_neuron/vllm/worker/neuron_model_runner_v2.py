@@ -1908,18 +1908,23 @@ class NeuronModelRunnerV2:
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
             always_cached_seq_len=state_prefill,
         )
-        if model_input.num_draft_by_row is not None and self._state_groups:
-            # Recurrent-state groups of a verify step resume from the block of the
-            # slot's last accepted token: the graph fills state_in from the device
-            # accepted counts (the key selects the models' multi-token state path).
+        if model_input.num_draft_by_row is not None:
+            # The verify graph rebuilds each group's metadata once (slot mappings from
+            # device positions). It finds a group by this constant index, not by the
+            # dict's identity, which Dynamo would guard on (a recompile every step).
             groups = self._kv_cache_config.kv_cache_groups
-            for g in sorted(self._state_groups):
-                metadata = attn_metadata[groups[g].layer_names[0]]
-                metadata["state_in"] = torch.zeros(
-                    model_input.padded_num_reqs,
-                    dtype=torch.int32,
-                    device=model_input.positions.device,
-                )
+            for g, group in enumerate(groups):
+                metadata = attn_metadata[group.layer_names[0]]
+                metadata["kv_group"] = g
+                if g in self._state_groups:
+                    # Recurrent-state groups resume from the block of the slot's last
+                    # accepted token: the graph fills state_in from the device accepted
+                    # counts (the key selects the models' multi-token state path).
+                    metadata["state_in"] = torch.zeros(
+                        model_input.padded_num_reqs,
+                        dtype=torch.int32,
+                        device=model_input.positions.device,
+                    )
         rs = self.request_state
 
         def state_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:

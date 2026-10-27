@@ -19,6 +19,7 @@ max_model_len (drafts trimmed by the scheduler near the end).
 """
 
 import json
+import os
 import sys
 from collections import deque
 from types import SimpleNamespace
@@ -366,6 +367,13 @@ class _Engine:
             emit_gathered_logits=runner._logprobs_enabled,
             speculator=speculator,
         )
+        if os.environ.get("SPEC_DYNAMO"):
+            # Opt-in (slow): trace the adapter with Dynamo, fullgraph, as on device.
+            torch._dynamo.config.cache_size_limit = 1 << 20
+            torch._dynamo.config.recompile_limit = 1 << 20
+            runner._forward_adapter = torch.compile(
+                runner._forward_adapter, backend="eager", fullgraph=True
+            )
         self.runner = runner
         vllm_config.cache_config.num_gpu_blocks = config.num_blocks
         block_size, hash_block_size = resolve_kv_cache_block_sizes(config, vllm_config)

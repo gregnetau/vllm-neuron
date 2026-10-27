@@ -97,6 +97,7 @@ def _metadata(block_table, *, state_rows=None, query_len):
         "block_size": BLOCK,
         "max_blocks_per_seq": block_table.shape[1],
         "decode_token_threshold": 1 + K,
+        "kv_group": 0,
     }
     md = {"layers.0.self_attn": attn, "layers.2.self_attn": attn}
     if state_rows is not None:
@@ -104,6 +105,7 @@ def _metadata(block_table, *, state_rows=None, query_len):
             attn,
             block_table_tensor=state_rows,
             state_in=torch.zeros(state_rows.shape[0], dtype=torch.int32),
+            kv_group=1,
         )
     return md
 
