@@ -196,9 +196,11 @@ class HasRecurrentState(Protocol):
     """Hybrid models with fixed-size recurrent-state layers (e.g. Gated DeltaNet) next to
     attention layers.
 
-    They declare the state layers in their ``KVSpec`` (``StateLayerSpec``). The V1 runner
-    allocates the state as vLLM ``MambaSpec`` KV groups; Model Runner V2 does not support
-    them; prefix caching uses vLLM's Mamba ``align`` mode.
+    They declare the state layers in their ``KVSpec`` (``StateLayerSpec``). The runners
+    report the state as vLLM ``MambaSpec`` KV groups; prefix caching uses vLLM's Mamba
+    ``align`` mode. Model Runner V1 is the default for these models. Model Runner V2
+    (``VLLM_USE_V2_MODEL_RUNNER=1``) serves them with dedicated state pools, without
+    prefix caching or speculative decoding.
     """
 
     @classmethod

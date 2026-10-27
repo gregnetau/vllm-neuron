@@ -3,7 +3,7 @@
 <!-- meta: description: Design of per-request recurrent state (Gated DeltaNet) alongside paged
 KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-14 -->
+<!-- meta: date_updated: 2026-10-27 -->
 
 ## Overview
 
@@ -55,6 +55,25 @@ attention block (`_build_state_cache_specs`) and keeps the real page for the ded
 (2048 tokens with FP8 KV; `per_group=[256, ...]` instead). Prefix caching (state checkpoints
 are cached blocks) keeps the shared layout and the real page, as does
 `VLLM_NEURON_SHARED_STATE_POOL=1`.
+
+## Model Runner V2
+
+V1 is the default for these models. With `VLLM_USE_V2_MODEL_RUNNER=1`, Model Runner V2
+serves them without prefix caching, speculative decoding or the shared state pool. Those
+configurations, and those without segmented prefill, stay on V1. Both runners build the
+specs, pools and KV-block clearing with `vllm_neuron/vllm/worker/hybrid_state.py`. V2
+differs from V1 in two ways:
+
+- The placeholder page is one attention page, not a 256-token block, so vLLM does not
+  enlarge the attention block. The attention group keeps `--block-size`, and a state
+  group's block spans `max_model_len`. No manager block is split into kernel blocks.
+- V2 keeps a request in the same batch slot from admission until it finishes or is
+  preempted. A freed slot is quarantined while an in-flight graph still touches it. So the
+  slot indexes the pool directly: page `1 + slot` (`build_state_pool_rows`), with no
+  translation table.
+
+Every prefill uses the first KV segment size, so V2 requires all prefill buckets to be
+multiples of 128 for these models.
 
 ## Prefix caching
 
