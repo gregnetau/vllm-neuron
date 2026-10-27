@@ -563,17 +563,13 @@ def test_oracle_drafts_partial_acceptance_match_hf(
     long_chunks = [s[0]["long"] for s in engine.steps if s[0].get("long", 0) > 1]
     assert long_chunks[:2] == [CHUNK, 200 - CHUNK]
     # Near max_model_len: sync scheduling trims one row's drafts inside a multi-row
-    # verify step; NeuronAsyncScheduler stops drafting for every running request.
+    # verify step; NeuronAsyncScheduler stops drafting for the request near the limit
+    # while the others keep drafting. Both are mixed verify steps, padded per row.
     multi_row = [
         s for s in engine.steps if len(s[0]) > 1 and max(s[0].values()) <= 1 + K
     ]
     if async_scheduling:
-        assert any(not s[1] for s in multi_row)
-        if decode_steps == 0:
-            # After "end" finishes, "long" (prefilled while the others were held back)
-            # drafts while the others still have no drafts: a mixed verify step, which
-            # the scheduler's no-mixing rule (932f443) does not prevent.
-            assert any(s[1] and len(s[1]) < len(s[0]) for s in multi_row)
+        assert any(s[1] and len(s[1]) < len(s[0]) for s in multi_row)
     else:
         assert any(
             any(0 < len(d) < K for d in s[1].values()) and len(s[1]) > 1
