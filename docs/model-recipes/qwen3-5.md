@@ -49,7 +49,8 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | Several prefill buckets; each step picks its KV segment size by the cached length (`PREFILL_BUCKETS`) | ✅ |
 | | Decode context-length buckets (`DECODE_CTX_BUCKETS`) | ✅ |
 | | Decode steps between the chunks of a long prefill (`DECODE_INTERLEAVE`) | ✅ |
-| | Prefix caching (Mamba `align` mode) | ✅ (not re-validated with the segmented prefill kernel) |
+| | Prefix caching (Mamba `align` mode), V1 without MTP | ✅ (not re-validated with the segmented prefill kernel) |
+| | Prefix caching on Model Runner V2, with and without MTP (dedicated running-state pool, checkpoints in the KV pool) | 🧪 (CPU-validated) |
 | **Performance** | Fused NKI GDN decode kernel (BF16: one token; FP8: whole sub-layer, up to 32 tokens) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
 | | Multi-token prediction (MTP) speculative decoding, 1-2 draft tokens | ✅ |
@@ -58,7 +59,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | torch.compile, native route (`BACKEND=neuron_native`) | ✅ (slower, see [Compilation](#compilation)) |
 | | CPU mode (unit tests) | ✅ |
 | **Runner** | Model Runner V1 | ✅ |
-| | Model Runner V2 | ❌ (hybrid models and speculative decoding route to V1) |
+| | Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`; hybrid state, MTP and prefix caching) | 🧪 (opt-in; V1 is the default, see [the design note](../design/speculation/mrv2-spec-decode.md)) |
 
 **Status legend:**
 
@@ -244,7 +245,21 @@ attention KV blocks and a checkpoint of every GDN layer's state at each block bo
 Mamba cache mode `align`; see [the design note](../design/hybrid-state-gdn.md#prefix-caching)).
 Prefills are scheduled in 1024-token chunks, so `PREFILL_BUCKET` must be at least 1024. A
 request reuses the longest cached prefix that ends on a block boundary, below the prompt
-length. Prefix caching is not combined with MTP.
+length. V1 does not combine prefix caching with MTP.
+
+With `VLLM_USE_V2_MODEL_RUNNER=1`, Model Runner V2 serves prefix caching with and without MTP
+(`MTP_TOKENS`). It keeps the running GDN state in its dedicated pool and copies a checkpoint
+to vLLM's state block at each block boundary a request reaches (and back on a prefix hit), so
+the compiled forward graphs bind the KV pool only as attention KV; V1 binds it as KV and as
+state, which neuronx-cc counts twice against the 24 GB graph I/O limit (NCC_EVRF009). The
+block is the attention block enlarged to the state page (1024 tokens for Qwen3.8-27B at TP=4
+with BF16 KV and `--block-size 32`, 2048 with FP8 KV and `BLOCK_SIZE=128`), split back into
+kernel blocks of `--block-size`. With MTP, vLLM matches one block past a hit and drops it, so
+a hit is one block shorter. Without MTP vLLM retains by default only the checkpoint at a
+prompt's last block boundary and at shared-prefix junctions
+(`--prefix-cache-retention-interval`: a multiple of the block adds periodic ones; with MTP
+vLLM defaults to every block boundary). See
+[the design note](../design/hybrid-state-gdn.md#prefix-caching-on-model-runner-v2).
 
 Measured with the previous (PyTorch) prefill attention:
 
@@ -535,11 +550,14 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
   not use: `3 (1 + k)` blocks per request, each now one 256-token attention block.
 - **Packed FP8 KV (`fp8_packed_kv`) is not supported**: the library decode kernel reads the
   packed layout only at `head_dim` <= 128.
-- **Prefix caching** is not combined with MTP and has not been re-validated since the
-  segmented prefill kernel replaced the PyTorch prefill attention.
+- **Prefix caching** on V1 is not combined with MTP and has not been re-validated since the
+  segmented prefill kernel replaced the PyTorch prefill attention. On V2 (with or without
+  MTP) it is validated on CPU only.
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
-- **Model Runner V2 is not supported.** Hybrid models and speculative decoding run on V1.
+- **Model Runner V2 is opt-in** (`VLLM_USE_V2_MODEL_RUNNER=1`): hybrid state and MTP run on V2
+  only when forced, also with prefix caching and `DECODE_CTX_BUCKETS`; the MoE checkpoint and
+  prefix caching on V2 are validated on CPU only.
 - **`logprobs` requests fail with MTP**: with on-device rejection sampling the runner returns
   no log-probabilities for the speculative tokens, and vLLM's endpoint fails (HTTP 500). Serve
   without `MTP_TOKENS` when `logprobs` are needed.
@@ -599,12 +617,14 @@ Next:
    efficiency at long prefixes (about 20% of peak; loading K/V once per query head is not the
    bottleneck); a DMA-transpose load for FP8 K; the native route's core-synchronization waits.
 2. **Aider Polyglot** at long context.
-3. **KV pool**: no state blocks in the shared pool at all; dedicated state pool with prefix
-   caching; re-validate prefix caching with the segmented prefill kernel.
+3. **KV pool**: no state blocks in the shared pool without prefix caching; device validation
+   of V2 prefix caching (dedicated running-state pool, checkpoints in the KV pool); re-validate
+   V1 prefix caching with the segmented prefill kernel.
 4. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
-5. **MTP**: prefix caching together with MTP, more than 2 draft tokens, and FP8 for the
-   draft's `lm_head`.
-6. **Model Runner V2** together with MTP: speculative decoding and hybrid state on V2.
+5. **MTP**: prefix caching together with MTP on device (V2), more than 2 draft tokens, and FP8
+   for the draft's `lm_head`.
+6. **Model Runner V2** together with MTP: device parity runs (Qwen3.8-27B)
+   before V2 becomes the default.
 7. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, plus latency and throughput sweeps over context length and batch size.
 
