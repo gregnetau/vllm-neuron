@@ -201,19 +201,27 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 
 ## Aider Polyglot
 
-225 exercises with `run_aider_polyglot.sh`: diff edit format, 2 tries, thinking mode at the
-template's default `reasoning_effort=xhigh`, model-card sampling (temperature 1.0, top_p 0.95,
-top_k 20), Aider 0.86.3.dev (5dc9490). Served by 8 replicas (64k context, 3 concurrent requests
-each) with 24 threads.
+225 exercises with `run_aider_polyglot.sh`:
+- diff edit format, 2 tries;
+- thinking mode at the template's default `reasoning_effort=xhigh`, model-card sampling
+  (temperature 1.0, top_p 0.95, top_k 20);
+- Aider 0.86.3.dev (5dc9490);
+- served by 8 replicas at 64k context.
 
-| | |
-|---|---|
-| Pass rate, 1 try / 2 tries | 48.9% / **86.2%** (194 of 225) |
-| Well-formed responses | 99.6% |
-| Error outputs | 24 (15 Aider-side 3,600 s request timeouts on very long thinking responses) |
-| Exhausted context windows | 6 |
-| Tokens | 3.0M prompt, 5.47M completion (about 24k per exercise) |
-| Wall time | 12.5 h |
+| | Run 1 (2026-10-22) | Run 2 (2026-10-27) |
+|---|---|---|
+| Serving | 3 concurrent requests per replica (default cap), 24 threads | 8 per replica (`VLLM_NEURON_MAX_KV_CONCURRENT=8`), 64 threads |
+| Pass rate, 1 try / 2 tries | 48.9% / 86.2% (194 of 225) | 47.1% / **87.1%** (196 of 225) |
+| Well-formed responses | 99.6% | 100% |
+| Error outputs | 24 (15 Aider-side 3,600 s request timeouts) | 19 (13 timeouts) |
+| Exhausted context windows | 6 | 6 |
+| Tokens (prompt / completion) | 3.0M / 5.47M | 2.8M / 5.67M |
+| Wall time, average generation rate | 12.5 h, ~120 tok/s | 8.8 h, ~180 tok/s |
+
+- **Errors.** The timeouts are very long thinking responses, which Aider abandons after its
+  3,600 s request timeout.
+- **Run 2's code.** It used the final branch (MTP not enabled). No preemption occurred at 8
+  requests per replica.
 
 ## Known limitations
 

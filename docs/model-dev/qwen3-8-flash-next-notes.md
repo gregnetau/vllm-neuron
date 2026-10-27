@@ -234,6 +234,24 @@ The run averaged about 120 tok/s, where 24 short requests reach 364 tok/s. Reaso
 - the long tail: the last 13 exercises took 2.5 h with replicas mostly idle;
 - no prefix caching, so every turn re-prefills its context.
 
+### Run 2 (2026-10-27)
+
+Same configuration on the final branch, but with 8 concurrent requests per replica
+(`VLLM_NEURON_MAX_KV_CONCURRENT=8`) and 64 Aider threads:
+
+| Metric | Value |
+|---|---|
+| pass_rate_1 / pass_rate_2 | 47.1 / 87.1 (106 / 196) |
+| percent_cases_well_formed | 100.0 |
+| error_outputs | 19 (13 Aider-side 3,600 s request timeouts) |
+| user_asks | 136 |
+| exhausted_context_windows | 6 |
+| prompt / completion tokens | 2,807,446 / 5,674,140 |
+| wall time | 8.8 h (about 180 tok/s average; about 900 tok/s at the start) |
+
+- **No preemption occurred.** The pass rate matches run 1 within run-to-run variance.
+- **The long tail remains.** The last few exercises run near batch 1 for up to an hour each.
+
 ## Device validation (2026-10-26)
 
 Full 48-layer FP8 model on trn2.48xlarge unless noted.
@@ -284,8 +302,9 @@ state-pool pages kept inside the pool. Re-validated on device:
 - **QSA decode compact gather.** Gather only the ≤ 2,051 selected K/V rows per query instead of
   masking the full context. This is the main long-context decode cost.
 - **Serving defaults.**
-  - Raise per-replica concurrency (`VLLM_NEURON_MAX_KV_CONCURRENT=8`, validated above) and use
-    MTP for Aider-style workloads; both are validated but were not used in the 2026-10-22 run.
+  - Per-replica concurrency of 8 (used in Aider run 2) as the recommended Aider configuration.
+  - MTP for the long single-request tail, once validated beyond 8k context and 4 concurrent
+    requests.
   - FP8 KV needs calibrated scales before it can be a default.
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.
