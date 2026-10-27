@@ -368,6 +368,67 @@ class Qwen4ExpGatedDeltaNet(Q.Qwen3_5GatedDeltaNet):
             )
         return self._out_proj(o)
 
+    def _copy_state_pages(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Copy the state pages of blocks ``src`` [B] to blocks ``dst`` [B] (int; -1 for
+        padded rows: zeros go to the null page, as ``_write_state`` writes them)."""
+        B = dst.shape[0]
+        pad = (dst < 0).view(B, *([1] * (self.state_a.dim() - 1)))
+        src, dst = src.long().clamp(min=0), dst.long().clamp(min=0)
+        zero = torch.zeros((), dtype=self.state_a.dtype, device=self.state_a.device)
+        for state in (self.state_a, self.state_b):
+            state.index_copy_(
+                0, dst, torch.where(pad, zero, state.index_select(0, src))
+            )
+
+    def _decode_spec(self, hidden_states, md):
+        """MTP verify (S = 1 + k tokens per request, see the Qwen3.5 ``_decode_spec``) with the
+        decode kernel, one token at a time: token j continues from the state after token j - 1
+        (block state_in for j = 0) copied into block j, where the kernel updates it in place.
+        The torch recurrence (the fallback) costs about 1.1 ms more per layer and step."""
+        bt = md["block_table_tensor"].to(torch.int32)  # [B, 1 + k]; -1: padded row
+        B = bt.shape[0]
+        T = hidden_states.shape[0]
+        S = T // B
+        if self.Hk % 2 or not self._use_decode_kernel(
+            hidden_states[:B], max_requests=self.DECODE_KERNEL_MAX_REQUESTS
+        ):
+            return super()._decode_spec(hidden_states, md)
+        from vllm_neuron.model.qwen3_5.gdn_kernels import gdn_decode
+
+        mixed, z, b, a = self._project(hidden_states.to(self.dtype))
+        mixed, z = mixed.view(B, S, -1), z.view(B, S, -1)
+        b, a = b.view(B, S, -1), a.view(B, S, -1)
+        src = bt.gather(1, md["state_in"].long().view(B, 1)).view(B)
+        outs = []
+        for j in range(S):
+            dst = bt[:, j].contiguous()
+            self._copy_state_pages(src, dst)
+            o = gdn_decode(
+                mixed[:, j].contiguous(),
+                z[:, j].contiguous(),
+                b[:, j].contiguous(),
+                a[:, j].contiguous(),
+                self.conv_weight,
+                self.A_log,
+                self.dt_bias,
+                self.norm_weight,
+                self.state_a,
+                self.state_b,
+                dst,
+                self.config.rms_norm_eps,
+                gate_sigmoid=self.config.output_gate_type == "sigmoid",
+                own_conv_rows=True,
+            )
+            if B > 1:
+                o = torch.where(
+                    (dst >= 0).view(-1, 1),
+                    o,
+                    torch.zeros((), dtype=o.dtype, device=o.device),
+                )
+            outs.append(o)
+            src = dst
+        return self._out_proj(torch.stack(outs, dim=1).reshape(T, -1))
+
 
 class Qwen4ExpAttention(Q.Qwen3_5Attention):
     """Qwen3.5 gated attention with replicated KV heads (tp > num_key_value_heads) and QSA.

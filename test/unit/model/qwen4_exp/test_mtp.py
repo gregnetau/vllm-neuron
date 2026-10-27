@@ -198,3 +198,153 @@ def test_mtp_tiny_load_and_draft(plugin_mtp, tiny_hf_model, tiny_text_config):
         blk, off = int(bt[b, p // BS]), p % BS
         assert attn.k_cache[blk, :, off].abs().sum() > 0
         assert attn.index_cache[blk, :, off].abs().sum() > 0
+
+
+@torch.no_grad()
+def test_verify_decode_matches_hf(plugin):
+    """MTP verify steps of the whole backbone (2 tokens per request: GDN ``_decode_spec``, PLE
+    multi-token decode, attention over the new rows) against HF, through accepted and rejected
+    drafts: each step's state starts from block ``state_in`` (the state after the last accepted
+    token), and its first row always equals sequential decoding."""
+    from qwen4_exp_testlib import load_from_hf, ple_rows, state_pages
+    from test_model_dense import BLOCK, _hf_model
+
+    hf, hf_cfg = _hf_model()
+    model = plugin.Qwen4ExpForCausalLM.from_configs(hf_cfg, None)
+    cfg = model.config
+    load_from_hf(model, hf)
+    spec = model.get_kv_spec()
+    kv = {
+        ls.name: [
+            torch.zeros(8, ls.num_kv_heads, BLOCK, ls.head_size) for _ in range(2)
+        ]
+        for ls in spec.layers
+    }
+    model.bind_kv_cache(kv)
+    model.bind_state_cache(state_pages(spec, 10, fill=7))
+    n_real, T, S = 21, 32, 2
+    torch.manual_seed(1)
+    ids_all = torch.randint(2, cfg.vocab_size, (n_real + 8,))
+    ple_all = ple_rows(hf, ids_all)
+    blocks = torch.tensor([[2, 3, 4, 6]], dtype=torch.int32)
+    state_tables = {
+        "linear_attn": torch.tensor([[5, 8]], dtype=torch.int32),
+        "ple": torch.tensor([[3, 9]], dtype=torch.int32),
+    }
+
+    def md_for(q, slots, cached, state_in=None):
+        common = {
+            "max_query_len": q,
+            "decode_token_threshold": S if state_in is not None else 1,
+            "block_size": BLOCK,
+            "max_blocks_per_seq": 4,
+            "cached_seq_len": torch.tensor([[cached]], dtype=torch.int32),
+            "kv_segment_size": 0,
+            "slot_mapping": slots,
+        }
+        state = dict(common)
+        if state_in is not None:
+            state["state_in"] = torch.tensor([state_in], dtype=torch.int32)
+        md = {}
+        for i, t in enumerate(cfg.layer_types):
+            if t == "full_attention":
+                md[f"layers.{i}.self_attn"] = dict(common, block_table_tensor=blocks)
+            else:
+                md[f"layers.{i}.linear_attn"] = dict(
+                    state, block_table_tensor=state_tables["linear_attn"]
+                )
+        md["layers.1.ple"] = dict(state, block_table_tensor=state_tables["ple"])
+        return md
+
+    pos = torch.arange(n_real)
+    slot = torch.zeros(T, dtype=torch.long)
+    slot[:n_real] = blocks[0][pos // BLOCK].long() * BLOCK + pos % BLOCK
+    model(
+        torch.cat([ids_all[:n_real], torch.zeros(T - n_real, dtype=torch.long)]),
+        positions=torch.arange(T),
+        attn_metadata=md_for(T, slot, 0),
+        sampling_positions=torch.tensor([n_real - 1]),
+        ple_embeds=torch.cat(
+            [ple_all[:n_real], torch.zeros(T - n_real, ple_all.shape[1])]
+        ),
+    )
+    ref = hf(ids_all[None]).logits[0]
+
+    p, state_in = n_real, 0
+    for accept in (True, False, True, False, False):
+        ps = torch.tensor([p, p + 1])
+        ids, emb = ids_all[p : p + 2].clone(), ple_all[p : p + 2].clone()
+        if not accept:  # a wrong draft token (and its n-gram row)
+            ids[1] = (ids[1] + 1) % cfg.vocab_size
+            emb[1] = ple_rows(hf, torch.cat([ids_all[: p + 1], ids[1:]]))[-1]
+        slots = blocks[0][ps // BLOCK].long() * BLOCK + ps % BLOCK
+        logits = model(
+            ids,
+            positions=ps,
+            attn_metadata=md_for(S, slots, p, state_in),
+            ple_embeds=emb,
+        )
+        torch.testing.assert_close(logits[0], ref[p], rtol=2e-3, atol=2e-3)
+        if accept:
+            torch.testing.assert_close(logits[1], ref[p + 1], rtol=2e-3, atol=2e-3)
+            p, state_in = p + 2, 1
+        else:
+            p, state_in = p + 1, 0
+
+
+@torch.no_grad()
+def test_gdn_verify_kernel_route_matches_torch(plugin, monkeypatch):
+    """The GDN verify step through the decode kernel (one call per token, with the state
+    copied from the previous token's block into the token's own block) equals the torch
+    recurrence: outputs and every block's state, from a ``state_in`` per request. The kernel is
+    replaced by a torch emulation of its contract (state read from and written to ``slots``)."""
+    from qwen4_exp_testlib import state_pages
+    from test_model_dense import _hf_model
+
+    from vllm_neuron.model.qwen3_5 import gdn_kernels, gdn_ops
+
+    model = plugin.Qwen4ExpForCausalLM.from_configs(_hf_model()[1], None)
+    torch.manual_seed(0)
+    for p in model.parameters():
+        p.data.normal_(0, 0.2)
+    layer = model.model.layers[0].linear_attn
+    name = "layers.0.linear_attn"
+    cfg = model.config
+
+    def fake_gdn_decode(
+        mixed, z, b, a, conv_w, A_log, dt_bias, norm_w, sa, sb, slots, eps, **kw
+    ):
+        n = slots.shape[0]
+        conv, ssm = layer._read_state(slots.long().clamp(min=0))
+        m, conv = gdn_ops.causal_conv1d_step_batched(mixed, conv_w, conv)
+        q, k, v = layer._qkv_heads(m, n)
+        g, beta = gdn_ops.gdn_gating(a, b, A_log, dt_bias)
+        o, ssm = gdn_ops.gated_delta_step_batched(q, k, v, g, beta, ssm)
+        layer._write_state(slots.long(), conv, ssm)
+        o = gdn_ops.gated_rmsnorm(
+            o,
+            z.reshape(n, layer.Hv, layer.Dv),
+            norm_w,
+            eps,
+            gate_act=cfg.output_gate_type,
+        )
+        return o.reshape(n, -1)
+
+    monkeypatch.setattr(gdn_kernels, "gdn_decode", fake_gdn_decode)
+    B, S = 2, 3
+    bt = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    md = {"block_table_tensor": bt, "state_in": torch.tensor([2, 0], dtype=torch.int32)}
+    x = torch.randn(B * S, cfg.hidden_size)
+    pages = state_pages(model.get_kv_spec(), 8)[name]
+    g = torch.Generator().manual_seed(1)
+    init = [torch.randn(t.shape, generator=g) for t in pages]
+    results = []
+    for kernel in (True, False):
+        layer.bind_state(*[t.clone() for t in init])
+        monkeypatch.setattr(layer, "_use_decode_kernel", lambda *a, **k: kernel)
+        out = layer._decode_spec(x, md)
+        results.append((out, [layer._read_state(bt[:, j].long()) for j in range(S)]))
+    (out_k, st_k), (out_t, st_t) = results
+    torch.testing.assert_close(out_k, out_t)
+    for a, b in zip(st_k, st_t):
+        torch.testing.assert_close(a, b)
