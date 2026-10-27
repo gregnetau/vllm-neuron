@@ -632,6 +632,18 @@ def _reinterpret_uint32_as_int32(
     return tensor
 
 
+def _request_generator(device: torch.device, seed: int) -> torch.Generator:
+    """Per-request seeded generator. The Neuron device has no generator hooks
+    (``torch.Generator(device=neuron)`` raises NotImplementedError, which took the engine
+    down on the first request with a ``seed``), so fall back to a CPU generator."""
+    try:
+        generator = torch.Generator(device=device)
+    except (NotImplementedError, RuntimeError):
+        generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return generator
+
+
 def _compute_slot_mapping_cpu(
     block_table_cpu: np.ndarray,
     slot_mapping_np: np.ndarray,
@@ -3287,8 +3299,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
+                generator = _request_generator(self.device, sampling_params.seed)
             else:
                 generator = None
 
