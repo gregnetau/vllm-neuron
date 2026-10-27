@@ -88,11 +88,14 @@ def extract_accepted_tokens(
 def _slot_mapping(positions, block_table, block_size):
     """KV slot per position (as eagle3_model.compute_slot_mapping). Padded batch rows can
     carry negative corrected positions: their block index is clamped into the table and the
-    -1 (unused) result is mapped to slot 0, the null block."""
+    -1 (unused) result is mapped to slot 0, the null block. A position past the table (a
+    table trimmed to a decode context-length bucket that does not cover it, which the runner
+    rules out) also maps to the null block instead of the table's last block."""
     blocks = (positions // block_size).clamp(0, block_table.shape[1] - 1)
     ids = block_table.gather(1, blocks.view(-1, 1).long()).view(-1)
     slot = ids * block_size + positions % block_size
-    return torch.where(ids < 0, torch.zeros_like(slot), slot)
+    past_table = positions >= block_table.shape[1] * block_size
+    return torch.where((ids < 0) | past_table, torch.zeros_like(slot), slot)
 
 
 class Qwen3_5MTPModel(nn.Module):
