@@ -19,6 +19,9 @@ import argparse
 import time
 
 import torch
+
+torch._dynamo.config.recompile_limit = 1024  # one compiled run() per (config, B, S, impl)
+torch._dynamo.config.accumulated_recompile_limit = 4096
 from torch import nn
 
 D, KC, EPS = 128, 4, 1e-6
