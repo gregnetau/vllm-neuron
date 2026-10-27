@@ -21,6 +21,8 @@ BLOCK, PAGE = 8, 5  # attention block size; state page id
 
 class _TP:
     world_size, rank_in_group, device_group = 1, 0, None
+    # Read by NF.build_blockwise_mapping (MoE prefill, test_moe).
+    rank_in_group_tensor = torch.zeros(1, dtype=torch.int32)
 
 
 def _stub(name, **attrs):

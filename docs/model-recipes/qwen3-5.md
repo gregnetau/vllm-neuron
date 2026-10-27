@@ -1,4 +1,4 @@
-# Qwen3.5 / Qwen3.8 (Dense) Model Recipe
+# Qwen3.5 / Qwen3.8 (Dense and MoE) Model Recipe
 
 <!-- meta: description: Model recipe for serving the dense Qwen3.5 / Qwen3.8 hybrid
 (Gated DeltaNet + full attention) checkpoints with vLLM on Neuron, including supported
@@ -7,7 +7,7 @@ FP8, performance and known limitations. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.5, Qwen3.8, Qwen3.8-27B, Gated DeltaNet, hybrid,
 linear attention, FP8, long context, MTP, model recipe, model card, LLM serving, Trn2,
 Trainium -->
-<!-- meta: date_updated: 2026-10-20 -->
+<!-- meta: date_updated: 2026-10-27 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -19,6 +19,10 @@ fourth layer is full attention (24 query / 4 KV heads, head_dim 256, output gate
 rotary). This recipe serves the text tower: the vision tower is not loaded, and the
 multi-token-prediction (MTP) head is loaded as a speculative-decoding draft when enabled.
 
+The sparse MoE checkpoints (`Qwen3_5MoeForConditionalGeneration`, `model_type=qwen3_5_moe`)
+use the same model with a mixture-of-experts FFN in every layer; see
+[Sparse MoE: Qwen3.5-35B-A3B](#sparse-moe-qwen35-35b-a3b).
+
 Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on trn2.3xlarge.
 
 **Compatible model checkpoints:**
@@ -26,6 +30,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | Model | HuggingFace | Hardware | Quantization | Context |
 |-------|-------------|----------|--------------|---------|
 | Qwen3.8-27B | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Trn2 (trn2.3xlarge, TP=4) | BF16, static FP8 | up to 262,144 (native) |
+| Qwen3.5-35B-A3B (MoE, experimental) | [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Trn2 (trn2.3xlarge, TP=4) | BF16 | validated on CPU only |
 
 > `Qwen/Qwen3.8-27B-FP8` uses 128x128 block weight scales with dynamic activation
 > quantization, which Trn2 does not support. Serve the BF16 checkpoint and let the plugin
@@ -41,7 +46,8 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | Static FP8 (E4M3, per tensor): MLP, GDN and attention projections | ✅ |
 | | FP8 KV cache (unit KV scales) | ✅ |
 | | Packed FP8 KV layout (`fp8_packed_kv`) | ❌ (decode kernel, `head_dim` 256) |
-| **Parallelism** | Tensor parallelism (TP=4, one KV head per rank) | ✅ |
+| **Parallelism** | Tensor parallelism (TP=4, one KV head per rank; KV heads replicated when TP exceeds them) | ✅ |
+| | Sparse MoE FFN (Qwen3.5-35B-A3B): TP-sharded experts, optional expert parallelism | 🧪 (CPU-validated) |
 | | Decode batches > 1 (`max_num_seqs` > 1), with and without MTP | ✅ |
 | | Pipeline / context parallelism | ❌ |
 | **Context** | Native `max_model_len` 262144 (KV pool about 640k tokens in BF16, 1.26M in FP8) | ✅ |
@@ -63,6 +69,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 **Status legend:**
 
 - ✅ Supported: integrated and tested for Qwen3.8-27B
+- 🧪 Implemented and unit-tested on CPU, not yet validated on device
 - ❌ Not supported yet
 
 ## Quick start
@@ -236,6 +243,46 @@ speculative state blocks for Mamba layers), and the next step starts from the bl
 last accepted token; see [the design note](../design/hybrid-state-gdn.md#speculative-decoding-mtp).
 The draft acceptance rate is about 86% for the first draft token and 62% for the second (mean
 1.85 and 2.4 tokens per step at batch 1; about 2.7 at batch 8).
+
+### Sparse MoE: Qwen3.5-35B-A3B
+
+Qwen3.5-35B-A3B has 40 layers (30 GDN + 10 full attention, hidden size 2048, 16 query / 2 KV
+heads at head_dim 256) and replaces every MLP with 256 routed experts (top 8, intermediate
+size 512) plus a shared expert of size 512 scaled by `sigmoid(shared_expert_gate(x))`. The
+MTP layer has the same MoE FFN. The MoE FFN (`vllm_neuron/model/qwen3_5/moe.py`) is derived
+from the contrib Qwen3.5 model of
+[vllm-project/vllm-neuron#68](https://github.com/vllm-project/vllm-neuron/pull/68):
+
+- Routing: softmax over all experts, top-k, renormalised (as the HF router).
+- Prefill: router on the sequence-parallel shard, then the blockwise `moe_cte` kernel over all
+  tokens (128-token expert blocks; padding tokens route to no expert), shared expert, reduce-scatter.
+- Decode: the fused `moe_block_tkg` kernel (norm, router, top-k and experts); below 32 tokens
+  per step at top-8 / 256 experts it reads only the selected experts' weights. The shared
+  expert runs outside the kernel (its sigmoid gate is input dependent). More than 128 tokens
+  per decode step use the blockwise kernel.
+- Parallelism: every rank holds every expert with the intermediate dimension sharded (128 per
+  rank at TP=4; the kernels need a multiple of 128). With `--enable-expert-parallel` each EP
+  partition holds `256 / ep_degree` experts instead; it saves no memory and adds prefill
+  padding, so it is only worth it where TP alone cannot satisfy the 128-multiple.
+- The 2 KV heads are replicated over TP=4 (ranks 0-1 hold KV head 0, ranks 2-3 KV head 1),
+  so every rank keeps one KV head and the attention kernels run as for 27B.
+- BF16 only: `quantization: fp8` is rejected for MoE checkpoints (static-FP8 calibration covers
+  the dense MLP only).
+
+Memory per rank at TP=4 (BF16): about 16.2 GiB for the target (routed experts 15.0 GiB, GDN
+0.5 GiB, embedding and LM head 0.5 GiB) and 0.9 GiB for the MTP draft (0.5 GiB of it its own
+copies of the embedding and LM head), about 17.1 GiB of the 24 GiB. A token of context takes 10 KB of attention KV per rank (10
+layers, one KV head of 256 in K and V) and a request's GDN state 15.7 MiB per state block
+(30 layers of 536 KiB). With the default `GPU_MEM_UTIL` (0.65) the weights exceed the budget
+(`24 * 0.65 GiB`), so raise it:
+
+```bash
+MODEL=<path-to-checkpoint>/Qwen3.5-35B-A3B MTP_TOKENS=2 GPU_MEM_UTIL=0.9 \
+    examples/vllm_neuron/models/qwen3_5/serve.sh
+```
+
+With `GPU_MEM_UTIL=0.9` and the default `KV_CAP_FRACTION=0.15` the KV/state pool is about
+3.2 GiB per rank (`0.15 * 0.9 * 24 GiB`), leaving about 3.7 GiB for compiled graphs and scratch.
 
 ### Prefix caching
 
@@ -545,6 +592,10 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
   without `MTP_TOKENS` when `logprobs` are needed.
 - **MTP supports at most 2 draft tokens**. With 3 draft tokens the verify pass produced
   invalid indices; this is not resolved.
+- **Qwen3.5-35B-A3B (MoE) is validated on CPU only** (HF parity of the MoE block and of the
+  whole model on a small random checkpoint, through the plugin's PyTorch fallbacks of the MoE
+  ops); BF16 experts only, and the MTP layer's experts are read from per-expert checkpoint
+  tensors.
 - **Device profiles of prefill graphs are incomplete**: the runtime drops profiler
   notifications for graphs of this size, so per-layer prefill breakdowns are not available yet.
 

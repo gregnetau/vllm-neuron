@@ -7,8 +7,9 @@ KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -
 
 ## Overview
 
-Qwen3.5 / Qwen3.8 dense models interleave Gated DeltaNet (GDN) linear-attention layers with
-full-attention layers (48 + 16 on 27B). A GDN layer carries a fixed-size state per request
+Qwen3.5 / Qwen3.8 models (dense, and the sparse MoE Qwen3.5-35B-A3B, whose FFNs are the only
+difference) interleave Gated DeltaNet (GDN) linear-attention layers with full-attention layers
+(48 + 16 on 27B, 30 + 10 on 35B-A3B). A GDN layer carries a fixed-size state per request
 instead of a KV cache:
 
 | State | Shape per rank (27B, TP=4) | Dtype |
@@ -32,7 +33,9 @@ the state page so the enlarged attention block is a whole number of 256-token bl
 the attention metadata splits each manager block back into kernel-sized blocks
 (`--block-size`, 32 by default; 128 is recommended with an FP8 KV cache, see
 [Full-attention prefill](#full-attention-prefill)). With one KV head per rank, a manager block
-is a pure reshape of its kernel blocks. The runner logs the result, for example
+is a pure reshape of its kernel blocks. Checkpoints with fewer KV heads than ranks (Qwen3.5-35B-A3B:
+2 KV heads at TP=4) replicate each KV head over `tp / num_key_value_heads` ranks, so they also
+keep one KV head per rank (`Qwen3_5Config.kv_head_shard`). The runner logs the result, for example
 `KV cache block_size resolved: cache_config=32, per_group=[1024, 2048, 2048, 2048]`.
 
 ## Dedicated state pool

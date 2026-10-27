@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Qwen3.5 / Qwen3.8 dense (hybrid Gated DeltaNet) config
-======================================================
+Qwen3.5 / Qwen3.8 (hybrid Gated DeltaNet) config, dense or sparse MoE
+=====================================================================
 
 <-- MODEL-SPECIFIC: Qwen3.8-27B (``model_type=qwen3_5``, text tower only).
 64 layers: 48 ``linear_attention`` (Gated DeltaNet) + 16 ``full_attention``
@@ -9,6 +9,11 @@ Qwen3.5 / Qwen3.8 dense (hybrid Gated DeltaNet) config
 gate (q_proj emits 2*head_dim per head: [query | gate]), per-head QK-norm and
 partial rotary (``partial_rotary_factor`` of head_dim) with interleaved mrope.
 RMSNorm is zero-centered: ``x * (1 + weight)``.
+
+Sparse MoE (``model_type=qwen3_5_moe``, e.g. Qwen3.5-35B-A3B): the same hybrid stack with
+every MLP replaced by ``num_experts`` routed experts (top ``num_experts_per_tok``, softmax
+over all experts then L1-renormalised) plus one shared expert scaled by
+``sigmoid(shared_expert_gate(x))``. ``num_experts == 0`` means dense.
 """
 
 import json
@@ -59,6 +64,15 @@ class Qwen3_5Config:
     # Multi-token-prediction head (draft model for speculative decoding)
     mtp_num_hidden_layers: int = 1
 
+    # Sparse MoE (qwen3_5_moe); 0 experts = dense MLP (intermediate_size)
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    norm_topk_prob: bool = True
+    mlp_only_layers: list[int] = field(default_factory=list)
+    decoder_sparse_step: int = 1
+
     # Framework config
     neuron_config: NeuronConfig | None = None
 
@@ -80,6 +94,33 @@ class Qwen3_5Config:
         if self.linear_num_value_heads % self.linear_num_key_heads:
             raise ValueError(
                 "linear_num_value_heads must be a multiple of linear_num_key_heads"
+            )
+        if self.is_moe:
+            self._validate_moe()
+
+    def _validate_moe(self) -> None:
+        # <-- MODEL-SPECIFIC: Qwen3-Next style configs can keep some layers dense; the
+        # published Qwen3.5 MoE checkpoints are sparse in every layer.
+        if self.mlp_only_layers or self.decoder_sparse_step != 1:
+            raise NotImplementedError(
+                f"mlp_only_layers={self.mlp_only_layers} / decoder_sparse_step="
+                f"{self.decoder_sparse_step}: Qwen3.5 MoE supports sparse MLPs in every layer only."
+            )
+        if not self.norm_topk_prob:
+            raise NotImplementedError(
+                "norm_topk_prob=False is not supported: the MoE kernels route softmax -> "
+                "top-k -> renormalise."
+            )
+        if not (
+            0 < self.num_experts_per_tok <= self.num_experts
+            and self.moe_intermediate_size > 0
+            and self.shared_expert_intermediate_size > 0
+        ):
+            raise ValueError(
+                f"Invalid MoE config: num_experts={self.num_experts}, "
+                f"num_experts_per_tok={self.num_experts_per_tok}, moe_intermediate_size="
+                f"{self.moe_intermediate_size}, shared_expert_intermediate_size="
+                f"{self.shared_expert_intermediate_size} (a shared expert is required)."
             )
 
     # -- derived ----------------------------------------------------------
@@ -109,29 +150,67 @@ class Qwen3_5Config:
         return [i for i, t in enumerate(self.layer_types) if t == LINEAR_ATTENTION]
 
     @property
+    def is_moe(self) -> bool:
+        return self.num_experts > 0
+
+    def num_kv_heads_per_rank(self, tp_size: int) -> int:
+        """KV heads per rank; with fewer KV heads than ranks each head is replicated."""
+        return max(1, self.num_key_value_heads // tp_size)
+
+    def kv_head_shard(self, rank: int, tp_size: int) -> tuple[int, int]:
+        """(shard index, shard count) of this rank's KV heads. With replication
+        (tp_size > num_key_value_heads) ranks ``r*rep .. r*rep+rep-1`` share KV head ``r``,
+        which is the head their query heads attend to (query heads are sharded contiguously)."""
+        if tp_size <= self.num_key_value_heads:
+            return rank, tp_size
+        rep = tp_size // self.num_key_value_heads
+        return rank // rep, self.num_key_value_heads
+
+    @property
     def fp8_enabled(self) -> bool:
         return (
             self.neuron_config is not None and self.neuron_config.quantization == "fp8"
         )
 
     def fp8_quantized(self, module: str) -> bool:
-        """Whether HF-named ``module`` (e.g. "layers.3.mlp") runs in static FP8."""
+        """Whether HF-named ``module`` (e.g. "layers.3.mlp") runs in static FP8. MoE experts
+        are BF16 only (the factory rejects quantization="fp8" for MoE checkpoints)."""
         if not self.fp8_enabled:
+            return False
+        if self.is_moe and module.endswith(".mlp"):
             return False
         skip = self.neuron_config.modules_to_not_convert or []
         return not any(s in module for s in skip)
 
     def validate_tp(self, tp_size: int) -> None:
-        """Every sharded dimension must divide evenly (KV heads are not replicated)."""
+        """Every sharded dimension must divide evenly. KV heads either shard evenly or, with
+        more ranks than KV heads, are replicated (tp_size a multiple of num_key_value_heads)."""
+        if self.is_moe:
+            mlp = (
+                ("moe_intermediate_size", self.moe_intermediate_size),
+                (
+                    "shared_expert_intermediate_size",
+                    self.shared_expert_intermediate_size,
+                ),
+            )
+        else:
+            mlp = (("intermediate_size", self.intermediate_size),)
         for name, n in (
             ("num_attention_heads", self.num_attention_heads),
-            ("num_key_value_heads", self.num_key_value_heads),
             ("linear_num_key_heads", self.linear_num_key_heads),
             ("linear_num_value_heads", self.linear_num_value_heads),
-            ("intermediate_size", self.intermediate_size),
+            *mlp,
         ):
             if n % tp_size:
                 raise ValueError(f"{name}={n} is not divisible by tp_size={tp_size}")
+        nkv = self.num_key_value_heads
+        if (nkv % tp_size if tp_size <= nkv else tp_size % nkv) or (
+            self.num_attention_heads // tp_size % self.num_kv_heads_per_rank(tp_size)
+        ):
+            raise ValueError(
+                f"num_key_value_heads={nkv} neither shards nor replicates over "
+                f"tp_size={tp_size}"
+            )
 
     # -- construction -----------------------------------------------------
     @classmethod
@@ -150,7 +229,7 @@ class Qwen3_5Config:
             if dtype is not None:
                 config_dict["torch_dtype"] = dtype
 
-        # Top-level Qwen3_5ForConditionalGeneration config nests the text tower.
+        # Top-level Qwen3_5(Moe)ForConditionalGeneration config nests the text tower.
         text = config_dict.get("text_config")
         if text is not None:
             top_dtype = config_dict.get("torch_dtype") or config_dict.get("dtype")

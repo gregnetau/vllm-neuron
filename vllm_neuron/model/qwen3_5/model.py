@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Qwen3.5 / Qwen3.8 dense hybrid (Gated DeltaNet + full attention), text only
-=========================================================================
+Qwen3.5 / Qwen3.8 hybrid (Gated DeltaNet + full attention), dense or sparse MoE, text only
+==========================================================================================
 
 BF16, or per-tensor static FP8 (``quantization="fp8"``: MLP, attention and GDN projections;
-the attention output gate and GDN b/a projections stay BF16). Numerics of the weight transforms, GDN
-ops, partial-rotary trick and TP sharding are unit-tested on CPU (``test/unit/model/qwen3_5``).
+the attention output gate and GDN b/a projections stay BF16). The decoder layer's FFN is
+pluggable: the dense MLP (BF16 / static FP8), or for ``qwen3_5_moe`` checkpoints (e.g.
+Qwen3.5-35B-A3B) the BF16 sparse MoE block in ``moe.py``. With fewer KV heads than TP ranks
+(35B-A3B: 2 KV heads at TP=4) each KV head is replicated, so every rank keeps one. Numerics
+of the weight transforms, GDN ops, partial-rotary trick, MoE block and TP sharding are
+unit-tested on CPU (``test/unit/model/qwen3_5``).
 
 Adapted from ``vllm_neuron/model/qwen3/model.py`` (dense, GQA, QK-norm). Differences:
 
@@ -53,14 +57,18 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from vllm_neuron.utils.weight_loader import (
     SafetensorsWeightLoader,
+    expert_parallel_grouped_loader,
+    expert_parallel_tensor_dim_loader,
     set_weight_loader,
     sharding_weight_loader,
+    with_rank_override,
 )
 from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from . import gdn_ops
 from . import weights as W
 from .config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
+from .moe import Qwen3_5SparseMoeBlock
 from .state import gdn_state_shapes
 
 logger = logging.getLogger(__name__)
@@ -258,8 +266,9 @@ class Qwen3_5Attention(nn.Module):
         self.num_attention_heads_per_rank = (
             config.num_attention_heads // self.world_size
         )
-        self.num_key_value_heads_per_rank = (
-            config.num_key_value_heads // self.world_size
+        # With fewer KV heads than ranks each KV head is replicated (weights.attention_qkv_device).
+        self.num_key_value_heads_per_rank = config.num_kv_heads_per_rank(
+            self.world_size
         )
         self.num_key_value_groups = (
             self.num_attention_heads_per_rank // self.num_key_value_heads_per_rank
@@ -1241,6 +1250,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5MLP(nn.Module):
     """SiLU-gated MLP, TP intermediate sharding (identical structure to Qwen3MLP)."""
 
+    FUSES_NORM: ClassVar[bool] = False  # takes the post-attention-normed hidden state
+
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
         self.tp_group = get_tp_group()
@@ -1296,6 +1307,7 @@ class Qwen3_5MLPStaticFP8(nn.Module):
         "gate_up_input_scale": ("mlp.gate_proj", "mlp.up_proj"),
         "down_input_scale": ("mlp.down_proj",),
     }
+    FUSES_NORM: ClassVar[bool] = True  # takes the residual and the norm gamma (ln_w)
 
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
@@ -1494,8 +1506,15 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.self_attn = Qwen3_5Attention(config, layer_idx)
         else:
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+        # Pluggable FFN: dense MLP (BF16 or static FP8) or sparse MoE (qwen3_5_moe).
+        self.is_moe = config.is_moe
         self.mlp_fp8 = config.fp8_quantized(f"layers.{layer_idx}.mlp")
-        self.mlp = Qwen3_5MLPStaticFP8(config) if self.mlp_fp8 else Qwen3_5MLP(config)
+        if self.is_moe:
+            self.mlp = Qwen3_5SparseMoeBlock(config)
+        elif self.mlp_fp8:
+            self.mlp = Qwen3_5MLPStaticFP8(config)
+        else:
+            self.mlp = Qwen3_5MLP(config)
         self.mixer_key = _mixer_key(config, layer_idx, self.layer_type)
 
     @property
@@ -1525,7 +1544,15 @@ class Qwen3_5DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        if self.mlp_fp8:  # norm is fused into the fp8 MLP kernels
+        if self.is_moe:  # the decode MoE kernel fuses the norm
+            hidden_states = self.mlp(
+                hidden_states,
+                is_prefill=not is_decode,
+                ln_w=self.post_attention_layernorm.weight,
+                # Prefill padding (slot -1, the GDN prefill's convention) routes to no expert.
+                token_mask=None if is_decode else md["slot_mapping"] > 0,
+            )
+        elif self.mlp.FUSES_NORM:  # norm is fused into the fp8 MLP kernels
             hidden_states = self.mlp(
                 hidden_states,
                 is_prefill=not is_decode,
@@ -1637,14 +1664,66 @@ class Qwen3_5Model(nn.Module):
         return hidden_states, []
 
 
-def _attach_layer_loaders(layer, cfg, tp: int) -> None:
+def _attach_moe_loaders(moe, tp: int, fused_experts: bool) -> None:
+    """Loaders for a Qwen3_5SparseMoeBlock. ``fused_experts``: the checkpoint stores one
+    [E, 2I, H] gate_up_proj and one [E, H, I] down_proj tensor (backbone layers); otherwise
+    per-expert gate_proj / up_proj / down_proj weights (the MTP layer), mapped as the lists
+    [gate_0 .. gate_{E-1}, up_0 .. up_{E-1}] and [down_0 .. down_{E-1}]."""
+    if fused_experts:
+        gate_up = SafetensorsWeightLoader(
+            transform=lambda s, r: W.moe_gate_up_device(s[0], r, moe.tp_degree)
+        )
+        down = SafetensorsWeightLoader(
+            transform=lambda s, r: W.moe_down_device(s[0], r, moe.tp_degree)
+        )
+    else:
+        gate_up = SafetensorsWeightLoader(
+            transform=lambda s, r: W.moe_gate_up_device_per_expert(
+                s[: len(s) // 2], s[len(s) // 2 :], r, moe.tp_degree
+            )
+        )
+        down = SafetensorsWeightLoader(
+            transform=lambda s, r: W.moe_down_device_per_expert(s, r, moe.tp_degree)
+        )
+    if moe.ep_degree > 1:  # >>> PARALLELISM: EP reads only this rank's experts <<<
+        if fused_experts:
+            gate_up = expert_parallel_tensor_dim_loader(moe.local_experts, gate_up)
+            down = expert_parallel_tensor_dim_loader(moe.local_experts, down)
+        else:
+            gate_up = expert_parallel_grouped_loader(
+                moe.local_experts, gate_up, moe.num_experts
+            )
+            down = expert_parallel_grouped_loader(
+                moe.local_experts, down, moe.num_experts
+            )
+        # The intermediate-dim shard is this rank's position in its EP partition.
+        ep_tp_rank = moe.ep_tp_group.rank_in_group
+        gate_up = with_rank_override(gate_up, ep_tp_rank)
+        down = with_rank_override(down, ep_tp_rank)
+    set_weight_loader(moe.experts_gate_up_weight, gate_up)
+    set_weight_loader(moe.experts_down_weight, down)
+    transposed = _loader(lambda t, r: t[0].t().contiguous())  # replicated, [in, out]
+    set_weight_loader(moe.router_weight, transposed)
+    set_weight_loader(moe.shared_expert_gate_weight, transposed)
+    gate_up_dev = _loader(lambda t, r: W.mlp_gate_up_device(t[0], r, tp))
+    set_weight_loader(moe.shared_gate_proj_weight, gate_up_dev)
+    set_weight_loader(moe.shared_up_proj_weight, gate_up_dev)
+    set_weight_loader(
+        moe.shared_down_proj_weight,
+        _loader(lambda t, r: W.mlp_down_device(t[0], r, tp)),
+    )
+
+
+def _attach_layer_loaders(layer, cfg, tp: int, fused_experts: bool = True) -> None:
     """Per-parameter transforms (HF checkpoint tensors -> this rank's layout) for one decoder
     layer; the checkpoint keys come from _layer_weight_mappings."""
     fold = _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float())
     set_weight_loader(layer.input_layernorm.weight, fold)
     set_weight_loader(layer.post_attention_layernorm.weight, fold)
     mlp = layer.mlp
-    if layer.mlp_fp8:
+    if layer.is_moe:
+        _attach_moe_loaders(mlp, tp, fused_experts)
+    elif layer.mlp_fp8:
         q = lambda dev: _loader(
             lambda t, r: W.fp8_quantize(dev(t[0], r, tp), W.fp8_weight_scale(t[0]))
         )
@@ -1735,15 +1814,46 @@ def _attach_layer_loaders(layer, cfg, tp: int) -> None:
         set_weight_loader(g.dt_bias, vec)
 
 
-def _layer_weight_mappings(layer, pre: str, ck: str) -> dict:
+def _moe_weight_mappings(moe, pre: str, ck: str, fused_experts: bool) -> dict:
+    """Param name -> checkpoint key(s) for a Qwen3_5SparseMoeBlock (see _attach_moe_loaders)."""
+    m = {}
+    if fused_experts:
+        # nn.Parameters of Qwen3_5MoeExperts: no ".weight" suffix.
+        m[pre + "experts_gate_up_weight"] = ck + "experts.gate_up_proj"
+        m[pre + "experts_down_weight"] = ck + "experts.down_proj"
+    else:
+        experts = range(moe.num_experts)
+        m[pre + "experts_gate_up_weight"] = [
+            ck + f"experts.{e}.{proj}.weight"
+            for proj in ("gate_proj", "up_proj")
+            for e in experts
+        ]
+        m[pre + "experts_down_weight"] = [
+            ck + f"experts.{e}.down_proj.weight" for e in experts
+        ]
+    m[pre + "router_weight"] = ck + "gate.weight"
+    for part in ("gate", "up", "down"):
+        m[pre + f"shared_{part}_proj_weight"] = ck + f"shared_expert.{part}_proj.weight"
+    m[pre + "shared_expert_gate_weight"] = ck + "shared_expert_gate.weight"
+    return m
+
+
+def _layer_weight_mappings(
+    layer, pre: str, ck: str, fused_experts: bool = True
+) -> dict:
     """Param name -> checkpoint key(s) for one decoder layer (param prefix ``pre``, checkpoint
-    prefix ``ck``)."""
+    prefix ``ck``). ``fused_experts``: MoE expert layout of the checkpoint (_attach_moe_loaders)."""
     m = {}
     m[pre + "input_layernorm.weight"] = ck + "input_layernorm.weight"
     m[pre + "post_attention_layernorm.weight"] = ck + "post_attention_layernorm.weight"
-    m[pre + "mlp.gate_proj_weight"] = ck + "mlp.gate_proj.weight"
-    m[pre + "mlp.up_proj_weight"] = ck + "mlp.up_proj.weight"
-    m[pre + "mlp.down_proj_weight"] = ck + "mlp.down_proj.weight"
+    if layer.is_moe:
+        m.update(
+            _moe_weight_mappings(layer.mlp, pre + "mlp.", ck + "mlp.", fused_experts)
+        )
+    else:
+        m[pre + "mlp.gate_proj_weight"] = ck + "mlp.gate_proj.weight"
+        m[pre + "mlp.up_proj_weight"] = ck + "mlp.up_proj.weight"
+        m[pre + "mlp.down_proj_weight"] = ck + "mlp.down_proj.weight"
     if layer.mlp_fp8:
         for part in ("gate", "up", "down"):
             m[pre + f"mlp.{part}_weight_scale"] = ck + f"mlp.{part}_proj.weight"

@@ -32,6 +32,10 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM),
         ("Qwen3_5ForConditionalGeneration", Qwen3_5ForCausalLM),
         ("Qwen3_5MTP", Qwen3_5MTP),  # MTP head, draft model for speculative decoding
+        # Qwen3.5 sparse MoE (e.g. Qwen3.5-35B-A3B): same model, MoE FFN from the config.
+        ("Qwen3_5MoeForCausalLM", Qwen3_5ForCausalLM),
+        ("Qwen3_5MoeForConditionalGeneration", Qwen3_5ForCausalLM),
+        ("Qwen3_5MoeMTP", Qwen3_5MTP),
         ("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration),
     ]
 

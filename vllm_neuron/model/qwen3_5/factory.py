@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Factory for the Qwen3.5 / Qwen3.8 dense hybrid text model (BF16 or static FP8, text only)."""
+"""Factory for the Qwen3.5 / Qwen3.8 hybrid text model: dense (BF16 or static FP8) or sparse
+MoE (``qwen3_5_moe``, BF16), text only."""
 
 from torch import nn
 from transformers import PretrainedConfig
@@ -11,9 +12,12 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 class Qwen3_5ForCausalLM(nn.Module, HasRecurrentState, ServesTextOnly):
     """Validates the config and builds the Neuron implementation.
 
-    Registered under both ``Qwen3_5ForCausalLM`` and ``Qwen3_5ForConditionalGeneration``
-    (the published Qwen3.8-27B checkpoint's architecture). Both serve the text tower; the
-    vision tower is not loaded, and the MTP head is the separate ``Qwen3_5MTP`` draft model.
+    Registered under ``Qwen3_5ForCausalLM`` and ``Qwen3_5ForConditionalGeneration`` (the
+    published Qwen3.8-27B checkpoint's architecture), and for the sparse MoE checkpoints
+    (e.g. Qwen3.5-35B-A3B) under ``Qwen3_5MoeForCausalLM`` and
+    ``Qwen3_5MoeForConditionalGeneration``: the config's ``num_experts`` selects the FFN.
+    All serve the text tower; the vision tower is not loaded, and the MTP head is the
+    separate ``Qwen3_5MTP`` (``Qwen3_5MoeMTP``) draft model.
     """
 
     # Options the plugin core reads from the registered class (registry.get_model_cls):
@@ -78,12 +82,43 @@ class Qwen3_5ForCausalLM(nn.Module, HasRecurrentState, ServesTextOnly):
         cfg = Qwen3_5Config.from_configs(hf_config)
         tp = get_tp_group().world_size
         cfg.validate_tp(tp)
-        if cfg.num_key_value_heads // tp != 1:
+        if cfg.num_kv_heads_per_rank(tp) != 1:
             # Hybrid attention/state models split the KV manager's enlarged attention blocks
-            # into kernel-sized blocks with a pure reshape, which needs 1 KV head per rank.
+            # into kernel-sized blocks with a pure reshape, which needs 1 KV head per rank
+            # (KV heads are replicated when tensor_parallel_size exceeds them).
             raise NotImplementedError(
-                f"tensor_parallel_size must equal num_key_value_heads "
+                f"tensor_parallel_size must be a multiple of num_key_value_heads "
                 f"({cfg.num_key_value_heads}) for Qwen3.5/3.8; got {tp}."
+            )
+        if cfg.is_moe:
+            cls._validate_moe(cfg, quantization)
+
+    @staticmethod
+    def _validate_moe(cfg, quantization) -> None:
+        """Sparse MoE: BF16 experts, and the shapes the MoE kernels (moe.py) need."""
+        from .moe import _expert_parallel_degree
+
+        if quantization == "fp8":
+            raise NotImplementedError(
+                "quantization='fp8' is not supported for Qwen3.5 MoE checkpoints: the experts "
+                "run in BF16 and the static-FP8 calibration covers the dense MLP only. Serve "
+                "BF16 (quantization None/'bf16')."
+            )
+        from vllm.distributed.parallel_state import get_tp_group
+
+        _, _, ep_tp_group = _expert_parallel_degree()
+        expert_tp = (ep_tp_group or get_tp_group()).world_size
+        inter = cfg.moe_intermediate_size // expert_tp
+        if cfg.moe_intermediate_size % expert_tp or inter % 128:
+            raise ValueError(
+                f"moe_intermediate_size / expert TP degree = {cfg.moe_intermediate_size} / "
+                f"{expert_tp} must be a multiple of 128 for the MoE kernels; lower "
+                "tensor_parallel_size or enable expert parallelism."
+            )
+        if cfg.hidden_size % 256:
+            raise ValueError(
+                f"hidden_size={cfg.hidden_size} must be a multiple of 256 for the decode MoE "
+                "kernel."
             )
 
     @staticmethod
@@ -109,7 +144,9 @@ class Qwen3_5ForCausalLM(nn.Module, HasRecurrentState, ServesTextOnly):
 
 
 class Qwen3_5MTP(nn.Module):
-    """Factory for the MTP draft model (vLLM's ``mtp`` speculative method)."""
+    """Factory for the MTP draft model (vLLM's ``mtp`` speculative method). Registered as
+    ``Qwen3_5MTP`` and ``Qwen3_5MoeMTP`` (the draft architecture vLLM picks for
+    ``qwen3_5_moe``); the config selects the FFN."""
 
     @classmethod
     def from_configs(

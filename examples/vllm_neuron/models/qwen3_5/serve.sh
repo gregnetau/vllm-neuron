@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# OpenAI-compatible server for Qwen3.5 / Qwen3.8 dense (27B), TP=4 on trn2.3xlarge.
+# OpenAI-compatible server for Qwen3.5 / Qwen3.8 (dense 27B, sparse MoE 35B-A3B), TP=4 on
+# trn2.3xlarge.
 #
 # Usage:
 #   MODEL=<path-to-checkpoint>/Qwen3.8-27B examples/vllm_neuron/models/qwen3_5/serve.sh
-#   # Tensor parallelism = the checkpoint's KV-head count (TP, default 4; Qwen3.5-2B: TP=2):
+#   # Tensor parallelism: a multiple of the checkpoint's KV-head count (TP, default 4; KV heads
+#   # are replicated above it; Qwen3.5-2B: TP=2):
 #   MODEL=<path-to-checkpoint>/Qwen3.5-2B TP=2 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Static FP8 MLPs:
 #   MODEL=... FP8_SCALES=<path>/fp8_act_amax.json examples/vllm_neuron/models/qwen3_5/serve.sh
@@ -16,6 +18,10 @@
 #   MODEL=... PREFIX_CACHING=1 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # MTP speculative decoding with N (1 or 2) draft tokens:
 #   MODEL=... MTP_TOKENS=1 examples/vllm_neuron/models/qwen3_5/serve.sh
+#   # Sparse MoE Qwen3.5-35B-A3B (BF16, 2 KV heads replicated over TP=4; about 17 GiB of
+#   # weights per rank, so raise GPU_MEM_UTIL to leave room for the KV/state pool):
+#   MODEL=<path-to-checkpoint>/Qwen3.5-35B-A3B MTP_TOKENS=2 GPU_MEM_UTIL=0.9 \
+#       examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Native 262k context, FP8 KV (KV pool of about 1.19M tokens), 4 sequences:
 #   MODEL=... FP8_SCALES=... MTP_TOKENS=2 KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 MAX_MODEL_LEN=262144 \
 #       MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" DECODE_CTX_BUCKETS="16384, 65536" GPU_MEM_UTIL=0.95 \
