@@ -68,6 +68,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
         async_scheduling=False,
+        disable_log_stats=not args.mtp,  # the MTP summary reads the spec-decode metrics
         limit_mm_per_prompt={"image": 0, "video": 0},
         hf_overrides=hf_overrides,
         additional_config={"neuron_config": neuron_config},
