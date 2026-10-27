@@ -129,6 +129,7 @@ def _load_text_model(model_checkpoint, dtype, config=None):
     "batch_size, seq_len",
     [
         (1, 2048),
+        (4, 2048),
     ],
 )
 def test_model_accuracy(batch_size: int, seq_len: int) -> None:
