@@ -259,8 +259,9 @@ def test_align_state_table_is_running_block_per_row():
     t = r._mamba_align_state_table(4, 1)
     assert t.shape == (4, 1)
     assert t.dtype == torch.int32
-    # a: block 2 -> 22; b: block 0 -> 30; c: no index -> null block; row 3: padding.
-    assert t[:, 0].tolist() == [22, 30, 0, 0]
+    # a: block 2 -> 22; b: block 0 -> 30; c: no index and row 3 (padding): -1, so the
+    # GDN kernels skip them instead of writing state into the KV null block 0.
+    assert t[:, 0].tolist() == [22, 30, -1, -1]
 
 
 def test_align_state_table_follows_preprocess():
