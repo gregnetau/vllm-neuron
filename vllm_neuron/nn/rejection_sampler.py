@@ -179,8 +179,10 @@ def rejection_sampler(
         torch.where(boundary, targets_2d, PLACEHOLDER_TOKEN_ID),
     )
 
-    # Add bonus token if all drafts accepted
-    all_accepted = (matches & valid).all(dim=1)
+    # Add bonus token if all drafts accepted. Positions past a request's own drafts
+    # count as accepted: a request with fewer than max_spec_len drafts (none, near
+    # max_model_len) still emits its bonus token.
+    all_accepted = (matches | ~valid).all(dim=1)
     result = torch.cat(
         [
             output,
