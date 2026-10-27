@@ -7066,19 +7066,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     dense_ctx,
                 )
 
-        # === Draft model graph capture ===
-        if self.drafter is not None:
-            logger.info(
-                "Capturing %s prefill graphs for bucket size: %d",
-                self.speculative_config.method.upper(),
-                bucket_size,
-            )
-            self.drafter.graph_extract(
-                num_tokens=bucket_size,
-                num_reqs=1,
-                attn_metadata=kwargs["attn_metadata"],
-                device=device,
-            )
+            # === Draft model graph capture ===
+            # The draft's attention layers share the target's KV group, so a dense-variant
+            # step hands the draft the trimmed tables too: capture each variant.
+            if self.drafter is not None:
+                logger.info(
+                    "Capturing %s prefill graphs for bucket size: %d, dense_ctx=%s",
+                    self.speculative_config.method.upper(),
+                    bucket_size,
+                    dense_ctx,
+                )
+                self.drafter.graph_extract(
+                    num_tokens=bucket_size,
+                    num_reqs=1,
+                    attn_metadata=kwargs["attn_metadata"],
+                    device=device,
+                )
 
     def _drain_previous_dummy_output(self, model_output: Any) -> None:
         """Read the previous dummy output back, then hold the current one.
@@ -7145,6 +7148,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size,
         )
         compile_start = time.perf_counter()
+        draft_metadata = []
         for dense_ctx in reversed(
             self.prefill_ctx_variants(kv_segment_size, bucket_size)
         ):
@@ -7160,6 +7164,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
                 set_active_context(None)
+            # The draft's attention layers share the target's KV group, so a dense-variant
+            # step hands the draft the trimmed tables too: warm up each variant.
+            if self.drafter is not None:
+                draft_metadata.append(warmup_kwargs["attn_metadata"])
         compile_elapsed = time.perf_counter() - compile_start
         bucket_name = f"prefill_s{bucket_size}"
         if kv_segment_size > 0:
@@ -7181,11 +7189,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.speculative_config.method.upper(),
                 bucket_size,
             )
-            self.drafter.warmup(
-                num_tokens=bucket_size,
-                num_reqs=1,
-                attn_metadata=warmup_kwargs["attn_metadata"],
-            )
+            for attn_metadata in draft_metadata:
+                self.drafter.warmup(
+                    num_tokens=bucket_size,
+                    num_reqs=1,
+                    attn_metadata=attn_metadata,
+                )
 
     def _create_warmup_spec_decode_metadata(
         self,

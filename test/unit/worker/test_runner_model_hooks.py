@@ -208,3 +208,40 @@ def test_runner_dense_prefill_variant_helpers():
     assert out["m"] is md["m"]
     r.model = SimpleNamespace()
     assert r.prefill_ctx_variants(0) == [False]
+
+
+def test_draft_warmup_covers_every_prefill_variant():
+    """The draft's attention layers share the target's KV groups, so a dense-variant step
+    hands the draft the trimmed tables too: the draft warms up (and is captured) with the
+    metadata of every prefill variant."""
+    variants = []
+
+    class Drafter:
+        def __init__(self):
+            self.warmed, self.captured = [], []
+
+        def warmup(self, num_tokens, num_reqs, attn_metadata):
+            self.warmed.append(attn_metadata["dense"])
+
+        def graph_extract(self, num_tokens, num_reqs, attn_metadata, device=None):
+            self.captured.append(attn_metadata["dense"])
+
+    def build(bucket_size, kv_segment_size, device=None, dense_ctx=False):
+        variants.append(dense_ctx)
+        return {"attn_metadata": {"dense": dense_ctx}}
+
+    r = make_runner(SimpleNamespace(prefill_dense_context=2048))
+    r.model = lambda **kwargs: None
+    r.capture_backend_model = r.model
+    r.kv_cache_config = SimpleNamespace()
+    r._build_prefill_synthetic_inputs = build
+    r._tensor_replacer = None
+    r.use_async_scheduling = False
+    r.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="m"))
+    r.speculative_config = SimpleNamespace(method="mtp")
+    r.drafter = Drafter()
+    r.prefill_ctx_variants = lambda segment, bucket: [False, True]
+    r.warmup_prefill(1024, 1024)
+    assert sorted(r.drafter.warmed) == [False, True]
+    r.extract_prefill_graphs(1024, 1024)
+    assert sorted(r.drafter.captured) == [False, True]
