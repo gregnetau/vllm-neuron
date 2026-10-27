@@ -345,7 +345,9 @@ need in-graph window trimming, since the host count is an upper bound.
   arriving while others decode (held back or interleaved), partial acceptance (oracle
   draft), trimmed drafts and drafting stopped near `max_model_len`, all drafts rejected,
   logprobs, the pool pages and `state_in`, and the real MTP head, whose in-graph drafts
-  equal a from-scratch run of the head over each committed sequence.
+  equal a from-scratch run of the head over each committed sequence. With `SPEC_DYNAMO=1`
+  the adapter runs through `torch.compile(backend="eager", fullgraph=True)`; the run must
+  compile one graph per bucket and nothing per step (`TORCH_LOGS=recompiles`).
 - `test/unit/worker/test_v2_policy_recurrent_state.py`: the policy matrix.
 
 ## Not done yet
