@@ -136,6 +136,52 @@ def rejection_sampler(
     )
     targets_2d = torch.where(valid, target_token_ids[target_idx], PLACEHOLDER_TOKEN_ID)
 
+    output, all_accepted = _accept_prefix(
+        drafts_2d, targets_2d, valid, synthetic_conditional_rates
+    )
+
+    # Add bonus token if all drafts accepted. Positions past a request's own drafts
+    # count as accepted: a request with fewer than max_spec_len drafts (none, near
+    # max_model_len) still emits its bonus token.
+    result = torch.cat(
+        [
+            output,
+            torch.full(
+                (batch_size, 1), PLACEHOLDER_TOKEN_ID, device=device, dtype=torch.int32
+            ),
+        ],
+        dim=1,
+    )
+    result[batch_idx, num_drafts.long()] = torch.where(
+        all_accepted, bonus_tokens, PLACEHOLDER_TOKEN_ID
+    )
+
+    return result
+
+
+def _accept_prefix(
+    drafts_2d: torch.Tensor,
+    targets_2d: torch.Tensor,
+    valid: torch.Tensor,
+    synthetic_conditional_rates: list[float] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accept drafts up to the first mismatch; shared by both sampler layouts.
+
+    Args:
+        drafts_2d: ``[batch, max_spec_len]`` draft tokens (masked where not ``valid``).
+        targets_2d: ``[batch, max_spec_len]`` target tokens at the draft positions.
+        valid: ``[batch, max_spec_len]`` positions holding a real draft.
+        synthetic_conditional_rates: Optional per-position conditional acceptance
+            rates (synthetic mode); ``None`` for standard greedy matching.
+
+    Returns:
+        ``[batch, max_spec_len]`` int32 output (accepted drafts, the target token at
+        the first mismatch, ``-1`` beyond) and the ``[batch]`` flag of rows whose
+        drafts were all accepted (positions past a row's own drafts count as
+        accepted, so a row with fewer drafts still emits its bonus token).
+    """
+    batch_size, max_spec_len = drafts_2d.shape
+    device = drafts_2d.device
     # Per-position acceptance mask. Both modes mask invalid positions to False so
     # the sequential early-termination below treats padding as a rejection.
     if synthetic_conditional_rates is not None:
@@ -162,7 +208,7 @@ def rejection_sampler(
     # `matches` differs.
     mismatches = ~matches  # [batch_size, max_spec_len]
     mismatches_with_sentinel = torch.cat(
-        [mismatches, torch.ones(cu.shape[0], 1, device=device, dtype=torch.bool)], dim=1
+        [mismatches, torch.ones(batch_size, 1, device=device, dtype=torch.bool)], dim=1
     )  # [batch_size, max_spec_len + 1]
     first_mismatch_pos = mismatches_with_sentinel.float().argmax(dim=1)  # [batch_size]
     pos_indices = torch.arange(max_spec_len, device=device).unsqueeze(
@@ -179,21 +225,66 @@ def rejection_sampler(
         torch.where(boundary, targets_2d, PLACEHOLDER_TOKEN_ID),
     )
 
-    # Add bonus token if all drafts accepted. Positions past a request's own drafts
-    # count as accepted: a request with fewer than max_spec_len drafts (none, near
-    # max_model_len) still emits its bonus token.
     all_accepted = (matches | ~valid).all(dim=1)
-    result = torch.cat(
-        [
-            output,
-            torch.full(
-                (batch_size, 1), PLACEHOLDER_TOKEN_ID, device=device, dtype=torch.int32
-            ),
-        ],
-        dim=1,
-    )
-    result[batch_idx, num_drafts.long()] = torch.where(
-        all_accepted, bonus_tokens, PLACEHOLDER_TOKEN_ID
-    )
+    return output, all_accepted
 
-    return result
+
+@torch.no_grad()
+def rejection_sample_fixed(
+    target_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    synthetic_conditional_rates: list[float] | None = None,
+) -> torch.Tensor:
+    """Greedy rejection sampling over a fixed ``[batch, 1 + k]`` verify layout.
+
+    Model Runner V2 lays a verify step out as ``1 + k`` tokens per request whatever
+    the request's draft count: row ``b`` holds its last token and ``num_draft_tokens[b]``
+    drafts, then padding. ``target_token_ids[b, j]`` is the token sampled from the
+    target logits at column ``j``, so column ``num_draft_tokens[b]`` is the bonus
+    token. Same acceptance rule as :func:`rejection_sampler`.
+
+    Args:
+        target_token_ids: ``[batch, 1 + k]`` sampled target tokens.
+        draft_token_ids: ``[batch, k]`` draft tokens; columns past a row's count are
+            ignored.
+        num_draft_tokens: ``[batch]`` draft count per row, ``0 .. k``.
+        synthetic_conditional_rates: Optional per-position conditional acceptance
+            rates (see :func:`rejection_sampler`).
+
+    Returns:
+        ``[batch, 1 + k]`` int32: the accepted drafts, then the target token at the
+        first mismatch (or the bonus token), then ``-1``.
+
+    Example:
+        >>> targets = torch.tensor([[5, 6, 7], [8, 1, 2], [11, 3, 4]], dtype=torch.int32)
+        >>> drafts = torch.tensor([[5, 6], [8, 9], [0, 0]], dtype=torch.int32)
+        >>> rejection_sample_fixed(targets, drafts, torch.tensor([2, 2, 0])).tolist()
+        [[5, 6, 7], [8, 1, -1], [11, -1, -1]]
+    """
+    batch_size, width = target_token_ids.shape
+    max_spec_len = width - 1
+    assert draft_token_ids.shape == (batch_size, max_spec_len), (
+        f"drafts {tuple(draft_token_ids.shape)} do not match targets "
+        f"{tuple(target_token_ids.shape)}"
+    )
+    assert max_spec_len <= MAX_SPEC_LEN
+    device = target_token_ids.device
+    targets = target_token_ids.to(torch.int32)
+    num_drafts = num_draft_tokens.to(torch.int64).view(batch_size, 1)
+    pos = torch.arange(max_spec_len, device=device).unsqueeze(0)
+    valid = pos < num_drafts
+    placeholder = torch.full_like(targets[:, :max_spec_len], PLACEHOLDER_TOKEN_ID)
+    drafts_2d = torch.where(valid, draft_token_ids.to(torch.int32), placeholder)
+    targets_2d = torch.where(valid, targets[:, :max_spec_len], placeholder)
+    output, all_accepted = _accept_prefix(
+        drafts_2d, targets_2d, valid, synthetic_conditional_rates
+    )
+    # The bonus token goes to column num_drafts (where, not an indexed write).
+    cols = torch.arange(width, device=device).unsqueeze(0)
+    bonus = torch.gather(targets, 1, num_drafts.clamp(max=max_spec_len))
+    output = torch.cat(
+        [output, torch.full_like(targets[:, :1], PLACEHOLDER_TOKEN_ID)], dim=1
+    )
+    at_bonus = (cols == num_drafts) & all_accepted.view(batch_size, 1)
+    return torch.where(at_bonus, bonus.expand(-1, width), output)
