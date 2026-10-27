@@ -1524,6 +1524,46 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
             log_stats=log_stats,
         )
 
+    def add_request(self, request: Request) -> None:
+        """Recurrent-state models with spec decode: end a request a few tokens before
+        max_model_len instead of letting it stop drafting there.
+
+        Near max_model_len ``_update_after_schedule`` stops drafting for a request (its
+        full 1 + num_spec verify step no longer fits). Its steps then differ from the
+        other requests' steps: a verify step that mixes requests with and without
+        drafts misaligns the recurrent-state models' [requests, 1 + num_spec] verify
+        layout, and switching the whole batch between spec and non-spec steps goes
+        through the runner's async transition path, which corrupted the other
+        requests' tokens under load. Capping max_tokens so that, with the batch queue's
+        in-flight steps, the request never gets there keeps every step a full verify
+        step. The request finishes as "length" up to 4 * (1 + num_spec) tokens before
+        max_model_len. Model Runner V2 pads each verify row to 1 + num_spec tokens and
+        needs no cap."""
+        if (
+            self.num_spec_tokens > 0
+            and not getattr(self, "use_v2_model_runner", False)
+            and self._has_recurrent_state_groups()
+        ):
+            limit = self.max_model_len - 4 * (1 + self.num_spec_tokens)
+            cap = max(1, limit - request.num_prompt_tokens)
+            if request.max_tokens > cap:
+                logger.debug(
+                    "Request %s: max_tokens %d -> %d (spec decode near max_model_len)",
+                    request.request_id,
+                    request.max_tokens,
+                    cap,
+                )
+                request.max_tokens = cap
+        super().add_request(request)
+
+    def _has_recurrent_state_groups(self) -> bool:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        return any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in self.kv_cache_config.kv_cache_groups
+        )
+
     def _call_base_schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Override to use AsyncScheduler.schedule() instead of Scheduler.schedule().
 
@@ -1615,14 +1655,3 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
                 request.spec_token_ids = []
             else:
                 request.spec_token_ids = self._spec_token_placeholders
-        # No step may mix requests with and without drafts. The verify graph lays the
-        # batch out as [requests, 1 + num_spec] tokens, so a request with one token
-        # shifts every later request's tokens by num_spec rows (wrong positions, state
-        # blocks and outputs). While any running request has drafting disabled, nobody
-        # drafts; the others resume when it finishes, a few steps later. Held-back
-        # requests are included: they may be scheduled together next step.
-        if is_spec and any(
-            getattr(r, "_async_spec_disabled", False) for r in self.running
-        ):
-            for r in self.running:
-                r.spec_token_ids = []
