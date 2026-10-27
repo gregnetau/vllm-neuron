@@ -562,22 +562,25 @@ def test_warm_up_hybrid_graphs():
 
 
 def _validation_runner(
-    monkeypatch, *, apc=False, spec=None, shared=False, buckets=(512,)
+    monkeypatch, *, apc=False, mode="align", spec=None, shared=False, buckets=(512,)
 ):
     runner = _runner()
     runner.vllm_config.cache_config.enable_prefix_caching = apc
+    runner.vllm_config.cache_config.mamba_cache_mode = mode if apc else "none"
+    runner._prefix_caching = apc
     runner.vllm_config.speculative_config = spec
     runner.neuron_config.num_batched_tokens_buckets = list(buckets)
-    monkeypatch.setattr(
-        _v2().envs, "VLLM_NEURON_SHARED_STATE_POOL", shared, raising=False
-    )
+    # The env var, not a module attribute: envs resolves names lazily, and a
+    # monkeypatched attribute would outlive the test (setattr restores the value it
+    # read through the module __getattr__ as a real attribute).
+    monkeypatch.setenv("VLLM_NEURON_SHARED_STATE_POOL", "1" if shared else "0")
     return runner
 
 
 @pytest.mark.parametrize(
     "kwargs, error, match",
     [
-        ({"apc": True}, NotImplementedError, "prefix caching"),
+        ({"apc": True, "mode": "all"}, NotImplementedError, "mode 'align' only"),
         ({"shared": True}, NotImplementedError, "VLLM_NEURON_SHARED_STATE_POOL"),
         ({"buckets": (64, 512)}, ValueError, r"multiples of 128.*\[64\]"),
     ],
@@ -592,6 +595,8 @@ def test_validation_accepts_supported_config(monkeypatch):
     _validation_runner(
         monkeypatch, buckets=(128, 512)
     )._validate_recurrent_state_config()
+    # Prefix caching (Mamba align mode), with or without speculative decoding.
+    _validation_runner(monkeypatch, apc=True)._validate_recurrent_state_config()
     runner = _validation_runner(monkeypatch, buckets=(64, 512))
     runner.kv_segment_size = 0  # single-shot prefill: always from zero state
     runner._validate_recurrent_state_config()
