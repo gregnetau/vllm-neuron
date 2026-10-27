@@ -34,6 +34,8 @@ TP_DEGREE = int(os.environ.get("QWEN4_EXP_TP", "8"))
 # "fp8": FP8 routed experts (needed for the full 48 layers to fit 8 NeuronCores).
 QUANTIZATION = os.environ.get("QWEN4_EXP_QUANTIZATION") or None
 GPU_MEM_UTIL = float(os.environ.get("QWEN4_EXP_GPU_MEM_UTIL", "0.9"))
+# vLLM --kv-cache-dtype, e.g. "fp8" (the QSA indexer side cache stays BF16).
+KV_CACHE_DTYPE = os.environ.get("QWEN4_EXP_KV_CACHE_DTYPE", "auto")
 
 # The rendered prompts are part of the golden cache key: any edit invalidates cached goldens.
 MESSAGES = [
@@ -180,6 +182,7 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         enable_prefix_caching=False,
         async_scheduling=False,
         gpu_memory_utilization=GPU_MEM_UTIL,
+        kv_cache_dtype=KV_CACHE_DTYPE,
         limit_mm_per_prompt={"image": 0, "video": 0},
         hf_overrides=hf_overrides,
         additional_config={
