@@ -94,7 +94,18 @@ def test_hybrid_defaults_to_v1_and_is_honored_when_forced(monkeypatch):
     "kwargs, feature",
     [
         ({"apc": True}, "prefix caching for a recurrent-state model"),
-        ({"spec": object()}, "speculative decoding"),
+        ({"spec": SimpleNamespace(method="eagle3")}, "speculative method 'eagle3'"),
+        (
+            {"spec": SimpleNamespace(method="mtp", rejection_sample_method="strict")},
+            "rejection sample method 'strict'",
+        ),
+        (
+            {
+                "spec": SimpleNamespace(method="mtp"),
+                "neuron_config": {"debug_logits_dir": "/tmp/x"},
+            },
+            "speculative decoding with debug logits",
+        ),
         # Single-shot prefill: no segmented prefill resolves.
         ({"max_batched": 2048}, "recurrent-state model without segmented prefill"),
         # max_num_batched_tokens not a supported segment size.
@@ -111,6 +122,32 @@ def test_hybrid_features_that_need_v1(monkeypatch, kwargs, feature):
     assert _decide(monkeypatch, cfg, forced=False) == (False, None)
     use_v2, error = _decide(monkeypatch, cfg, forced=True)
     assert use_v2 and feature in error
+
+
+def test_mtp_defaults_to_v1_and_is_honored_when_forced(monkeypatch):
+    cfg = _vllm_config(spec=SimpleNamespace(method="mtp"))
+    assert policy.get_neuron_model_runner_v2_policy(cfg) == (
+        policy.NeuronModelRunnerPolicy(False, ())
+    )
+    assert _decide(monkeypatch, cfg, forced=False) == (False, None)
+    assert _decide(monkeypatch, cfg, forced=True) == (True, None)
+
+
+def test_mtp_needs_v1_for_other_models_and_kv_transfer():
+    llama = _vllm_config(
+        arch="LlamaForCausalLM",
+        is_hybrid=False,
+        multimodal=False,
+        spec=SimpleNamespace(method="mtp"),
+    )
+    assert policy.get_neuron_model_runner_v2_policy(llama).unsupported_features == (
+        "speculative method 'mtp' for ['LlamaForCausalLM']",
+    )
+    di = _vllm_config(spec=SimpleNamespace(method="mtp"))
+    di.kv_transfer_config = object()
+    assert "speculative decoding with KV transfer" in (
+        policy.get_neuron_model_runner_v2_policy(di).unsupported_features
+    )
 
 
 def test_hybrid_shared_state_pool_needs_v1(monkeypatch):
