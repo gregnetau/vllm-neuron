@@ -49,23 +49,26 @@ EAGLE3 is a target-output parser and a hidden-state width away (see [EAGLE3](#ea
 Speculative decoding stays on V1 unless both hold:
 
 - `VLLM_USE_V2_MODEL_RUNNER=1`, and
-- the method and the target model class are in `V2_SPEC_DECODE_METHODS` / the method's
-  architecture allowlist in `model_runner_v2_policy.py` (initially `mtp` for
-  `Qwen3_5ForCausalLM` / `Qwen3_5ForConditionalGeneration`).
+- the method and the target architecture are in `V2_SPEC_DECODE_METHODS`
+  (`vllm/worker/v2_spec_decode.py`; initially `mtp` for `Qwen3_5ForCausalLM` /
+  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense).
 
 `get_neuron_model_runner_v2_policy` keeps `default_enabled=False` for every speculative
-configuration (V1 stays the default until device parity runs pass) and records as unsupported
-(so a forced V2 warns, and the runner refuses at construction) any speculative configuration
-with: a method or architecture outside the allowlist, KV transfer (DI; the bootstrap slot
-reads its first token from history), structured outputs (draft validation needs host drafts),
-sliding-window groups (trimmed tables are cut from the host count, which is an upper bound),
-expert parallelism with data parallelism (the spec / non-spec NEFF vote is not synchronized),
-debug logits and tensor capture, and `rejection_sample_method` other than `standard` /
-`synthetic`. Prefix caching remains unsupported for recurrent-state models on V2 (and V1 does
-not support MTP with prefix caching either).
+configuration (V1 stays the default until device parity runs pass), and
+`_spec_decode_unsupported` records as unsupported (so a forced V2 fails validation) any
+speculative configuration with: a method or architecture outside the allowlist, KV transfer
+(DI; the bootstrap slot reads its first token from history, and the last-token recompute of
+a transferred prompt is scheduled with spec width), sliding-window groups (trimmed tables are
+cut from the host count, which is an upper bound), expert parallelism with data parallelism
+(the spec / non-spec NEFF vote is not synchronized), debug logits, and a
+`rejection_sample_method` other than `standard` / `synthetic`. Structured outputs, tensor
+capture and decode context-length buckets are unsupported on V2 for every model. Prefix
+caching remains unsupported for recurrent-state models on V2 (V1 does not support MTP with
+prefix caching either).
 
-The runner repeats the checks in `NeuronModelRunnerV2._validate_spec_decode_config` because
-`VLLM_USE_V2_MODEL_RUNNER=1` forces V2 with only a warning.
+The runner repeats the checks in `NeuronModelRunnerV2._validate_spec_decode_config`, and
+requires every prefill bucket to exceed `1 + k` (models tell prefill from decode by
+`max_query_len > decode_token_threshold = 1 + k`).
 
 ## Graphs
 
@@ -269,6 +272,12 @@ unchanged: a verify graph touches exactly the slots of its rows.
   the end gets `n_r < k` drafts (sync) or none (async: `NeuronAsyncScheduler` stops drafting
   for every request while any request is near the end, 932f443). Both are rows with fewer
   drafts in the fixed layout.
+- The scheduler-side rule of 932f443 does not exclude every mixed step: once the request near
+  the end has finished, a request whose final prefill chunk ran while the others were held back
+  gets placeholders, while the held-back requests keep the empty draft lists of their last
+  step, so the next step mixes rows with `k` and with 0 drafts (seen in the CPU test with
+  `NeuronAsyncScheduler`, `decode_steps_between_prefill_chunks=0`). V1's packed layout would
+  misalign there; the fixed layout does not depend on the rule.
 - Padding positions are clamped to `max_model_len - 1` and write the null slot; the drafter's
   recurrent positions are clamped the same way (`mtp._slot_mapping` maps `-1` table entries to
   slot 0).
@@ -314,18 +323,74 @@ need in-graph window trimming, since the host count is an upper bound.
 
 | File | Change |
 |---|---|
-| `vllm/model_runner_v2_policy.py` | allowlist gate for speculative configurations |
-| `vllm/worker/neuron_model_runner_v2.py` | spec config, draft model load, KV specs incl. draft layers and spec state blocks, verify input assembly, bundle, output trimming, logprobs, `take_draft_token_ids` |
-| `vllm/worker/neuron_forward_adapter.py` | verify prologue, rejection, drafter call, multi-token commit |
-| `vllm/worker/neuron_request_state.py` | `draft_tokens`, `num_accepted`, per-group block-row widths |
-| `vllm/worker/neuron_input_build.py` | `build_verify_layout` (host verify operands) |
-| `vllm/worker/v2_spec_decode.py` | speculator registry, draft model loading, `V2DraftSpeculator` |
-| `nn/rejection_sampler.py` | `rejection_sample_fixed` |
+| `vllm/model_runner_v2_policy.py` | `_spec_decode_unsupported`: allowlist gate for speculative configurations |
+| `vllm/worker/v2_spec_decode.py` | `V2_SPEC_DECODE_METHODS`, `V2DraftSpeculator`, `load_draft_model` |
+| `vllm/worker/neuron_model_runner_v2.py` | `_validate_spec_decode_config`, `_load_draft_model`, `_build_speculator`, KV specs incl. draft layers and spec state blocks (`_kv_spec_layers`), verify classification in `_prepare_model_input`, verify assembly in `_assemble_model_input`, `state_in` placeholders and spec operands in `_build_forward_adapter_kwargs`, six-tensor `apply_committed_state`, `_trim_sampled` / `_sampled_rows`, `_build_verify_logprobs`, `take_draft_token_ids` |
+| `vllm/worker/neuron_forward_adapter.py` | `_forward_speculative`, `_build_verify_inputs`, `_shifted_prefill_draft_ids`, `_compute_next_device_state_multi` (non-speculative graphs keep `_compute_next_device_state`) |
+| `vllm/worker/neuron_request_state.py` | `draft_tokens`, `num_accepted`, `configure_block_sizes(min_widths=...)` |
+| `vllm/worker/neuron_input_build.py` | `build_verify_layout`; `NeuronModelInput.num_draft_by_row`, `spec_width` |
+| `nn/rejection_sampler.py` | `rejection_sample_fixed` (shares `_accept_prefix` with the packed sampler) |
 | `vllm/worker/neuron_worker.py` | count `draft_model` weights in the KV budget |
+
+## Tests (CPU)
+
+- `test/unit/nn/test_rejection_sampler.py`: the fixed layout against the packed sampler,
+  mixed draft counts, synthetic rates.
+- `test/unit/worker/test_v2_spec_adapter.py`: the adapter with a toy target and draft:
+  per-row acceptance and commit, inputs from device state with an optimistic host count,
+  `state_in`, a held-back slot, capacity near `max_model_len`, prefill drafting.
+- `test/unit/model/qwen3_5/test_v2_spec_decode_e2e.py`: the real Neuron schedulers (sync,
+  and async with the engine core's batch queue of depth 2), the V2 runner and the Qwen3.5
+  module (NKI stubbed) against the HF model: requests arriving together, a chunked prefill
+  arriving while others decode (held back or interleaved), partial acceptance (oracle
+  draft), trimmed drafts and drafting stopped near `max_model_len`, all drafts rejected,
+  logprobs, the pool pages and `state_in`, and the real MTP head, whose in-graph drafts
+  equal a from-scratch run of the head over each committed sequence.
+- `test/unit/worker/test_v2_policy_recurrent_state.py`: the policy matrix.
+
+## Not done yet
+
+- Device validation (below). Nothing here has run on a Neuron device.
+- EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
+- KV transfer (DI) with speculative decoding, sliding-window targets, prefix caching with
+  MTP, decode context-length buckets on V2.
+- A separate drafter NEFF (only needed if a draft model must compile with other options).
 
 ## Device validation
 
-See the runner's log lines `V2 speculative decoding: method=... k=...` (construction),
-`Recurrent-state pools: ... (k+1 per slot)` (KV init), the compiled buckets
-`decode_b{B}_s{1+k}`, and vLLM's `SpecDecoding metrics` (acceptance). Greedy outputs must
-match V1 MTP and non-speculative V2 token for token.
+Run on a trn2 instance with no other process on the devices. V2 needs
+`VLLM_USE_V2_MODEL_RUNNER=1`, no prefix caching (the script's default) and no
+`DECODE_CTX_BUCKETS`:
+
+```bash
+# Qwen3.5-2B, TP=2, MTP with 2 draft tokens, 4 sequences, async scheduling (default)
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.5-2B TP=2 MTP_TOKENS=2 MAX_NUM_SEQS=4 \
+    SEQS_BUCKETS="1, 4" examples/vllm_neuron/models/qwen3_5/serve.sh
+# Qwen3.8-27B, TP=4 (add FP8_SCALES=... KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 for FP8)
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.8-27B TP=4 MTP_TOKENS=2 MAX_NUM_SEQS=4 \
+    SEQS_BUCKETS="1, 4" examples/vllm_neuron/models/qwen3_5/serve.sh
+# Repeat each with ASYNC_SCHEDULING=0, and with DECODE_INTERLEAVE=1.
+```
+
+Log lines to check:
+
+- `Using the standalone V2 Neuron model runner.` and
+  `V2 speculative decoding: method=mtp k=2 draft=...; verify graphs decode_b{B}_s3 for
+  num_seqs_buckets=[1, 4], drafter in the target graph`.
+- `Recurrent-state pools: 48 layers in KV groups [...], N pages per layer (3 per slot)`
+  (Qwen3.8-27B; the GDN layer count for Qwen3.5-2B), with attention block sizes equal to
+  `--block-size`.
+- Compile metrics / NEFF buckets `prefill_s1024_kv1024` and `decode_b1_s3`, `decode_b4_s3`
+  only (no `decode_b{B}` without `_s3`).
+- No `VLLM_USE_V2_MODEL_RUNNER=1 forces Neuron Model Runner V2 with unsupported features`
+  warning.
+- vLLM's `SpecDecoding metrics: ... Mean acceptance length: ...` comparable to V1 MTP on the
+  same prompts.
+
+Checks: greedy (`temperature=0`) completions equal V1 MTP and V2 without
+`MTP_TOKENS`, token for token, at concurrency 1 and 4 with prompts of different lengths
+arriving together, a long prompt (several chunks) arriving while others decode, and requests
+that run to `max_model_len` (for example `MAX_MODEL_LEN=2048` with `max_tokens` past it);
+`logprobs=1` returns one entry per generated token. Signs of a layout or state bug are the
+ones 932f443 describes: tokens with logprob far below the top token in the last tokens of
+requests near the end, or divergence after the first verify step with partial acceptance.

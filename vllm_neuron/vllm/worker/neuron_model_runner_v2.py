@@ -373,6 +373,14 @@ class NeuronModelRunnerV2:
         self.num_seqs_buckets = list(self.neuron_config.num_seqs_buckets)
         self.prefill_token_capacity = max(self.num_batched_tokens_buckets)
         self.decode_row_capacity = max(self.num_seqs_buckets)
+        if self.num_speculative_tokens and min(self.num_batched_tokens_buckets) <= (
+            1 + self.num_speculative_tokens
+        ):
+            # Models tell prefill from decode by max_query_len > 1 + k.
+            raise ValueError(
+                f"num_batched_tokens_buckets {self.num_batched_tokens_buckets} must "
+                f"exceed 1 + num_speculative_tokens = {1 + self.num_speculative_tokens}"
+            )
         segment_buckets = self.neuron_config.kv_segment_size_buckets
         self.kv_segment_size = segment_buckets[0] if segment_buckets else 0
         if self._has_state_layers:

@@ -561,6 +561,11 @@ def test_oracle_drafts_partial_acceptance_match_hf(
     ]
     if async_scheduling:
         assert any(not s[1] for s in multi_row)
+        if decode_steps == 0:
+            # After "end" finishes, "long" (prefilled while the others were held back)
+            # drafts while the others still have no drafts: a mixed verify step, which
+            # the scheduler's no-mixing rule (932f443) does not prevent.
+            assert any(s[1] and len(s[1]) < len(s[0]) for s in multi_row)
     else:
         assert any(
             any(0 < len(d) < K for d in s[1].values()) and len(s[1]) > 1
@@ -731,4 +736,11 @@ def test_policy_and_runner_gate_spec_decode(tmp_path, monkeypatch):
     vllm_config.speculative_config.method = "mtp"
     vllm_config.kv_transfer_config = SimpleNamespace(is_kv_producer=False)
     with pytest.raises(NotImplementedError, match="KV transfer"):
+        NeuronModelRunnerV2(vllm_config, torch.device("cpu"))
+    vllm_config.kv_transfer_config = None
+    vllm_config.additional_config["neuron_config"]["num_batched_tokens_buckets"] = [
+        3,
+        CHUNK,
+    ]
+    with pytest.raises(ValueError, match=r"must exceed 1 \+ num_speculative_tokens"):
         NeuronModelRunnerV2(vllm_config, torch.device("cpu"))
