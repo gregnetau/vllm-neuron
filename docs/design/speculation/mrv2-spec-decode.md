@@ -297,11 +297,43 @@ unchanged: a verify graph touches exactly the slots of its rows.
 - Acceptance metrics come from the scheduler (`SpecDecodingStats` from the output lengths).
   The runner logs the NEFF bucket as `decode_b{B}_s{1 + k}`.
 
+## Decode context-length buckets
+
+With `decode_context_length_buckets` (models with recurrent state only; the policy keeps
+other models on V1 for it), every decode step trims the attention groups' kernel block
+tables to the smallest bucket `S` of `decode_context_length_buckets + [max_model_len]` with
+`S >= max(num_computed) + headroom`, `headroom = max(1, 2k)`
+(`neuron_input_build.select_decode_ctx_bucket`): the verify step writes and attends
+`1 + k` positions from the device computed count, and the MTP head's `k - 1` recurrent draft
+steps go one position past the last accepted token (at most `num_computed + k`) each, so the
+step touches positions up to `num_computed + 2k - 1`. The count is the scheduler's, an upper
+bound of the device count under async scheduling, so the in-graph positions stay inside the
+trimmed table by construction.
+
+- Trim: the first `ceil(S / block_size)` columns of each row (`build_kernel_block_rows(...,
+  num_columns=...)`, a fresh row-major array); the `max_model_len` bucket keeps the whole
+  aligned row (the graph without buckets). Prefill and the recurrent-state groups (`1 + k`
+  pool pages) are never trimmed. All attention groups, the MTP head's layer included, get the
+  same width, so the head's attention and its draft-step slot mapping (`mtp._slot_mapping`)
+  read the trimmed table too.
+- Slot mappings: the host slot mapping resolves through the untrimmed rows; the verify
+  graph's slot mapping (`_build_verify_inputs`) resolves through the trimmed table. When the
+  table is trimmed (`width * block_size < max_model_len`, a trace-time constant), a position
+  past it writes the null slot instead of the table's last block, and so does
+  `mtp._slot_mapping`; neither happens with a correctly chosen bucket (the CPU tests assert it
+  inside the graph).
+- Graphs: one verify graph `decode_b{B}_s{1 + k}` per `(num_seqs bucket, ctx bucket)`, the
+  compile metric labelled `decode_b{B}_s{1 + k}_ctx{S}`; the runtime NEFF label stays
+  `decode_b{B}_s{1 + k}`.
+- Not with expert parallelism across DP ranks (the bucket is not synchronized across the
+  group).
+
 ## Warmup and compile
 
 - Prefill: every `(num_batched_tokens_bucket, kv_segment_size)` as today, with the drafter in
   the graph (synthetic slot 0).
-- Decode: every `num_seqs_bucket` `B` as a verify graph with `n_r = k` for all rows
+- Decode: every `num_seqs_bucket` `B` (times every decode context bucket, with
+  `decode_context_length_buckets`) as a verify graph with `n_r = k` for all rows
   (`_build_decode_synthetic_inputs`), the same assembly path as serving.
 - The worker's V1 drafter hooks stay off: V2 keeps `self.drafter = None` (the drafter lives in
   the adapter), so `NeuronWorker` builds no separate draft trace jobs; the draft model's weights
@@ -348,6 +380,16 @@ need in-graph window trimming, since the host count is an upper bound.
   equal a from-scratch run of the head over each committed sequence. With `SPEC_DYNAMO=1`
   the adapter runs through `torch.compile(backend="eager", fullgraph=True)`; the run must
   compile one graph per bucket and nothing per step (`TORCH_LOGS=recompiles`).
+  `test_decode_ctx_buckets_match_hf` adds decode context buckets `[128, 256]` (max_model_len
+  320): requests cross both boundaries and reach the `max_model_len` graph mid-generation,
+  verify steps straddle each boundary, batches mix short and long rows, with the oracle and
+  the real MTP head; the positions of the verify slot mapping and of the head's draft steps
+  are checked against the trimmed table inside the graph.
+- `test/unit/model/qwen3_5/test_v2_runner_inputs.py::test_v2_decode_ctx_buckets_match_hf_across_bucket_boundaries`:
+  the same without speculative decoding, logits against HF at every step.
+- `test/unit/worker/test_v2_decode_ctx_buckets.py`: bucket selection, the head trim, the
+  verify slot mapping through a trimmed table, and the worker's decode jobs per
+  `(B, ctx)`.
 - `test/unit/worker/test_v2_policy_recurrent_state.py`: the policy matrix.
 
 ## Not done yet
@@ -355,14 +397,14 @@ need in-graph window trimming, since the host count is an upper bound.
 - Device validation (below). Nothing here has run on a Neuron device.
 - EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
 - KV transfer (DI) with speculative decoding, sliding-window targets, prefix caching with
-  MTP, decode context-length buckets on V2.
+  MTP, decode context-length buckets on V2 for models without recurrent state.
 - A separate drafter NEFF (only needed if a draft model must compile with other options).
 
 ## Device validation
 
 Run on a trn2 instance with no other process on the devices. V2 needs
-`VLLM_USE_V2_MODEL_RUNNER=1`, no prefix caching (the script's default) and no
-`DECODE_CTX_BUCKETS`:
+`VLLM_USE_V2_MODEL_RUNNER=1` and no prefix caching (the script's default);
+`DECODE_CTX_BUCKETS` is optional:
 
 ```bash
 # Qwen3.5-2B, TP=2, MTP with 2 draft tokens, 4 sequences, async scheduling (default)
@@ -372,7 +414,17 @@ VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.5-2B TP=2 MTP_TOKENS=2 MAX_NUM_SEQ
 VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.8-27B TP=4 MTP_TOKENS=2 MAX_NUM_SEQS=4 \
     SEQS_BUCKETS="1, 4" examples/vllm_neuron/models/qwen3_5/serve.sh
 # Repeat each with ASYNC_SCHEDULING=0, and with DECODE_INTERLEAVE=1.
+# Qwen3.8-27B FP8, 64k context with a 16k decode context bucket, 8 sequences: verify graphs
+# decode_b1_s3 and decode_b8_s3, each at ctx 16384 (128 blocks of 128) and 65536 (512)
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.8-27B TP=4 FP8_SCALES=<path>/fp8_act_amax.json \
+    KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 MTP_TOKENS=2 MAX_MODEL_LEN=65536 MAX_NUM_SEQS=8 \
+    SEQS_BUCKETS="1, 8" DECODE_CTX_BUCKETS="16384" examples/vllm_neuron/models/qwen3_5/serve.sh
 ```
+
+With `DECODE_CTX_BUCKETS`, also check `V2 decode context-length buckets [16384] +
+max_model_len 65536: ...` at startup, the compile metric labels `decode_b{B}_s3_ctx{S}` for
+every `(B, S)`, no recompile once serving (the serve guard raises), and identical greedy
+output with and without `DECODE_CTX_BUCKETS` for requests that cross 16384 while decoding.
 
 Log lines to check:
 

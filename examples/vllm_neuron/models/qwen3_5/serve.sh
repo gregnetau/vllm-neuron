@@ -16,6 +16,9 @@
 #   MODEL=... PREFIX_CACHING=1 examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # MTP speculative decoding with N (1 or 2) draft tokens:
 #   MODEL=... MTP_TOKENS=1 examples/vllm_neuron/models/qwen3_5/serve.sh
+#   # Model Runner V2 (opt-in; hybrid state, MTP and DECODE_CTX_BUCKETS, no PREFIX_CACHING):
+#   VLLM_USE_V2_MODEL_RUNNER=1 MODEL=... MTP_TOKENS=2 MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" \
+#       examples/vllm_neuron/models/qwen3_5/serve.sh
 #   # Native 262k context, FP8 KV (KV pool of about 1.19M tokens), 4 sequences:
 #   MODEL=... FP8_SCALES=... MTP_TOKENS=2 KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 MAX_MODEL_LEN=262144 \
 #       MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" DECODE_CTX_BUCKETS="16384, 65536" GPU_MEM_UTIL=0.95 \
