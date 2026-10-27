@@ -584,15 +584,18 @@ class StateCheckpointer:
         """Compile both graphs with padding-only inputs (no-op copies of the null pages).
         Call after model warmup, as :meth:`KVBlockClearer.warm_up`."""
         rows = STATE_CKPT_ROWS
-        zeros = self._tensor([0] * rows)
+        # Distinct tensors for every argument, as at run time: passing one tensor twice
+        # makes Dynamo guard on the aliasing ("row_slot is boundary"), and the first real
+        # save then recompiled the graph while serving (about 5 s of TTFT).
+        slots, boundaries, pages = (self._tensor([0] * rows) for _ in range(3))
         blocks = self._tensor([[0] * rows for _ in self.group_ids])
         invalid = self._tensor([False] * rows, torch.bool)
         self._save_fn(
             self.pool,
             self.ckpt,
             self.entry_groups,
-            zeros,
-            zeros,
+            slots,
+            boundaries,
             blocks,
             invalid,
             num_computed,
@@ -600,5 +603,10 @@ class StateCheckpointer:
             self.pages_per_slot,
         )
         self._restore_fn(
-            self.ckpt, self.pool, self.entry_groups, blocks, zeros, invalid
+            self.ckpt,
+            self.pool,
+            self.entry_groups,
+            self._tensor([[0] * rows for _ in self.group_ids]),
+            pages,
+            self._tensor([False] * rows, torch.bool),
         )
