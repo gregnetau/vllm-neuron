@@ -576,9 +576,11 @@ class NeuronPlatform(Platform):
         KV transfer and jump-forward decoding are rejected. Prefix caching uses Mamba
         "align" mode: the state is kept
         per KV-manager block and copied to the next block when a request crosses into it
-        (NeuronModelRunner._preprocess_mamba_align), and prefills are scheduled in
-        block-aligned chunks. The block (the attention block enlarged to the state page)
-        must not exceed the prefill chunk (max_num_batched_tokens)."""
+        (NeuronModelRunner._preprocess_mamba_align; Model Runner V2 keeps the running
+        state in its dedicated pool and copies block-boundary checkpoints to those blocks,
+        hybrid_state.StateCheckpointer), and prefills are scheduled in block-aligned
+        chunks. On V1 the block (the attention block enlarged to the state page) must not
+        exceed the prefill chunk (max_num_batched_tokens)."""
         # Models with recurrent state (interfaces.HasRecurrentState). The plugin's model
         # classes do not declare vLLM's IsHybrid interface, so vLLM's MambaModelConfig hook
         # does not configure them.
