@@ -38,6 +38,7 @@ __all__ = [
     "build_prefill_linear_idx",
     "gather_block_rows_raw",
     "build_kernel_block_rows",
+    "build_state_pool_rows",
     "SWA_ATTENTION_PMAX",
     "compute_swa_num_blocks",
     "build_swa_kernel_block_rows",
@@ -265,6 +266,50 @@ def build_kernel_block_rows(
     return torch.from_numpy(out).to(
         state.device if output_device is None else output_device
     )
+
+
+def build_state_pool_rows(
+    idx_mapping_np: np.ndarray,
+    padded_num_reqs: int,
+    pages_per_slot: int,
+    width: int,
+    *,
+    output_device: torch.device,
+) -> torch.Tensor:
+    """Build batch-ordered block rows of a recurrent-state group's dedicated pool.
+
+    A request's state lives in the pool pages of its stable slot,
+    ``1 + slot * pages_per_slot + j`` (page 0 is the null page), for its whole
+    life: the slot does not change while the request is out of a step's batch,
+    and a freed slot is quarantined until in-flight graphs that touch it
+    complete. vLLM's state block ids therefore need no translation table; they
+    still feed the slot mapping. Columns past the slot's pages hold the null
+    page, and padded rows hold ``PAD_SLOT_ID`` (the model skips their state and
+    zeroes their hidden states).
+
+    Args:
+        idx_mapping_np: ``[num_active]`` stable slots in scheduler order.
+        padded_num_reqs: Compiled batch width.
+        pages_per_slot: Pool pages per slot (``1 + num_speculative_blocks``).
+        width: Block-row width of the group.
+        output_device: Device for the returned tensor.
+
+    Returns:
+        An int32 ``[padded_num_reqs, width]`` tensor.
+
+    Raises:
+        AssertionError: If active rows exceed the padded batch width.
+    """
+    from .hybrid_state import pool_pages_for_slot
+
+    num_active = idx_mapping_np.shape[0]
+    assert num_active <= padded_num_reqs, (
+        f"num_active {num_active} > padded_num_reqs {padded_num_reqs}"
+    )
+    out = np.full((padded_num_reqs, width), PAD_SLOT_ID, dtype=np.int32)
+    for row in range(num_active):
+        out[row] = pool_pages_for_slot(int(idx_mapping_np[row]), pages_per_slot, width)
+    return torch.from_numpy(out).to(output_device)
 
 
 def build_slot_mapping(

@@ -64,6 +64,7 @@ def build_attention_metadata(
     kv_segment_size: int = 0,
     slot_mappings: "Sequence[torch.Tensor] | None" = None,
     swa_kv_pos_offsets: "Sequence[torch.Tensor | None] | None" = None,
+    always_cached_seq_len: bool = False,
 ) -> dict[str, dict]:
     """Build per-layer attention metadata for dense model execution.
 
@@ -74,7 +75,8 @@ def build_attention_metadata(
 
     Use ``max_query_len`` and ``decode_token_threshold`` to distinguish
     prefill from decode. Include ``cached_seq_len`` and ``kv_segment_size``
-    only for segmented prefill.
+    only for segmented prefill, and ``cached_seq_len`` on every prefill when
+    ``always_cached_seq_len`` is set.
 
     Args:
         kv_cache_groups (Sequence[KVCacheGroupSpec]): Cache groups with layer
@@ -94,6 +96,9 @@ def build_attention_metadata(
             offsets. A non-None entry marks a sliding-window group whose block
             table is window-trimmed; the model subtracts the offset from
             position IDs so the causal mask is computed in the trimmed frame.
+        always_cached_seq_len: Include ``cached_seq_len`` even without a KV
+            segment size. Recurrent-state models read it on every prefill
+            (zero means "start from zero state").
 
     Returns:
         A mapping from layer name to its group's shared metadata dictionary.
@@ -116,8 +121,9 @@ def build_attention_metadata(
             offset = swa_kv_pos_offsets[group_idx]
             if offset is not None:
                 per_layer["swa_kv_pos_offset"] = offset
-        if kv_segment_size:
+        if kv_segment_size or always_cached_seq_len:
             per_layer["cached_seq_len"] = cached_seq_len
+        if kv_segment_size:
             per_layer["kv_segment_size"] = kv_segment_size
         for layer_name in group.layer_names:
             metadata[layer_name] = (
