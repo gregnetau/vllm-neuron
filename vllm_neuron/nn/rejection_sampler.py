@@ -282,7 +282,9 @@ def rejection_sample_fixed(
     )
     # The bonus token goes to column num_drafts (where, not an indexed write).
     cols = torch.arange(width, device=device).unsqueeze(0)
-    bonus = torch.gather(targets, 1, num_drafts.clamp(max=max_spec_len))
+    # One-hot select rather than torch.gather along dim 1 (neuronx-cc NCC_ISMP902).
+    pick = (cols == num_drafts.clamp(max=max_spec_len)).to(targets.dtype)
+    bonus = (targets[:, :width] * pick).sum(dim=1, keepdim=True)
     output = torch.cat(
         [output, torch.full_like(targets[:, :1], PLACEHOLDER_TOKEN_ID)], dim=1
     )
