@@ -141,7 +141,16 @@ class _Speculator(torch.nn.Module):
         return drafts
 
 
-def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling, apc=False):
+def _vllm_config(
+    tmp_path,
+    hf_cfg,
+    *,
+    spec,
+    async_scheduling,
+    apc=False,
+    cache_dtype="auto",
+    max_model_len=MAX_MODEL_LEN,
+):
     from vllm.config import (
         CacheConfig,
         ModelConfig,
@@ -166,14 +175,14 @@ def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling, apc=False):
         model=str(tmp_path),
         skip_tokenizer_init=True,
         dtype="float32",
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
     )
     parallel_config = ParallelConfig()
     vllm_config = VllmConfig(
         model_config=model_config,
         parallel_config=parallel_config,
         cache_config=CacheConfig(
-            block_size=BLOCK, cache_dtype="auto", enable_prefix_caching=apc
+            block_size=BLOCK, cache_dtype=cache_dtype, enable_prefix_caching=apc
         ),
         speculative_config=(
             SpeculativeConfig(
@@ -188,7 +197,7 @@ def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling, apc=False):
         scheduler_config=SchedulerConfig(
             max_num_seqs=MAX_REQS,
             max_num_batched_tokens=CHUNK,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=max_model_len,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
             async_scheduling=async_scheduling,
@@ -471,3 +480,45 @@ def test_qwen4_exp_prefix_caching_on_v2_matches_hf(
         assert engine.admitted["q"] >= block, (engine.admitted, block)
     # With MTP vLLM drops the last matched block of a hit (EAGLE-style drafter): q's
     # shared prefix has a checkpoint only where p's first chunk ended, the last block.
+
+
+@pytest.mark.parametrize("draft", [None, "oracle"], ids=["plain", "oracle"])
+def test_qwen4_exp_fp8_kv_prefix_caching_matches_no_apc(tmp_path, plugin_mtp, draft):
+    """FP8 KV cache (unit scales; the QSA side caches stay in the model dtype), async
+    scheduling, with and without prefix caching: the same prompts give the same greedy
+    outputs (both runs quantize the KV cache alike; FP8 makes HF a loose reference), and
+    the later request hits the cache. The FP8 attention page is half the BF16 one, so
+    the prefix-cache block is twice as long (256 tokens here)."""
+    hf, hf_cfg = _hf_model()
+    g = torch.Generator().manual_seed(11)
+    shared = torch.randint(2, hf_cfg.vocab_size, (300,), generator=g).tolist()
+    tails = [
+        torch.randint(2, hf_cfg.vocab_size, (n,), generator=g).tolist() for n in (9, 21)
+    ]
+    prompts = {"p": shared + tails[0], "q": shared + tails[1]}
+    expected = {r: _hf_greedy(hf, p, 10) for r, p in prompts.items()}
+    outputs, admitted = {}, {}
+    for apc in (False, True):
+        model = _model(plugin_mtp, hf, hf_cfg)
+        vllm_config = _vllm_config(
+            tmp_path,
+            hf_cfg,
+            spec=draft is not None,
+            async_scheduling=True,
+            apc=apc,
+            cache_dtype="fp8",
+            max_model_len=640,
+        )
+        draft_model = (lambda runner: _Oracle(runner, expected)) if draft else None
+        engine = _Engine(vllm_config, model, draft_model)
+        k_cache = next(iter(engine.runner.kv_caches.values()))[0]
+        assert k_cache.dtype == torch.float8_e4m3fn
+        if apc:
+            assert engine.runner._ckpt_block_size == 256
+        engine.run({0: [("p", prompts["p"], 10)], 12: [("q", prompts["q"], 10)]})
+        outputs[apc], admitted[apc] = dict(engine.outputs), dict(engine.admitted)
+    assert outputs[True] == outputs[False]
+    assert all(len(v) == 10 for v in outputs[True].values())
+    assert admitted[False]["q"] == 0
+    if draft is None:
+        assert admitted[True]["q"] == 256, admitted
