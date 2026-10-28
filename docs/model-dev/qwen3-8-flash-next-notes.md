@@ -384,6 +384,43 @@ the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).
     model-card sampling, thinking on) generates 65.8 tok/s with 2 draft tokens against 79.6
     without MTP (gpu_memory_utilization 0.82 for both).
 
+## Model runner
+
+The port runs on Model Runner V1. The model declares recurrent state (`HasRecurrentState`), so
+the platform routes it to V1, and every runner-side feature below exists only in the V1 runner
+(`vllm_neuron/vllm/worker/neuron_model_runner.py`).
+
+Moving the model to Model Runner V2 needs, on top of V2 support for recurrent-state models
+(the Qwen3.5 work):
+- **Host inputs (`HasHostInputs`).**
+  - Call `build_host_inputs` on every real step with the padded rows' input ids, request rows,
+    positions and token history.
+  - Zero-fill the declared inputs in every warmup, dummy, capture and jump-forward graph.
+  - V2 keeps tokens on the device, so the async host-token join needs an equivalent: apply the
+    previous step's sampled tokens on the host on every rank before building the n-gram rows.
+  - See docs/design/host-inputs.md.
+- **Dense prefill variants (`prefill_dense_context`).** Compile prefill graphs with attention
+  block tables trimmed to that many tokens, use them when the cached context plus the chunk
+  fits, and warm the MTP draft for each variant.
+- **QSA side caches (`kv_side_bytes_per_token_per_attn_layer`).** Shrink the KV budget by the
+  side-cache ratio. The model allocates the side caches itself, addressed by the attention
+  layer's block table.
+- **State pools.** A separate recurrent-state layer for the PLE conv (`layers.1.ple`) in the
+  dedicated pool.
+- **MTP.** `mtp_hidden_size` sizes the draft's 10,240-wide target hidden state.
+- **Preemption.** Under `VLLM_NEURON_MAX_KV_CONCURRENT`, discard the samples of recompute chunks
+  that end before the request's last token, and tell prefill from decode by
+  `max(num_prompt_tokens, num_tokens - 1)`. The scheduler side is runner-independent.
+- **Per-step device-tensor caches.** Sampling parameters, block-table clones and state-pool
+  table pairs: an optimisation, not required for correctness.
+
+The model code is runner-independent. It reads per-layer metadata dicts keyed by layer name:
+`block_table_tensor`, `slot_mapping`, `cached_seq_len`, `max_query_len`,
+`decode_token_threshold`, `block_size`, `max_blocks_per_seq`, `kv_segment_size` and, with
+MTP, `state_in`. A V2 forward adapter must provide the same. The unit tests in test/unit/worker
+(`test_host_inputs.py`, `test_runner_step_caches.py`, `test_runner_model_hooks.py`,
+`test_scheduler_preemption.py`) describe the expected runner behaviour.
+
 ## Open work
 
 - **QSA verify rows.** MTP verify steps still mask the full context; a compact context of the
