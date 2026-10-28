@@ -46,6 +46,7 @@ the block mean in fp32 (cast back), scores in fp32.
 import math
 
 import torch
+import torch.nn.functional as F
 
 from vllm_neuron.model.kv_cache import paged_slot_indices
 
@@ -57,6 +58,7 @@ __all__ = [
     "index_qk",
     "write_raw_keys",
     "gather_raw_keys",
+    "write_compressed_keys",
     "compressed_keys",
     "index_scores",
     "topk_block_mask",
@@ -64,6 +66,10 @@ __all__ = [
     "token_mask",
     "qsa_token_mask",
     "decode_mask_from_token_mask",
+    "compact_slots",
+    "topk_block_ids",
+    "compact_decode_selection",
+    "compact_decode_mask",
 ]
 
 
@@ -197,6 +203,59 @@ def gather_raw_keys(key_cache: torch.Tensor, block_table: torch.Tensor) -> torch
 # =============================================================================
 
 
+def _compress_blocks(
+    raw: torch.Tensor,
+    starts: torch.Tensor,
+    k_gamma: torch.Tensor,
+    inv_freq: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Compressed keys of blocks: raw ``[N, ..., ratio, D]`` (the block's raw keys), starts
+    ``[N]`` (block start positions) -> ``[N, ..., D]``: rope(k_norm(mean_fp32(raw)), start)."""
+    pooled = raw.float().mean(dim=-2).to(raw.dtype)
+    normed = zero_centered_rms_norm(pooled, k_gamma, eps)
+    cos, sin = qsa_rope_cos_sin(starts, inv_freq, raw.dtype)
+    return apply_qsa_rope(normed, cos, sin)
+
+
+def write_compressed_keys(
+    ckey_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    q_pos: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_gamma: torch.Tensor,
+    inv_freq: torch.Tensor,
+    *,
+    ratio: int = 4,
+    eps: float = 1e-6,
+):
+    """Update the compressed-key cache for the blocks of this step's tokens, in place.
+
+    ckey_cache: ``[num_blocks, 1, block_size / ratio, D]``, entry ``j`` of a cache block holds
+        the compressed key of its tokens ``[ratio * j, ratio * j + ratio)``.
+    key_cache: the raw-key cache ``[num_blocks, 1, block_size, D]``, this step's keys already
+        written (``write_raw_keys``).
+    q_pos, slot_mapping: ``[T]`` positions / cache slots of this step's tokens.
+
+    Each token recomputes the entry of its own block from the cached raw keys, so a block's
+    entry is final once its last token is written (the tokens of one block in one step
+    write identical values). Entries of incomplete blocks are garbage and never visible.
+    Values equal ``compressed_keys`` over the gathered raw keys.
+    """
+    bs = key_cache.shape[-2]
+    blk, pos = paged_slot_indices(slot_mapping, bs, key_cache.shape[0])
+    blk, pos = blk.long(), pos.long()
+    start = pos - pos % ratio  # block start within the cache block
+    offs = start.unsqueeze(-1) + torch.arange(ratio, device=pos.device)  # [T, ratio]
+    b2 = blk.unsqueeze(-1).expand_as(offs)
+    raw = key_cache[b2, torch.zeros_like(b2), offs]  # [T, ratio, D]
+    p = q_pos.reshape(-1).to(torch.int32)
+    kc = _compress_blocks(raw, p - p % ratio, k_gamma, inv_freq, eps)
+    ckey_cache.index_put_(
+        (blk, torch.zeros_like(blk), start // ratio), kc.to(ckey_cache.dtype)
+    )
+
+
 def compressed_keys(
     k_raw_ctx: torch.Tensor,
     k_gamma: torch.Tensor,
@@ -213,12 +272,10 @@ def compressed_keys(
     """
     B, S, D = k_raw_ctx.shape
     nb = S // ratio
-    pooled = k_raw_ctx.reshape(B, nb, ratio, D).float().mean(dim=2).to(k_raw_ctx.dtype)
-    normed = zero_centered_rms_norm(pooled, k_gamma, eps)
     starts = torch.arange(nb, device=k_raw_ctx.device, dtype=torch.int32) * ratio
-    cos, sin = qsa_rope_cos_sin(starts, inv_freq, k_raw_ctx.dtype)
     # rope broadcasts over dim 0: put the block axis first
-    return apply_qsa_rope(normed.transpose(0, 1), cos, sin).transpose(0, 1)
+    raw = k_raw_ctx.reshape(B, nb, ratio, D).transpose(0, 1)
+    return _compress_blocks(raw, starts, k_gamma, inv_freq, eps).transpose(0, 1)
 
 
 def _visible_blocks(q_pos: torch.Tensor, nb: int, ratio: int) -> torch.Tensor:
@@ -450,6 +507,20 @@ def decode_mask_from_token_mask(
     the selection of the active positions; the other slots are cache positions. Returns the
     product, same shape / dtype / layout as ``base_mask``.
     """
+    S_ctx, B, H, S_tkg = base_mask.shape
+    # Active slots: gather tok_mask at q_pos[b, 0] + i (clamped: padded rows are don't-care).
+    steps = torch.arange(S_tkg, device=q_pos.device, dtype=torch.int32)
+    act_pos = (q_pos[:, :1].to(torch.int32) + steps).clamp(0, S_ctx - 1).long()
+    act = torch.gather(tok_mask, 2, act_pos.unsqueeze(1).expand(B, S_tkg, S_tkg))
+    seq = torch.cat([tok_mask[..., : S_ctx - S_tkg], act], dim=-1)  # [B, S_tkg, S_ctx]
+    return base_mask * _to_decode_mask_layout(seq, q_pos, base_mask, block_len)
+
+
+def _to_decode_mask_layout(
+    seq: torch.Tensor, q_pos: torch.Tensor, base_mask: torch.Tensor, block_len: int
+) -> torch.Tensor:
+    """bool ``[B, S_tkg, S_ctx]`` over the kernel's sequential slots -> ``base_mask``'s layout
+    ``[S_ctx, B, 1, S_tkg]`` (broadcast over heads) and dtype."""
     from vllm_neuron.functional.attention.attention_decode_mask import (
         P_MAX,
         _can_use_kernel,
@@ -458,11 +529,6 @@ def decode_mask_from_token_mask(
     from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
     S_ctx, B, H, S_tkg = base_mask.shape
-    # Active slots: gather tok_mask at q_pos[b, 0] + i (clamped: padded rows are don't-care).
-    steps = torch.arange(S_tkg, device=q_pos.device, dtype=torch.int32)
-    act_pos = (q_pos[:, :1].to(torch.int32) + steps).clamp(0, S_ctx - 1).long()
-    act = torch.gather(tok_mask, 2, act_pos.unsqueeze(1).expand(B, S_tkg, S_tkg))
-    seq = torch.cat([tok_mask[..., : S_ctx - S_tkg], act], dim=-1)  # [B, S_tkg, S_ctx]
     # Sequential -> kernel layout. Within each fold of P_MAX * bl slots the kernel stores
     # [bl (block offset), P_MAX (partition)] while the sequence is [P_MAX, bl]
     # (inverse of the torch fallback in attention_decode._torch_attention_decode_impl). The
@@ -474,4 +540,111 @@ def decode_mask_from_token_mask(
     if bl > 0:
         seq = seq.reshape(B, S_tkg, S_ctx // (P_MAX * bl), P_MAX, bl).transpose(-1, -2)
     seq = seq.reshape(B, 1, S_tkg, S_ctx).permute(3, 0, 1, 2)  # [S_ctx, B, 1, S_tkg]
-    return base_mask * seq.to(base_mask.dtype)
+    return seq.to(base_mask.dtype)
+
+
+# =============================================================================
+# Section 5: compact decode (attend only to the selected tokens)
+# =============================================================================
+
+
+def compact_slots(budget_blocks: int, ratio: int = 4) -> int:
+    """Compact context length for ``compact_decode_selection``, a multiple of 256 slots: the
+    selected blocks, the open tail block and the kernel's active slot (2,304 for 512 blocks)."""
+    need = (budget_blocks + 1) * ratio + 1
+    return -(-need // 256) * 256
+
+
+def topk_block_ids(
+    scores: torch.Tensor, budget_blocks: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The selected blocks as an index list: ``(idx int32 [B, k], valid bool [B, k])``.
+
+    scores: ``[B, 1, NB]`` (``index_scores``: >= 0 where visible, -1 elsewhere). Takes the top
+    ``k = budget_blocks`` scores with ``vllm_neuron.functional.topk`` (the NKI top-k kernel on
+    device, ``torch.topk`` elsewhere); the min(k, visible) entries with a score >= 0 are valid,
+    the others are invisible blocks. Among equal scores it may pick other blocks than
+    ``topk_block_mask`` (which takes the lowest indices); both are an exact top-k. Order is
+    unspecified.
+    """
+    from vllm_neuron.functional.topk import topk
+
+    B, _, NB = scores.shape
+    vals, idx = topk(scores.reshape(B, NB), budget_blocks, dim=-1, gather_dim=-1)
+    return idx.to(torch.int32).clamp(0, NB - 1), vals >= 0
+
+
+def compact_decode_selection(
+    idx: torch.Tensor,
+    valid: torch.Tensor,
+    q_pos: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    n_slots: int,
+    ratio: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The decode selection as a compact paged context for ``NF.attention_decode``.
+
+    The K/V caches ``[num_blocks, block_size, Dh]`` are read as ``[num_blocks * block_size /
+    ratio, ratio, Dh]``, i.e. in pages of one QSA block, so the kernel's block table can list
+    exactly the selected blocks: no K/V copy, and the kernel reads ``n_slots`` slots instead of
+    the whole context bucket.
+
+    idx, valid: ``[B, k]`` selected block indices in any order (``topk_block_ids``), one
+        decode token per request.
+    q_pos: ``[B, 1]`` decode positions; block_table: ``[B, n_blk]`` cache blocks of
+        ``block_size`` tokens (-1 = unused).
+    n_slots: compact context length (``compact_slots``); a multiple of 128.
+
+    Returns ``(table int32 [B, n_slots / ratio], seq bool [B, 1, n_slots])``:
+      * table: page ids of the selected blocks, then the open tail block, then page 0 (the
+        null block) as padding;
+      * seq: allowed compact slots in sequence order: the tokens of the selected blocks and of
+        the tail before ``q_pos`` (the kernel takes the token at ``q_pos`` from its own new
+        K/V, in the last slot), and the last slot iff the token at ``q_pos`` is selected.
+    Attention is invariant to the order of the keys, so this equals the masked full-context
+    decode (``token_mask`` + ``decode_mask_from_token_mask``) of the same selection.
+    """
+    B, k = idx.shape
+    dev = idx.device
+    n_pages = n_slots // ratio
+    if n_pages < k + 2 or n_slots % ratio:
+        raise ValueError(f"compact context {n_slots} too small for {k} blocks")
+    ppb = block_size // ratio  # QSA pages per cache block
+    bt = block_table.clamp(min=0).long()
+    n_blk = bt.shape[1]
+    p = q_pos.reshape(B, 1).long()
+
+    def page_of(blk):  # QSA block index -> page id of the K/V cache read in QSA pages
+        cb = torch.gather(
+            bt, 1, torch.div(blk, ppb, rounding_mode="floor").clamp(max=n_blk - 1)
+        )
+        return cb * ppb + blk % ppb
+
+    # Built per page / slot with where (no concatenation: neuronx-cc failed on that at B=8).
+    tail = torch.div(p + 1, ratio, rounding_mode="floor")  # [B, 1] open block
+    e = torch.arange(n_pages, device=dev).view(1, n_pages)
+    blk = F.pad(idx.long(), (0, n_pages - k))  # [B, n_pages]
+    ok = F.pad(valid, (0, n_pages - k))
+    blk = torch.where(e == k, tail, blk)
+    ok = (ok & (e < k)) | (e == k)
+    table = torch.where(ok, page_of(blk), torch.zeros_like(blk)).to(torch.int32)
+
+    t = torch.arange(ratio, device=dev).view(1, 1, ratio)
+    tok_pos = blk.unsqueeze(-1) * ratio + t  # [B, n_pages, ratio]
+    allowed = (ok.unsqueeze(-1) & (tok_pos < p.unsqueeze(-1))).reshape(B, n_slots)
+    own_blk = torch.div(p, ratio, rounding_mode="floor")
+    own = (valid & (idx.long() == own_blk)).any(-1, keepdim=True)
+    act_ok = own | ((p + 1) % ratio != 0)  # [B, 1]
+    last = torch.arange(n_slots, device=dev).view(1, n_slots) == n_slots - 1
+    seq = torch.where(last, act_ok, allowed)
+    return table, seq.view(B, 1, n_slots)
+
+
+def compact_decode_mask(
+    seq: torch.Tensor, q_pos: torch.Tensor, base_mask: torch.Tensor, block_len: int
+) -> torch.Tensor:
+    """``compact_decode_selection``'s ``seq`` in the layout / dtype of ``base_mask`` (the
+    ``gen_attention_decode_mask`` output for the compact context with every slot visible,
+    i.e. positions ``n_slots - 1``). block_len: the compact page length (``ratio``)."""
+    return base_mask * _to_decode_mask_layout(seq, q_pos, base_mask, block_len)

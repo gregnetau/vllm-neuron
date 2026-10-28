@@ -596,10 +596,33 @@ class Qwen3_5Attention(nn.Module):
             out = self.tp_group.reduce_scatter(out, dim=0)
         return out.contiguous()
 
-    def _restrict_decode_mask(self, attention_mask, positions, block_size):
-        """Hook for subclasses to restrict the pre-generated decode mask (e.g. to a sparse
-        selection of the cached context); positions [B, S]. Unchanged here."""
-        return attention_mask
+    def _decode_context(self, positions, block_table, block_size, S_ctx):
+        """Cached context of the fused decode kernel: (attention_mask, active_blocks_table,
+        K_cache, V_cache). positions [B, S]. Hook for subclasses that attend to a selection of
+        the cached context (a restricted mask, or another block table over a view of the
+        caches)."""
+        B, S_decode = positions.shape
+        nkh = self.num_key_value_heads_per_rank
+        attention_mask = NF.gen_attention_decode_mask(
+            pos_ids=positions.reshape(1, B * S_decode).to(torch.float32),
+            bs=B,
+            q_head=self.num_attention_heads_per_rank,
+            s_active=S_decode,
+            s_prior=S_ctx,
+            start_pos=None,
+            block_len=block_size,
+        )
+        k_cache = (
+            self.k_cache.squeeze(1) if self.k_cache.dim() == 4 and nkh else self.k_cache
+        )
+        v_cache = (
+            self.v_cache.squeeze(1) if self.v_cache.dim() == 4 and nkh else self.v_cache
+        )
+        # Unused table entries are the runner's -1 sentinel; the kernel skips OOB reads but the
+        # skipped SBUF tile keeps stale (possibly NaN) data, which survives the mask (0*NaN).
+        # Point them at the null block instead, which every step keeps zeroed.
+        active_blocks = block_table.clamp(min=0).to(torch.int32)
+        return attention_mask, active_blocks, k_cache, v_cache
 
     def forward_decode(
         self, hidden_states, positions, position_embeddings, attn_metadata
@@ -631,25 +654,6 @@ class Qwen3_5Attention(nn.Module):
             .contiguous()
             .to(self.dtype)
         )
-        attention_mask = NF.gen_attention_decode_mask(
-            pos_ids=positions.view(1, B * S_decode).to(torch.float32),
-            bs=B,
-            q_head=self.num_attention_heads_per_rank,
-            s_active=S_decode,
-            s_prior=S_ctx,
-            start_pos=None,
-            block_len=block_size,
-        )
-        attention_mask = self._restrict_decode_mask(
-            attention_mask, positions.view(B, S_decode), block_size
-        )
-        k_cache = (
-            self.k_cache.squeeze(1) if self.k_cache.dim() == 4 and nkh else self.k_cache
-        )
-        v_cache = (
-            self.v_cache.squeeze(1) if self.v_cache.dim() == 4 and nkh else self.v_cache
-        )
-
         # A token at block offset 0 starts a fresh block: clear it before the kernel reads it.
         # Writing the cache ahead of the kernel copies the whole cache, so the runner clears
         # blocks at allocation instead when it can (set_runner_clears_kv_blocks).
@@ -660,11 +664,9 @@ class Qwen3_5Attention(nn.Module):
                     slot_mapping % block_size == 0, blk_new, torch.zeros_like(blk_new)
                 )
             )
-
-        # Unused table entries are the runner's -1 sentinel; the kernel skips OOB reads but the
-        # skipped SBUF tile keeps stale (possibly NaN) data, which survives the mask (0*NaN).
-        # Point them at the null block instead, which every step keeps zeroed.
-        active_blocks = block_table.clamp(min=0).to(torch.int32)
+        attention_mask, active_blocks, k_cache, v_cache = self._decode_context(
+            positions.view(B, S_decode), block_table, block_size, S_ctx
+        )
 
         # W_out=None: the gate must multiply the attention output before o_proj.
         # Output layout [B, Nh, Dh, S].

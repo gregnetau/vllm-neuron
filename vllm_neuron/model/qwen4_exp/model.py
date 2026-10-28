@@ -18,11 +18,12 @@ gated-attention mixers are the Qwen3.5 classes with small overrides. What is new
     ``ple_embeds`` [T, ple_embed_dim] (``build_host_inputs``). On device, ``Qwen4ExpPLE`` gates
     them per stream against the residual and adds a dilated causal conv (state: the last 9
     conv inputs per request, a separate recurrent-state layer ``layers.1.ple``).
-  * QSA on the attention layers (``qsa.py``, ``Qwen4ExpAttention``). Raw indexer keys go to a
-    side cache per layer, addressed like its K/V cache (``bind_index_cache``). When the static
-    context bucket is <= 2048 slots every block is selected and the dense Qwen3.5 paths run
-    unchanged; otherwise prefill attends in torch with the QSA token mask and decode ANDs it
-    into the decode kernel's mask.
+  * QSA on the attention layers (``qsa.py``, ``Qwen4ExpAttention``). Raw and compressed
+    indexer keys go to side caches per layer, addressed like its K/V cache
+    (``bind_index_cache``). When the static context bucket is <= 2048 slots every block is
+    selected and the dense Qwen3.5 paths run unchanged; otherwise prefill attends in torch
+    with the QSA token mask, and decode runs the decode kernel over a compact context of only
+    the selected tokens (or, for multi-token verify rows, ANDs the mask into its mask).
   * GDN output gate is sigmoid (``output_gate_type``), and the 2 KV heads are replicated for
     tp > 2 (one KV head per rank, so the Qwen3.5 kernels and KV views apply).
 
@@ -435,16 +436,21 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
 
     QSA (``qsa.py``): a replicated indexer (4 query heads + 1 raw key x 128) scores mean-pooled
     4-token key blocks; each query attends to its top ``block_topk`` (512) complete blocks plus
-    the open tail. Every step writes this step's raw indexer keys into a side cache that shares
-    this layer's block table and slot mapping (``bind_index_cache``).
+    the open tail. Every step writes this step's raw indexer keys, and the compressed key of
+    their blocks, into side caches that share this layer's block table and slot mapping
+    (``bind_index_cache``), so scoring reads the S / 4 compressed keys.
 
     The context bucket ``S`` (block-table width x block size, static) picks the path:
       * ``qsa_is_dense(S)`` (S <= 2048): every visible block is selected, QSA == dense causal
         attention, so the Qwen3.5 paths run unchanged (segmented / flash prefill, decode kernel).
       * otherwise prefill attends over the cached context in torch with the QSA token mask
-        (``_attend_cached_qsa``), and decode ANDs the token mask into the pre-generated mask of
-        the decode kernel (``qsa.decode_mask_from_token_mask``); the CPU / no-kernel decode
-        applies it in ``_decode_torch``. MTP verify rows (S_tkg > 1) use the same masks.
+        (``_attend_cached_qsa``). Decode with one token per request (``_use_compact_decode``)
+        takes the top-k blocks as an index list (NKI top-k) and runs the decode kernel over a
+        compact context of only the selected tokens (``qsa.compact_decode_selection``): the
+        K/V caches read in pages of one QSA block, ~2.3k slots instead of S. MTP verify rows
+        (S_tkg > 1) AND the token mask into the pre-generated mask of the decode kernel
+        (``qsa.decode_mask_from_token_mask``); the CPU / no-kernel decode applies it in
+        ``_decode_torch``.
     """
 
     FP8_INPUT_SCALES = {}
@@ -514,6 +520,7 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
         self.k_scale = self.v_scale = None
         self.k_scale_float = self.v_scale_float = 1.0
         self._decode_token_mask = None  # QSA mask of the decode step in flight
+        self._decode_compact = None  # or its compact context (table, slot mask)
 
     def materialize_buffers(self):
         self.index_inv_freq = W35.rope_inv_freq(
@@ -554,6 +561,17 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
             dtype=self.dtype,
             device=v.device,
         )
+        # Compressed keys (one per QSA block, ``qsa.write_compressed_keys``), kept up to date
+        # every step so that scoring reads S / ratio keys instead of recomputing them from the
+        # S raw keys.
+        self.index_ckey_cache = torch.zeros(
+            v.shape[0],
+            1,
+            v.shape[-2] // self.config.indexer_compress_ratio,
+            self.config.indexer_head_dim,
+            dtype=self.dtype,
+            device=v.device,
+        )
 
     # ── QSA indexer ──────────────────────────────────────────────────────
 
@@ -565,12 +583,28 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
             S, self.config.block_topk, self.config.indexer_compress_ratio
         )
 
-    def _index_keys(self, x: torch.Tensor, attn_metadata) -> None:
-        """Write this step's raw indexer keys (x [T, H]); used when the selection is dense."""
+    def _write_index_keys(self, k_raw, q_pos, slot_mapping) -> None:
+        """Write this step's raw indexer keys k_raw [T, D] (positions q_pos), then the
+        compressed keys of their blocks."""
+        cfg = self.config
+        qsa.write_raw_keys(self.index_cache, k_raw, slot_mapping)
+        qsa.write_compressed_keys(
+            self.index_ckey_cache,
+            self.index_cache,
+            q_pos,
+            slot_mapping,
+            self.index_k_norm_weight,
+            self.index_inv_freq,
+            ratio=cfg.indexer_compress_ratio,
+            eps=cfg.rms_norm_eps,
+        )
+
+    def _index_keys(self, x: torch.Tensor, positions, attn_metadata) -> None:
+        """Write this step's indexer keys (x [T, H]); used when the selection is dense."""
         D = self.config.indexer_head_dim
         k_raw = x @ self.index_qk_weight[:, self.config.indexer_n_heads * D :]
-        qsa.write_raw_keys(
-            self.index_cache, k_raw, attn_metadata[self.md_key]["slot_mapping"]
+        self._write_index_keys(
+            k_raw, positions.reshape(-1), attn_metadata[self.md_key]["slot_mapping"]
         )
 
     def _qsa_index(self, x, q_pos, attn_metadata, S: int):
@@ -590,20 +624,13 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
             n_heads=cfg.indexer_n_heads,
             eps=cfg.rms_norm_eps,
         )
-        # Raw keys first: a query at p = 4b + 3 selects among blocks that include itself.
-        qsa.write_raw_keys(self.index_cache, k_raw, md["slot_mapping"])
-        kctx = qsa.gather_raw_keys(self.index_cache, md["block_table_tensor"])
-        if kctx.shape[1] != S:
+        # Keys first: a query at p = 4b + 3 selects among blocks that include itself.
+        self._write_index_keys(k_raw, q_pos.reshape(-1), md["slot_mapping"])
+        kc = qsa.gather_raw_keys(self.index_ckey_cache, md["block_table_tensor"])
+        if kc.shape[1] * cfg.indexer_compress_ratio != S:
             raise ValueError(
-                f"QSA: the block table spans {kctx.shape[1]} slots, expected {S}"
+                f"QSA: the block table spans {kc.shape[1]} blocks, expected {S} slots"
             )
-        kc = qsa.compressed_keys(
-            kctx,
-            self.index_k_norm_weight,
-            self.index_inv_freq,
-            ratio=cfg.indexer_compress_ratio,
-            eps=cfg.rms_norm_eps,
-        )
         return q_idx.view(B, Tq, cfg.indexer_n_heads, -1), kc
 
     def _qsa_select(self, q_idx, kc, q_pos, S: int) -> torch.Tensor:
@@ -627,7 +654,7 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
         if attn_metadata is None:
             return torch.zeros_like(hidden_states)
         if self._qsa_dense(attn_metadata):
-            self._index_keys(hidden_states.to(self.dtype), attn_metadata)
+            self._index_keys(hidden_states.to(self.dtype), positions, attn_metadata)
             return super().forward_prefill(
                 hidden_states, positions, position_embeddings, attn_metadata
             )
@@ -766,44 +793,102 @@ class Qwen4ExpAttention(Q.Qwen3_5Attention):
 
     # ── Decode ───────────────────────────────────────────────────────────
 
+    def _use_compact_decode(self, S_q: int) -> bool:
+        """Static: decode over a compact context of only the selected tokens
+        (``qsa.compact_decode_selection``) for one token per request and one unpacked KV head
+        per rank. On trn2 it beats the masked full-context kernel at every sparse context
+        bucket measured (4k-64k), from the top-k kernel alone."""
+        ratio = self.config.indexer_compress_ratio
+        return (
+            S_q == 1
+            and self.num_key_value_heads_per_rank == 1
+            and self.k_cache.dim() == 4
+            and self.k_cache.shape[-1] == self.head_dim
+            and self.v_cache.shape[-2] % ratio == 0
+        )
+
     def forward_decode(
         self, hidden_states, positions, position_embeddings, attn_metadata
     ):
         from vllm_neuron.utils.neuron_utils import can_run_kernel
 
+        cfg = self.config
         md = attn_metadata[self.md_key]
         B = md["block_table_tensor"].shape[0]
         S_q = hidden_states.shape[0] // B
-        tok = None
+        tok = compact = None
+        kernel = can_run_kernel(hidden_states)
         if not self._qsa_dense(attn_metadata):
             S = md["max_blocks_per_seq"] * md["block_size"]
             q_pos = positions.view(B, S_q).to(torch.int32)
-            tok = self._qsa_token_mask(
-                hidden_states.to(self.dtype), q_pos, attn_metadata, S
-            )
+            x = hidden_states.to(self.dtype)
+            if kernel and self._use_compact_decode(S_q):
+                ratio = cfg.indexer_compress_ratio
+                q_idx, kc = self._qsa_index(x, q_pos, attn_metadata, S)
+                scores = qsa.index_scores(q_idx, kc, q_pos, ratio)
+                idx, valid = qsa.topk_block_ids(scores, cfg.block_topk)
+                compact = qsa.compact_decode_selection(
+                    idx,
+                    valid,
+                    q_pos,
+                    md["block_table_tensor"],
+                    md["block_size"],
+                    qsa.compact_slots(cfg.block_topk, ratio),
+                    ratio,
+                )
+            else:
+                tok = self._qsa_token_mask(x, q_pos, attn_metadata, S)
         else:
-            self._index_keys(hidden_states.to(self.dtype), attn_metadata)
-        if not can_run_kernel(hidden_states):
+            self._index_keys(hidden_states.to(self.dtype), positions, attn_metadata)
+        if not kernel:
             return self._decode_torch(
                 hidden_states, positions, position_embeddings, attn_metadata, tok
             )
-        # The Qwen3.5 fused-kernel decode, with the QSA selection ANDed into its mask
-        # (_restrict_decode_mask); tok is None while every block is selected.
-        self._decode_token_mask = tok
+        # The Qwen3.5 fused-kernel decode over the QSA selection (_decode_context): a compact
+        # context of the selected tokens, or the full context with the selection ANDed into
+        # the mask; both None while every block is selected.
+        self._decode_token_mask, self._decode_compact = tok, compact
         try:
             return super().forward_decode(
                 hidden_states, positions, position_embeddings, attn_metadata
             )
         finally:
-            self._decode_token_mask = None
+            self._decode_token_mask = self._decode_compact = None
 
-    def _restrict_decode_mask(self, attention_mask, positions, block_size):
-        """ANDs the step's QSA token mask (set by forward_decode) into the decode-kernel mask."""
-        if self._decode_token_mask is None:
-            return attention_mask
-        return qsa.decode_mask_from_token_mask(
-            self._decode_token_mask, positions, attention_mask, block_size
+    def _decode_context(self, positions, block_table, block_size, S_ctx):
+        """The decode kernel's context for the step's QSA selection (set by forward_decode)."""
+        if self._decode_compact is not None:
+            table, seq = self._decode_compact
+            B, S_q = positions.shape
+            n_slots = seq.shape[-1]
+            ratio = self.config.indexer_compress_ratio
+            base = Q.NF.gen_attention_decode_mask(
+                pos_ids=torch.full(
+                    (1, B * S_q),
+                    float(n_slots - 1),
+                    dtype=torch.float32,
+                    device=positions.device,
+                ),
+                bs=B,
+                q_head=self.num_attention_heads_per_rank,
+                s_active=S_q,
+                s_prior=n_slots,
+                start_pos=None,
+                block_len=ratio,
+            )
+            mask = qsa.compact_decode_mask(seq, positions, base, ratio)
+            # [num_blocks, 1, bs, Dh] read in pages of one QSA block (one KV head per rank)
+            k_pages = self.k_cache.view(-1, ratio, self.k_cache.shape[-1])
+            v_pages = self.v_cache.view(-1, ratio, self.v_cache.shape[-1])
+            return mask, table, k_pages, v_pages
+        mask, table, k_cache, v_cache = super()._decode_context(
+            positions, block_table, block_size, S_ctx
         )
+        if self._decode_token_mask is not None:
+            mask = qsa.decode_mask_from_token_mask(
+                self._decode_token_mask, positions, mask, block_size
+            )
+        return mask, table, k_cache, v_cache
 
     def _decode_torch(
         self, hidden_states, positions, position_embeddings, attn_metadata, tok=None
@@ -1319,12 +1404,13 @@ class Qwen4ExpForCausalLM(nn.Module):
     @property
     def kv_side_bytes_per_token_per_attn_layer(self) -> int:
         """Runner budget hook: bytes per cached token of every attention layer's side cache
-        (QSA raw indexer keys, ``Qwen4ExpAttention.bind_index_cache``), allocated outside the
+        (QSA raw and compressed indexer keys, ``Qwen4ExpAttention.bind_index_cache``), allocated outside the
         KV pool in proportion to it."""
-        return (
-            self.config.indexer_head_dim
-            * torch.empty((), dtype=self.config.torch_dtype).element_size()
+        cfg = self.config
+        raw = (
+            cfg.indexer_head_dim * torch.empty((), dtype=cfg.torch_dtype).element_size()
         )
+        return raw + raw // cfg.indexer_compress_ratio  # + the compressed keys
 
     @property
     def prefill_dense_context(self) -> int:

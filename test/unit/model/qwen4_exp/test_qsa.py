@@ -436,9 +436,12 @@ def test_decode_attention_matches_hf(tiny_hf_model):
             torch.testing.assert_close(ours, out, atol=2e-5, rtol=1e-4)
 
 
-def test_decode_kernel_mask_through_attention_decode(tiny_hf_model):
+@pytest.mark.parametrize("compact", [False, True])
+def test_decode_kernel_mask_through_attention_decode(tiny_hf_model, compact):
     """QSA token mask -> ``decode_mask_from_token_mask`` -> ``NF.attention_decode`` (torch
-    fallback on CPU, which reads the mask in the kernel's layout) matches HF decode."""
+    fallback on CPU, which reads the mask in the kernel's layout) matches HF decode. With
+    ``compact`` the kernel instead reads only the selected tokens: the caches in pages of one
+    QSA block and the block table / mask of ``compact_decode_selection``."""
     import vllm_neuron.functional as NF
 
     model = tiny_hf_model
@@ -467,16 +470,45 @@ def test_decode_kernel_mask_through_attention_decode(tiny_hf_model):
             # snapshot caches before this step's write: the kernel takes the new K/V as inputs
             k_prev, v_prev = ref.k_cache.clone(), ref.v_cache.clone()
             q, k, v, gate, tm = ref.decode_inputs(h, pos)
-            base = NF.gen_attention_decode_mask(
-                pos_ids=pos.view(1, B).float(),
-                bs=B,
-                q_head=rep,
-                s_active=1,
-                s_prior=ref.S,
-                start_pos=None,
-                block_len=BS,
-            )
-            mask = qsa.decode_mask_from_token_mask(tm, pos.view(B, 1), base, BS)
+            if compact:
+                # the block selection behind tm: its complete blocks with all tokens allowed
+                R = ref.p["ratio"]
+                nb = ref.S // R
+                sel = tm.view(B, 1, nb, R).all(-1) & (
+                    torch.arange(nb) < (pos.view(B, 1, 1) + 1) // R
+                )
+                n_slots = qsa.compact_slots(ref.p["budget_blocks"], R)
+                # as an index list in shuffled order, padded with invalid entries
+                key = torch.rand(B, nb, generator=g) + sel[:, 0].float()
+                vals, idx = key.topk(ref.p["budget_blocks"], -1)
+                valid = vals >= 1
+                table, seq = qsa.compact_decode_selection(
+                    idx, valid, pos.view(B, 1), ref.bt, BS, n_slots, R
+                )
+                assert seq.sum() == tm.sum()  # the same tokens, compacted
+                base = NF.gen_attention_decode_mask(
+                    pos_ids=torch.full((1, B), n_slots - 1.0),
+                    bs=B,
+                    q_head=rep,
+                    s_active=1,
+                    s_prior=n_slots,
+                    start_pos=None,
+                    block_len=R,
+                )
+                mask = qsa.compact_decode_mask(seq, pos.view(B, 1), base, R)
+                bt, page = table, R
+            else:
+                base = NF.gen_attention_decode_mask(
+                    pos_ids=pos.view(1, B).float(),
+                    bs=B,
+                    q_head=rep,
+                    s_active=1,
+                    s_prior=ref.S,
+                    start_pos=None,
+                    block_len=BS,
+                )
+                mask = qsa.decode_mask_from_token_mask(tm, pos.view(B, 1), base, BS)
+                bt, page = ref.bt.to(torch.int32), BS
             outs = []
             for kv in range(ref.Nkv):  # one KV head per "rank", like TP deployment
                 qr = q[:, 0, kv * rep : (kv + 1) * rep].reshape(B, 1, rep * Dh)
@@ -486,9 +518,9 @@ def test_decode_kernel_mask_through_attention_decode(tiny_hf_model):
                 o, _, _ = NF.attention_decode(
                     X=X,
                     W_qkv=torch.eye(X.shape[-1]),
-                    active_blocks_table=ref.bt.to(torch.int32),
-                    K_cache=torch.nan_to_num(k_prev[:, kv]),
-                    V_cache=torch.nan_to_num(v_prev[:, kv]),
+                    active_blocks_table=bt,
+                    K_cache=torch.nan_to_num(k_prev[:, kv]).reshape(-1, page, Dh),
+                    V_cache=torch.nan_to_num(v_prev[:, kv]).reshape(-1, page, Dh),
                     attention_mask=mask,
                     softmax_scale=ref.attn.scaling,
                     update_cache=False,
@@ -498,6 +530,23 @@ def test_decode_kernel_mask_through_attention_decode(tiny_hf_model):
             torch.testing.assert_close(
                 o @ ref.attn.o_proj.weight.T, out_hf, atol=2e-5, rtol=1e-4
             )
+
+
+def test_topk_block_ids_matches_topk_block_mask():
+    """The index-list top-k selects the same blocks as the mask top-k (no ties here), with
+    the invisible blocks of short requests marked invalid."""
+    g = torch.Generator().manual_seed(1)
+    nb, k = 600, 64
+    q_pos = torch.tensor([[2399], [100], [255]])  # visible 600, 25, 64 blocks
+    vis = torch.arange(nb) < (q_pos + 1) // 4
+    scores = torch.where(vis, torch.rand(3, nb, generator=g), -1.0).unsqueeze(1)
+    mask = qsa.topk_block_mask(scores, ((q_pos + 1) // 4).clamp(max=k))[:, 0]
+    idx, valid = qsa.topk_block_ids(scores, k)
+    got = torch.zeros_like(mask)
+    for b in range(3):
+        got[b, idx[b][valid[b]].long()] = True
+    assert torch.equal(got, mask)
+    assert valid.sum(-1).tolist() == [64, 25, 64]
 
 
 @pytest.mark.parametrize("S_tkg", [1, 2, 3])

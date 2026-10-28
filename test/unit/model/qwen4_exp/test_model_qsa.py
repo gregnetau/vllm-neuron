@@ -68,6 +68,7 @@ class _Paged:
                     cfg.indexer_head_dim,
                 )
                 layer.self_attn.index_cache.fill_(fill)
+                layer.self_attn.index_ckey_cache.fill_(fill)
         model.bind_state_cache(state_pages(spec, 40))
         g = torch.Generator().manual_seed(3)
         perm = torch.randperm(63, generator=g) + 1
@@ -264,7 +265,7 @@ def test_qsa_batched_and_multitoken_decode_match_hf(plugin):
     # the attention layer alone, on hidden states that make each request's selection sparse.
     attn = model.model.layers[3].self_attn
     H = model.config.hidden_size
-    caches = [attn.k_cache, attn.v_cache, attn.index_cache]
+    caches = [attn.k_cache, attn.v_cache, attn.index_cache, attn.index_ckey_cache]
     snap = [c.clone() for c in caches]
     x = torch.randn(4, H, generator=torch.Generator().manual_seed(4))
     rows = torch.arange(2).repeat_interleave(2)
