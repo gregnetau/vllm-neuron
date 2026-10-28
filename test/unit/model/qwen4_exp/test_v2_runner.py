@@ -141,7 +141,7 @@ class _Speculator(torch.nn.Module):
         return drafts
 
 
-def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling):
+def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling, apc=False):
     from vllm.config import (
         CacheConfig,
         ModelConfig,
@@ -173,7 +173,7 @@ def _vllm_config(tmp_path, hf_cfg, *, spec, async_scheduling):
         model_config=model_config,
         parallel_config=parallel_config,
         cache_config=CacheConfig(
-            block_size=BLOCK, cache_dtype="auto", enable_prefix_caching=False
+            block_size=BLOCK, cache_dtype="auto", enable_prefix_caching=apc
         ),
         speculative_config=(
             SpeculativeConfig(
@@ -245,6 +245,10 @@ class _Engine:
             if isinstance(s, FullAttentionSpec)
         )
         num_attn = sum(isinstance(s, FullAttentionSpec) for s in specs.values())
+        if vllm_config.cache_config.enable_prefix_caching:
+            # Mamba align mode: every group's block is the state page.
+            page = max(s.page_size_bytes for s in specs.values())
+            num_attn = max(len(g.layer_names) for g in groups)
         config = get_kv_cache_config_from_groups(
             vllm_config, groups, 120 * page * num_attn
         )
@@ -259,7 +263,25 @@ class _Engine:
         )
         self.runner = runner
         vllm_config.cache_config.num_gpu_blocks = config.num_blocks
+        # EngineCore._initialize_kv_caches: the scheduler sees the manager block.
+        vllm_config.cache_config.block_size = min(
+            g.kv_cache_spec.block_size for g in config.kv_cache_groups
+        )
         block_size, hash_block_size = resolve_kv_cache_block_sizes(config, vllm_config)
+        self.block_hasher = None
+        if vllm_config.cache_config.enable_prefix_caching:
+            from vllm.utils.hashing import get_hash_fn_by_name
+            from vllm.v1.core.kv_cache_utils import (
+                get_request_block_hasher,
+                init_none_hash,
+            )
+
+            hash_fn = get_hash_fn_by_name(
+                vllm_config.cache_config.prefix_caching_hash_algo
+            )
+            init_none_hash(hash_fn)
+            self.block_hasher = get_request_block_hasher(hash_block_size, hash_fn)
+        self.admitted = {}  # req_id -> cached tokens at admission
         cls = NeuronAsyncScheduler if self.async_scheduling else NeuronScheduler
         self.scheduler = cls(
             vllm_config=vllm_config,
@@ -278,7 +300,9 @@ class _Engine:
         from vllm.v1.request import Request
 
         params = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
-        self.scheduler.add_request(Request(req_id, prompt, params, None))
+        self.scheduler.add_request(
+            Request(req_id, prompt, params, None, block_hasher=self.block_hasher)
+        )
         self.outputs[req_id] = []
 
     def _process(self, scheduler_output, output):
@@ -308,6 +332,8 @@ class _Engine:
                 return
             if self.scheduler.has_requests() and len(self.queue) < self.depth:
                 so = self.scheduler.schedule()
+                for r in so.scheduled_new_reqs:
+                    self.admitted.setdefault(r.req_id, r.num_computed_tokens)
                 out = self.runner.execute_model(so)
                 if so.total_num_scheduled_tokens > 0:
                     out = self.runner.sample_tokens(None)
@@ -384,3 +410,54 @@ def test_qwen4_exp_on_v2_matches_hf(
         assert prompt + engine.outputs[r] == expected[r], r
     if draft == "oracle":
         assert 0 < engine.num_accepted < engine.num_draft
+
+
+@pytest.mark.parametrize(
+    "draft,async_scheduling",
+    [(None, False), (None, True), ("oracle", True)],
+    ids=["plain-sync", "plain-async", "oracle-async"],
+)
+def test_qwen4_exp_prefix_caching_on_v2_matches_hf(
+    tmp_path, plugin_mtp, draft, async_scheduling
+):
+    """Prefix caching (Mamba align mode): the GDN and PLE state checkpoints at block
+    boundaries, the QSA side caches of cached blocks and the host token history of a
+    request admitted with a hit. Two requests share a multi-block prefix (the second
+    arrives once the first is cached), and a third continues the first one's prompt and
+    answer. Greedy outputs equal HF's; the later requests hit."""
+    hf, hf_cfg = _hf_model()
+    model = _model(plugin_mtp, hf, hf_cfg)
+    g = torch.Generator().manual_seed(7)
+    shared = torch.randint(2, hf_cfg.vocab_size, (150,), generator=g).tolist()
+    tail = torch.randint(2, hf_cfg.vocab_size, (30,), generator=g).tolist()
+    prompts = {"p": shared + tail[:10], "q": shared + tail[10:]}
+    expected = {r: _hf_greedy(hf, p, 12) for r, p in prompts.items()}
+    prompts["r"] = expected["p"] + tail[20:]
+    expected["r"] = _hf_greedy(hf, prompts["r"], 8)
+    vllm_config = _vllm_config(
+        tmp_path,
+        hf_cfg,
+        spec=draft is not None,
+        async_scheduling=async_scheduling,
+        apc=True,
+    )
+    assert vllm_config.cache_config.mamba_cache_mode == "align"
+    draft_model = (lambda runner: _Oracle(runner, expected)) if draft else None
+    engine = _Engine(vllm_config, model, draft_model)
+    assert engine.runner._ckpt is not None
+    engine.run(
+        {
+            0: [("p", prompts["p"], 12)],
+            12: [("q", prompts["q"], 12)],
+            40: [("r", prompts["r"], 8)],
+        }
+    )
+    for r, prompt in prompts.items():
+        assert prompt + engine.outputs[r] == expected[r], r
+    block = engine.runner._ckpt_block_size
+    assert engine.admitted["p"] == 0
+    assert engine.admitted["r"] >= block, (engine.admitted, block)
+    if draft is None:
+        assert engine.admitted["q"] >= block, (engine.admitted, block)
+    # With MTP vLLM drops the last matched block of a hit (EAGLE-style drafter): q's
+    # shared prefix has a checkpoint only where p's first chunk ended, the last block.
