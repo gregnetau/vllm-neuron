@@ -56,8 +56,10 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | **Scheduling** | Async scheduling | ✅ (host-token join, see [Host inputs](../design/host-inputs.md)) |
 | | Chunked (segmented) prefill | ✅ |
 | | KV overcommit with preemption (`VLLM_NEURON_MAX_KV_CONCURRENT`) | ✅ |
-| | Prefix caching | ❌ |
+| | Prefix caching | ✅ Model Runner V2 only (`RUNNER=v2 PREFIX_CACHING=1`; 512-token blocks with BF16 KV) |
 | **Speculative decoding** | MTP (1-2 draft tokens) | ⚠️ faster at batch 1 only (batch 2 with an extra batch-2 graph), slower above (see [MTP](#mtp-speculative-decoding)) |
+| **Runner** | Model Runner V1 | ✅ (default) |
+| | Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`, `serve.sh` `RUNNER=v2`) | ✅ opt-in: host inputs, MTP with async scheduling, decode context buckets, preemption, prefix caching (see the [development notes](../model-dev/qwen3-8-flash-next-notes.md#model-runner)) |
 
 ## Quick start
 
@@ -304,13 +306,14 @@ Logit validation against Hugging Face Transformers (FP32 reference,
   plain decode uses the compact context).
 - **Concurrency cap.** Concurrency is capped by the worst-case KV reservation (see
   [Memory and concurrency](#memory-and-concurrency)).
-- **Not supported:** prefix caching (the recurrent state uses dedicated pools), and BF16 for the
+- **Not supported:** prefix caching on Model Runner V1 (V2 supports it), and BF16 for the
   full model (needs more than 8 NeuronCores per replica).
 - **MTP** is faster than plain decode only at batch 1 in the 65,536-token configuration, and it
   reduces the KV cache by 36% (1 draft token) or 57% (2 draft tokens, which also need
-  `gpu_memory_utilization` 0.82). It supports at most 2 draft tokens, no prefix caching and no
-  async scheduling. Its verify step uses the GDN decode kernel for up to 16 requests; larger
-  batches use a slower torch path.
+  `gpu_memory_utilization` 0.82). It supports at most 2 draft tokens; on V1 no prefix caching and no
+  async scheduling (V2 keeps async scheduling; with MTP it builds no dense prefill variant). Its
+  verify step uses the GDN decode kernel for up to 16 requests; larger batches use a slower torch
+  path.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** uses unit scales and reduces accuracy (see [FP8](#fp8)).
