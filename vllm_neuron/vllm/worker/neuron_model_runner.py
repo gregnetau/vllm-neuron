@@ -620,6 +620,18 @@ def _reinterpret_uint32_as_int32(
     return tensor
 
 
+def _request_generator(device: torch.device, seed: int) -> torch.Generator:
+    """Per-request seeded generator. The Neuron device has no generator hooks
+    (``torch.Generator(device=neuron)`` raises NotImplementedError, which took the engine
+    down on the first request with a ``seed``), so fall back to a CPU generator."""
+    try:
+        generator = torch.Generator(device=device)
+    except (NotImplementedError, RuntimeError):
+        generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return generator
+
+
 def _compute_slot_mapping_cpu(
     block_table_cpu: np.ndarray,
     slot_mapping_np: np.ndarray,
@@ -669,7 +681,9 @@ def _compute_slot_mapping_cpu(
             [(int(req_indices[i]), int(positions[i])) for i in oob_sample],
         )
         flat_indices = np.where(oob_mask, 0, flat_indices)
-    block_numbers = block_table_cpu.ravel()[flat_indices]
+    # int64 before the multiply: block tables are int32, and a recurrent-state group's block
+    # size is max_model_len, so block_id * block_size can pass 2**31.
+    block_numbers = block_table_cpu.ravel()[flat_indices].astype(np.int64)
 
     if cp_world_size > 1:
         virtual_block_offsets = positions % virtual_block_size
@@ -3209,8 +3223,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
+                generator = _request_generator(self.device, sampling_params.seed)
             else:
                 generator = None
 
