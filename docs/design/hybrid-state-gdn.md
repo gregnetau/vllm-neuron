@@ -3,7 +3,7 @@
 <!-- meta: description: Design of per-request recurrent state (Gated DeltaNet) alongside paged
 KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-10-28 -->
 
 ## Overview
 
@@ -249,7 +249,22 @@ functions, the candidates, the block split and the runner's specs and layout.
 
 ### Device validation
 
-Not run on a device yet. On a trn2 instance with no other process on the devices:
+Validated on trn2.3xlarge (SDK 2.33, plugin 0.29):
+
+| Model and configuration | MTP | Result |
+|---|---|---|
+| Qwen3.5-2B, TP=2, BF16 KV | none | 0 corrupt greedy outputs (shared prefix sent sequentially, concurrently and repeated); prefix cache hit rate 67% |
+| same | 2 | 0 corrupt greedy outputs (same cases); hit rate 34% |
+| Qwen3.8-27B FP8 + FP8 KV, `KV_CAP_FRACTION=0.48` (V1 cannot compile it) | none | hit rate 70%; TTFT 3.2 s cold, 1.1 s warm (5k-token prefix) |
+| same | 2 | GSM8K 97.5% (200 questions, concurrency 4); hit rate 35%; TTFT 3.2 s cold, 2.2 s warm |
+| same, `MAX_MODEL_LEN=65536`, `MAX_NUM_SEQS=8`, `DECODE_CTX_BUCKETS="16384"` | 2 | GSM8K 96.7% (300 questions, concurrency 8); 293 output tokens/s |
+| same, Aider Polyglot (225 exercises, 2 tries) | 2 | 71.1% (74.7% without prefix caching; McNemar p = 0.27); hit rate 5.4% |
+
+On Qwen3.5-2B the warm TTFT for a 2.5k-token shared prefix is 146 ms. With MTP the hits on
+Qwen3.8-27B are one 2048-token block shorter (vLLM drops the last matched block), so
+the hit rate and the warm TTFT gain are lower than without MTP.
+
+To reproduce, on a trn2 instance with no other process on the devices:
 
 ```bash
 # Qwen3.5-2B, TP=2, BF16 KV: without and with MTP
@@ -275,7 +290,9 @@ split into 16 kernel blocks of 128 tokens)` (27B FP8 KV; 1024 and 32 with BF16 K
 prefill graphs `prefill_s{P}_kv{S}`, the decode graphs `decode_b{B}` (`decode_b{B}_s3` with
 MTP), the KV-block clearing graph and the two checkpoint copy graphs
 (`save_state_checkpoints`, `restore_state_checkpoints`), all compiled at startup; nothing
-compiles while serving. Checks: greedy outputs equal those without prefix caching for a
+compiles while serving. Checks (`examples/vllm_neuron/models/qwen3_5/stress/apc_test.py`
+covers the sequential, concurrent and repeated shared-prefix cases and the TTFT): greedy
+outputs equal those without prefix caching for a
 shared multi-block prefix sent sequentially and concurrently (batch 4, also with fewer
 than 4 requests so decode rows are padded), for a prompt continuing a previous answer, and
 with MTP; TTFT drops for a repeated multi-block prompt.
@@ -315,7 +332,12 @@ program's heads.
   after the PyTorch input projections, for up to 32 tokens, returning the normed output for
   `out_proj`. `VLLM_NEURON_GDN_BATCHED_DECODE` selects it: `0` off (PyTorch path), `1`
   (default) for steps of more than one token, `2` also for single-token steps instead of
-  `gdn_decode`. Other cases use the PyTorch ops in `gdn_ops`.
+  `gdn_decode`. Other cases use the PyTorch ops in `gdn_ops`. Per layer and rank on device,
+  `gdn_decode_batched` takes 129 us for 4 requests and 187 us for 8 against 3514 us and
+  6922 us on the PyTorch path (Qwen3.5-2B at TP=2; 116 / 225 us against 804 / 1400 us for
+  Qwen3.5-35B-A3B at TP=4; see the
+  [recipe](../model-recipes/qwen3-5.md#batched-bf16-gdn-decode-kernel)).
+  `test/unit/model/qwen3_5/test_gdn_kernels_sim.py` checks both kernels in the NKI simulator.
 - State writes are in place (`index_copy_` on the bound views, or the kernel's aliased
   outputs). The runner's block tables use `-1` for unused entries; the model maps them to
   the null block before indexing.
@@ -330,6 +352,11 @@ in SBUF between them)
 and writes the state after token `j` to block `j`. The next step reads the state from the
 block of the last accepted token, passed as `state_in` in the GDN metadata. Prefills and
 single-token steps read `state_in` (0 after a prefill) and write block 0.
+`test/unit/model/qwen3_5/test_verify_causality_sim.py` (NKI simulator, `RUN_NKI_SIM=1`)
+checks at Qwen3.8-27B per-rank shapes that one verify step of `S = 3` tokens equals three
+`S = 1` decode steps per layer (attention with FP8 and BF16 KV, GDN with the FP8 and the
+batched BF16 kernel), and that later tokens of a row never change the outputs or state
+pages of earlier ones.
 
 With synchronous scheduling the runner sets `state_in` from the previous step's sampled
 tokens. With asynchronous scheduling the target graph derives it from the previous step's

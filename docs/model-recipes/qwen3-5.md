@@ -30,7 +30,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | Model | HuggingFace | Hardware | Quantization | Context |
 |-------|-------------|----------|--------------|---------|
 | Qwen3.8-27B | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Trn2 (trn2.3xlarge, TP=4) | BF16, static FP8 | up to 262,144 (native) |
-| Qwen3.5-35B-A3B (MoE, experimental) | [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Trn2 (trn2.3xlarge, TP=4) | BF16 | validated on CPU only |
+| Qwen3.5-35B-A3B (sparse MoE) | [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Trn2 (trn2.3xlarge, TP=4) | BF16 | tested at the default context (see [Sparse MoE](#sparse-moe-qwen35-35b-a3b)) |
 
 > `Qwen/Qwen3.8-27B-FP8` uses 128x128 block weight scales with dynamic activation
 > quantization, which Trn2 does not support. Serve the BF16 checkpoint and let the plugin
@@ -47,7 +47,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | FP8 KV cache (unit KV scales) | ✅ |
 | | Packed FP8 KV layout (`fp8_packed_kv`) | ❌ (decode kernel, `head_dim` 256) |
 | **Parallelism** | Tensor parallelism (TP=4, one KV head per rank; KV heads replicated when TP exceeds them) | ✅ |
-| | Sparse MoE FFN (Qwen3.5-35B-A3B): TP-sharded experts, optional expert parallelism | 🧪 (CPU-validated) |
+| | Sparse MoE FFN (Qwen3.5-35B-A3B, BF16): TP-sharded experts, optional expert parallelism; Model Runner V1 and V2 | ✅ |
 | | Decode batches > 1 (`max_num_seqs` > 1), with and without MTP | ✅ |
 | | Pipeline / context parallelism | ❌ |
 | **Context** | Native `max_model_len` 262144 (KV pool about 640k tokens in BF16, 1.26M in FP8) | ✅ |
@@ -55,9 +55,10 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | Several prefill buckets; each step picks its KV segment size by the cached length (`PREFILL_BUCKETS`) | ✅ |
 | | Decode context-length buckets (`DECODE_CTX_BUCKETS`) | ✅ |
 | | Decode steps between the chunks of a long prefill (`DECODE_INTERLEAVE`) | ✅ |
-| | Prefix caching (Mamba `align` mode), V1 without MTP | ✅ (not re-validated with the segmented prefill kernel) |
-| | Prefix caching on Model Runner V2, with and without MTP (dedicated running-state pool, checkpoints in the KV pool) | 🧪 (CPU-validated) |
+| | Prefix caching (Mamba `align` mode) on Model Runner V1, without MTP | ✅ (FP8 + FP8 KV: `KV_CAP_FRACTION` <= about 0.22; not re-validated with the segmented prefill kernel) |
+| | Prefix caching on Model Runner V2, with and without MTP (dedicated running-state pool, checkpoints in the KV pool) | ✅ |
 | **Performance** | Fused NKI GDN decode kernel (BF16: one token; FP8: whole sub-layer, up to 32 tokens) | ✅ |
+| | Batched BF16 GDN decode kernel for batches > 1 and MTP verify steps (`VLLM_NEURON_GDN_BATCHED_DECODE`) | ✅ |
 | | NKI FP8 decode kernels: MLP (norm + gate/up + down), projections | ✅ |
 | | Multi-token prediction (MTP) speculative decoding, 1-2 draft tokens | ✅ |
 | | Asynchronous scheduling | ✅ |
@@ -65,12 +66,11 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | torch.compile, native route (`BACKEND=neuron_native`) | ✅ (slower, see [Compilation](#compilation)) |
 | | CPU mode (unit tests) | ✅ |
 | **Runner** | Model Runner V1 | ✅ |
-| | Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`; hybrid state, MTP and prefix caching) | 🧪 (opt-in; V1 is the default, see [the design note](../design/speculation/mrv2-spec-decode.md)) |
+| | Model Runner V2 (opt-in, `VLLM_USE_V2_MODEL_RUNNER=1`): hybrid state, MTP, decode context-length buckets, prefix caching with and without MTP | ✅ (V1 is the default; see [Model Runner V2](#model-runner-v2)) |
 
 **Status legend:**
 
-- ✅ Supported: integrated and tested for Qwen3.8-27B
-- 🧪 Implemented and unit-tested on CPU, not yet validated on device
+- ✅ Supported: integrated and tested on device (Qwen3.8-27B; Qwen3.5-35B-A3B for the MoE rows)
 - ❌ Not supported yet
 
 ## Quick start
@@ -182,7 +182,9 @@ about 0.22 (`NCC_EVRF009` above it).
 
 When parallel compilation fails after the pool size or KV dtype changes, the compile cache may
 hold graphs captured for the earlier configuration, which parallel compilation picks up again.
-Remove the directories whose `log-neuron-cc.txt` reports the error.
+On SDK 2.33 the `libtorch_neuronx_lite` compile cache can also replay a graph that failed
+after a change that only affects the sizes of bound buffers (for example `KV_CAP_FRACTION`).
+Remove the `compile_cache/<hash>` directories whose `log-neuron-cc.txt` reports the error.
 
 ### Long-context prefill
 
@@ -247,6 +249,53 @@ last accepted token; see [the design note](../design/hybrid-state-gdn.md#specula
 The draft acceptance rate is about 86% for the first draft token and 62% for the second (mean
 1.85 and 2.4 tokens per step at batch 1; about 2.7 at batch 8).
 
+### Model Runner V2
+
+`VLLM_USE_V2_MODEL_RUNNER=1` serves these models on Model Runner V2 (V1 stays the default):
+hybrid recurrent state, MTP speculative decoding (verify, rejection, drafting and commit in
+one adapter graph; see [the design note](../design/speculation/mrv2-spec-decode.md)), decode
+context-length buckets, prefix caching with and without MTP (see
+[Prefix caching](#prefix-caching)) and the sparse MoE checkpoint, with the same `serve.sh`
+options as V1:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<path-to-checkpoint>/Qwen3.8-27B \
+    FP8_SCALES=<path-to-checkpoint>/Qwen3.8-27B/fp8_act_amax.json MTP_TOKENS=2 KV_CACHE_DTYPE=fp8 \
+    BLOCK_SIZE=128 MAX_MODEL_LEN=65536 MAX_NUM_SEQS=8 SEQS_BUCKETS="1, 8" DECODE_CTX_BUCKETS="16384" \
+    DECODE_INTERLEAVE=1 GPU_MEM_UTIL=0.95 KV_CAP_FRACTION=0.48 examples/vllm_neuron/models/qwen3_5/serve.sh
+```
+
+In this throughput configuration V2 matches V1 (see [Model Runner V1 and V2](#model-runner-v1-and-v2)),
+and it serves the 262k recommended configuration with MTP. Compared with V1, V2 has no
+`max_tokens` cap near `max_model_len` with MTP and asynchronous scheduling, does not show the
+V1 corruption with MTP and synchronous scheduling near `max_model_len`, and serves prefix
+caching together with MTP and with the large KV pool of the recommended configurations (see
+[Known limitations](#known-limitations)).
+
+### Batched BF16 GDN decode kernel
+
+The fused BF16 GDN decode kernel (`gdn_decode`) runs one token of one request. Steps of more
+than one token in BF16 (batches > 1, and every MTP verify step) run `gdn_decode_batched`, the
+recurrence of the FP8 kernel after the PyTorch input projections, for up to 32 tokens (see
+[the design note](../design/hybrid-state-gdn.md#reads-and-writes)).
+`VLLM_NEURON_GDN_BATCHED_DECODE` selects it: `1` (default) for steps of more than one token,
+`0` for the PyTorch path, `2` also for single-token steps. It applies when the key heads split
+evenly over the two programs of a logical core (Qwen3.5-2B at TP=2, Qwen3.5-35B-A3B and
+Qwen3.8-27B at TP=4).
+
+One GDN layer's decode after the projections, per rank, from
+`examples/vllm_neuron/models/qwen3_5/bench_gdn_decode.py` (microseconds per layer, `B`
+requests of `S` tokens; `S` is 1 unless noted):
+
+| Shapes | B1 | B4 | B8 | B1, S3 | B8, S3 |
+|---|---|---|---|---|---|
+| Qwen3.5-2B, TP=2: kernel / PyTorch | 46 / 892 | 129 / 3514 | 187 / 6922 | 77 / 1895 | |
+| Qwen3.5-35B-A3B, TP=4: kernel / PyTorch | 24.5 / 336 | 116 / 804 | 225 / 1400 | | |
+| Qwen3.8-27B, TP=4: kernel | 48 | 145 | 223 | | 395-420 |
+
+A micro-benchmark process that compiles many distinct kernel graphs occasionally hits a
+sequencer fault (`BAD_OPCODE`); this has not been seen while serving.
+
 ### Sparse MoE: Qwen3.5-35B-A3B
 
 Qwen3.5-35B-A3B has 40 layers (30 GDN + 10 full attention, hidden size 2048, 16 query / 2 KV
@@ -289,13 +338,25 @@ With `GPU_MEM_UTIL=0.9` and the default `KV_CAP_FRACTION=0.15` the KV/state pool
 
 Model Runner V2 with MTP (`VLLM_USE_V2_MODEL_RUNNER=1`, see
 [the V2 design note](../design/speculation/mrv2-spec-decode.md#sparse-moe-targets)) serves the
-MoE checkpoint like the dense ones; it is validated on CPU only (HF parity through the V2
-runner and the real schedulers on a small random MoE checkpoint):
+MoE checkpoint like the dense ones:
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<path-to-checkpoint>/Qwen3.5-35B-A3B TP=4 MTP_TOKENS=2 \
     MAX_NUM_SEQS=4 SEQS_BUCKETS="1, 4" GPU_MEM_UTIL=0.9 examples/vllm_neuron/models/qwen3_5/serve.sh
 ```
+
+Measured on trn2.3xlarge (BF16, TP=4, GSM8K as in [GSM8K](#gsm8k)):
+
+| Runner | TPOT, batch 1 | TPOT, batch 4 | GSM8K | Throughput | MTP acceptance |
+|---|---|---|---|---|---|
+| V1, no MTP | 9.0 ms | 92 ms (PyTorch GDN path, before the batched kernel) | 97.0% | | |
+| V2, MTP 2, batched GDN kernel | 8.6-10.4 ms | 20.0 ms | 97.0% (300 questions, concurrency 4) | 150 output tokens/s | 2.81 tokens per step |
+
+Batched BF16 decode steps (batch > 1, and every MTP verify step) run the batched GDN decode
+kernel (see [Batched BF16 GDN decode kernel](#batched-bf16-gdn-decode-kernel)); MoE checkpoints
+are BF16 only, so without it every batched step ran the PyTorch GDN path. For comparison,
+[#68](https://github.com/vllm-project/vllm-neuron/pull/68) reports a TPOT of 18.17 ms (native
+route) and 34.54 ms (XLA route) at batch 1 on trn2.48xlarge.
 
 ### Prefix caching
 
@@ -323,7 +384,23 @@ prompt's last block boundary and at shared-prefix junctions
 vLLM defaults to every block boundary). See
 [the design note](../design/hybrid-state-gdn.md#prefix-caching-on-model-runner-v2).
 
-Measured with the previous (PyTorch) prefill attention:
+Measured on Model Runner V2 (trn2.3xlarge, plugin 0.29):
+
+| Model and configuration | MTP | Prefix cache hit rate | TTFT cold / warm | Accuracy |
+|---|---|---|---|---|
+| Qwen3.5-2B, TP=2 | none | 67% | | greedy: 0 corrupt outputs, sequential, concurrent and repeated |
+| Qwen3.5-2B, TP=2 | 2 | 34% | | greedy: 0 corrupt outputs |
+| Qwen3.8-27B FP8 + FP8 KV, `KV_CAP_FRACTION=0.48` | none | 70% | 3.2 s / 1.1 s (5k prefix) | |
+| same | 2 | 35% | 3.2 s / 2.2 s (5k prefix) | GSM8K 97.5% (200 questions, concurrency 4) |
+| same, 64k configuration with `DECODE_CTX_BUCKETS="16384"` | 2 | | | GSM8K 96.7% (300 questions, concurrency 8), 293 output tokens/s |
+
+On Qwen3.5-2B the warm TTFT for a 2.5k-token shared prefix is 146 ms. V1 cannot compile the
+27B rows (`KV_CAP_FRACTION=0.48` with prefix caching fails with
+`NCC_EVRF009` on V1). With MTP, vLLM drops the last matched block of a hit, so hits are one
+2048-token block shorter (FP8 KV), which lowers the hit rate and the warm TTFT gain. For the
+Aider Polyglot run with prefix caching see [Aider Polyglot](#aider-polyglot).
+
+On Model Runner V1, measured with the previous (PyTorch) prefill attention:
 
 | FP8, `max_model_len` 4096 | Prompt tokens (cached) | TTFT |
 |---|---|---|
@@ -462,6 +539,15 @@ On 0.24 with a BF16 KV cache (640k-token pool, block 32, no decode buckets) TTFT
 the previous PyTorch prefill attention, `max_model_len` was limited to about 32k and a 30k
 prompt took 24.5 s.
 
+On Model Runner V2 with MTP 2 (`VLLM_USE_V2_MODEL_RUNNER=1`, same configuration):
+
+| Prompt tokens | TTFT | TPOT | Passkey retrieval |
+|---|---|---|---|
+| 1,000 | | 8.95 ms | |
+| 26,936 | 11.1 s | | correct at depths 0.25, 0.75 |
+| 105,656 | 52.5 s | | correct at depths 0.25, 0.75 |
+| 220,856 | 139 s | | correct at depths 0.25, 0.75 |
+
 ### Concurrent requests
 
 Recommended 262k configuration (`MAX_NUM_SEQS=4`), 1,000-token prompts, 512 output tokens,
@@ -481,6 +567,22 @@ stalls for at most 0.55 s between tokens (1024-token chunks) instead of the whol
 
 Throughput configuration on 0.24 (`MAX_MODEL_LEN=65536`, `MAX_NUM_SEQS=8`): 8 concurrent requests,
 1,000-token prompts, 512 output tokens: 318 output tokens/s aggregate, TPOT 18.8-24.1 ms.
+
+### Model Runner V1 and V2
+
+Same configuration on both runners: FP8 weights and FP8 KV, MTP 2, `MAX_MODEL_LEN=65536`,
+`DECODE_CTX_BUCKETS="16384"`, `MAX_NUM_SEQS=8`, `DECODE_INTERLEAVE=1`, `GPU_MEM_UTIL=0.95`,
+`KV_CAP_FRACTION=0.48`:
+
+| | Model Runner V1 | Model Runner V2 |
+|---|---|---|
+| GSM8K, concurrency 8 | 95.9% (1,319 questions) | 96.5% (first 400 questions) |
+| Aggregate output tokens/s, 8 concurrent requests | 295 | 294 |
+| TPOT, batch 1 | 8.8-9.8 ms | 9.0-9.5 ms |
+| TTFT, short prompt | 406 ms | 399 ms |
+| MTP acceptance (tokens per step) | 2.84 | 2.81 |
+
+For Aider Polyglot on V2 see [Results](#results).
 
 ## Accuracy
 
@@ -534,6 +636,33 @@ through the Hugging Face BF16 model on CPU at the divergent position before call
 corruption: a divergence where BF16 also rates both tokens as near-equal is FP8 noise, a
 token BF16 gives near-zero probability is a bug.
 
+### Stress validation
+
+`examples/vllm_neuron/models/qwen3_5/stress/` holds the harness used against running servers
+(Qwen3.5-2B and Qwen3.8-27B, V1 and V2, with and without MTP, prefix caching and decode steps
+between prefill chunks):
+
+- Greedy concurrency against sequential runs (`stress.py ref` / `consistency`,
+  `nearmax_random.py`): every request's output under concurrency is compared with its own
+  sequential output, and each divergence is classified by teacher forcing the sequential
+  prefix (a near-tie, or a token the model rates far below the top token);
+  `hf_ref_pos.py` checks a divergent position against the Hugging Face BF16 model on CPU.
+- Chaos (`stress.py chaos`): client aborts, mixed sampling parameters, `logprobs`, `n > 1`
+  and per-request seeds in one load; the server must stay up, every completed request must
+  be well formed, and a greedy re-check afterwards must match the reference.
+- Randomized tests near `max_model_len` and mid-sequence (`nearmax_random.py`, `--mid`):
+  requests running into `max_model_len` next to mid-sequence requests and short arrivals.
+- Prefix caching (`apc_test.py`): shared multi-block prefixes sent sequentially,
+  concurrently and repeated, compared with the outputs of a server without prefix caching,
+  and the cold and warm TTFT.
+- GSM8K (`stress.py gsm8k`) and a long-thinking probe on an Aider exercise
+  (`bookstore_probe.py`). `srv.sh` starts, waits for and stops `serve.sh`.
+
+NKI-simulator tests (`test/unit/model/qwen3_5/test_verify_causality_sim.py`, `RUN_NKI_SIM=1`)
+check that one MTP verify step of `S = 3` tokens equals three `S = 1` decode steps per layer
+(attention, GDN FP8 and BF16), and that later tokens of a verify row never change earlier
+tokens' outputs or state pages.
+
 ## Aider Polyglot
 
 [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark) (225 Exercism exercises in
@@ -574,14 +703,40 @@ rest of the context.
 
 | Run | Pass rate, 2 tries | First try | Well-formed responses | Exhausted context windows | Client timeouts |
 |---|---|---|---|---|---|
-| 2026-10-19 (3600 s request timeout) | **71.1%** | 33.8% | 82.7% (46 malformed) | 7 | 1 |
-| 2026-10-14 to 2026-10-16 (default timeout) | **73.8%** | 30.2% | 97.3% (6 malformed) | 3 | 196 |
+| Model Runner V2, plugin 0.29 fork | **74.7%** | 32.0% | 99.1% | 3 | 0 |
+| Model Runner V2 with prefix caching, plugin 0.29 fork | **71.1%** | 28.4% | 98.7% | 10 (6 exercises) | |
+| Model Runner V1, plugin 0.24, 2026-10-19 (3600 s request timeout) | **71.1%** | 33.8% | 82.7% (46 malformed) | 7 | 1 |
+| Model Runner V1, plugin 0.24, 2026-10-14 to 2026-10-16 (default timeout) | **73.8%** | 30.2% | 97.3% (6 malformed) | 3 | 196 |
 
-Both runs used plugin 0.24.0.1.1.0 and the throughput configuration above. With the longer
-timeout the client no longer abandoned long thinking responses. The second run had more
-malformed edit blocks; the 2.7-point difference in the 2-try score is about one standard error at 225 exercises.
+All runs used the throughput configuration above (FP8 weights and FP8 KV, MTP 2,
+`MAX_MODEL_LEN=65536`, `MAX_NUM_SEQS=8`, `DECODE_CTX_BUCKETS="16384"`, `DECODE_INTERLEAVE=1`,
+`GPU_MEM_UTIL=0.95`, `KV_CAP_FRACTION=0.48`) and Aider commit `5dc9490`; the V2 runs used SDK 2.33 and the 3600 s
+request timeout, with Aider's default thinking effort (`xhigh`). With the longer timeout the client
+no longer abandoned long thinking responses. The second V1 run had more malformed edit blocks;
+the 2.7-point difference in the 2-try score between the V1 runs is about one standard error at
+225 exercises.
 
-First run in detail, 2026-10-14 to 2026-10-16 (Aider 0.86.3.dev, commit `5dc9490`; the throughput
+Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`), without and with prefix caching
+(`PREFIX_CACHING=1`):
+
+| | Without prefix caching | With prefix caching |
+|---|---|---|
+| Pass rate, 2 tries | **74.7%** (168 / 225) | **71.1%** (160 / 225) |
+| Pass rate, first try | 32.0% | 28.4% |
+| Well-formed responses | 99.1% | 98.7% |
+| Exhausted context windows | 3 | 10 (6 exercises) |
+| Client timeouts | 0 | |
+| Prompt / completion tokens | 3.03M / 4.30M | 3.43M / 3.45M |
+| Wall time | 4 h 57 min | 4 h 16 min |
+| Generation throughput | about 280 tokens/s | about 269 tokens/s |
+| MTP acceptance (tokens per step) | 2.53 | 2.52 |
+| Prefix cache hit rate | | 5.4% |
+
+Per language without prefix caching (2 tries): JavaScript 83.7%, Python 79.4%, C++ 73.1%,
+Java 70.2%, Rust 70.0%, Go 69.2%. The two V2 runs differ on 16 exercises one way and 24 the
+other (McNemar p = 0.27): the 3.6-point difference is not significant.
+
+First V1 run in detail, 2026-10-14 to 2026-10-16 (Aider 0.86.3.dev, commit `5dc9490`; the throughput
 configuration above; diff edit format, 2 tries, 8 threads):
 
 | | |
@@ -629,20 +784,22 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
   kernel time at long prefixes.
 - **Decode above the largest decode context bucket** reads the whole `max_model_len` of KV;
   each bucket adds compiled decode graphs.
-- **BF16 decode at batch > 1** uses the PyTorch GDN path (the fused BF16 GDN kernel is
-  single-request); use FP8 for batched serving.
+- **The batched BF16 GDN decode kernel** needs the key heads to split evenly over the two
+  programs of a logical core (Qwen3.5-2B at TP=2, Qwen3.5-35B-A3B and Qwen3.8-27B at TP=4);
+  other head counts run batched BF16 steps on the PyTorch GDN path.
 - **vLLM allocates state blocks in the shared KV pool** that the dedicated state pool does
   not use: `3 (1 + k)` blocks per request, each now one 256-token attention block.
 - **Packed FP8 KV (`fp8_packed_kv`) is not supported**: the library decode kernel reads the
   packed layout only at `head_dim` <= 128.
-- **Prefix caching** on V1 is not combined with MTP and has not been re-validated since the
-  segmented prefill kernel replaced the PyTorch prefill attention. On V2 (with or without
-  MTP) it is validated on CPU only.
+- **Prefix caching on V1** is not combined with MTP and has not been re-validated since the
+  segmented prefill kernel replaced the PyTorch prefill attention. Use Model Runner V2 for
+  prefix caching with MTP or with a large KV pool.
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
-- **Model Runner V2 is opt-in** (`VLLM_USE_V2_MODEL_RUNNER=1`): hybrid state and MTP run on V2
-  only when forced, also with prefix caching and `DECODE_CTX_BUCKETS`; the MoE checkpoint and
-  prefix caching on V2 are validated on CPU only.
+- **Model Runner V2 is opt-in** (`VLLM_USE_V2_MODEL_RUNNER=1`): hybrid models run on V1
+  unless V2 is forced.
+- **Prefix caching hits are one block shorter with MTP** (V2): vLLM drops the last matched
+  block of a hit for EAGLE-style drafters, 2048 tokens with FP8 KV.
 - **MTP with synchronous scheduling (`ASYNC_SCHEDULING=0`) can corrupt outputs near
   `max_model_len`** on V1: requests that run into `max_model_len` next to other requests may
   emit wrong tokens in their last steps. This predates the fixes in this recipe and is not
@@ -658,10 +815,9 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
   request's generator.
 - **MTP supports at most 2 draft tokens**. With 3 draft tokens the verify pass produced
   invalid indices; this is not resolved.
-- **Qwen3.5-35B-A3B (MoE) is validated on CPU only** (HF parity of the MoE block and of the
-  whole model on a small random checkpoint, through the plugin's PyTorch fallbacks of the MoE
-  ops); BF16 experts only, and the MTP layer's experts are read from per-expert checkpoint
-  tensors.
+- **Qwen3.5-35B-A3B (MoE) is BF16 only** (static-FP8 calibration covers the dense MLP), and
+  the MTP layer's experts are read from per-expert checkpoint tensors. Larger MoE checkpoints
+  are not covered here (see [Related work](#related-work)).
 - **Device profiles of prefill graphs are incomplete**: the runtime drops profiler
   notifications for graphs of this size, so per-layer prefill breakdowns are not available yet.
 
@@ -691,6 +847,11 @@ instructions, and the difference persists with this implementation compiled the 
 blocked inversion after finding it unstable on device. The intent is to converge with #54
 rather than to propose a competing implementation.
 
+[vllm-project/vllm-neuron#68](https://github.com/vllm-project/vllm-neuron/pull/68) adds
+contrib Qwen3.5 models, including the sparse MoE checkpoints up to Qwen3.5-397B-A17B. The
+MoE FFN here is derived from its MoE block (see
+[Sparse MoE](#sparse-moe-qwen35-35b-a3b)); both register `Qwen3_5ForConditionalGeneration`.
+
 ## Roadmap
 
 Done:
@@ -711,6 +872,10 @@ Done:
 - `logprobs` with MTP and with asynchronous scheduling.
 - Stress testing of concurrent, aborted and near-`max_model_len` requests with MTP and
   asynchronous scheduling, with the fixes it found; GSM8K 95.9% (FP8, MTP 2, concurrency 8).
+- Model Runner V2 (opt-in): hybrid state, MTP, decode context-length buckets and prefix
+  caching with and without MTP, on par with V1 in the throughput configuration; Aider
+  Polyglot 74.7% (71.1% with prefix caching).
+- Qwen3.5-35B-A3B (sparse MoE, BF16) on V1 and V2, and the batched BF16 GDN decode kernel.
 
 Next:
 
@@ -719,14 +884,11 @@ Next:
    efficiency at long prefixes (about 20% of peak; loading K/V once per query head is not the
    bottleneck); a DMA-transpose load for FP8 K; the native route's core-synchronization waits.
 2. **Aider Polyglot** at long context.
-3. **KV pool**: no state blocks in the shared pool without prefix caching; device validation
-   of V2 prefix caching (dedicated running-state pool, checkpoints in the KV pool); re-validate
-   V1 prefix caching with the segmented prefill kernel.
+3. **KV pool**: no state blocks in the shared pool without prefix caching; re-validate V1
+   prefix caching with the segmented prefill kernel.
 4. **FP8**: calibrated KV-cache scales, and accuracy-driven selection of layers kept in BF16.
-5. **MTP**: prefix caching together with MTP on device (V2), more than 2 draft tokens, and FP8
-   for the draft's `lm_head`.
-6. **Model Runner V2** together with MTP: device parity runs (Qwen3.8-27B, Qwen3.5-35B-A3B)
-   before V2 becomes the default.
+5. **MTP**: more than 2 draft tokens, and FP8 for the draft's `lm_head`.
+6. **Model Runner V2** as the default for hybrid models; FP8 for the MoE experts.
 7. **End-to-end benchmark suite**: accuracy and serving benchmarks against the Hugging Face
    reference and #54, plus latency and throughput sweeps over context length and batch size.
 
