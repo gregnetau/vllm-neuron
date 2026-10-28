@@ -30,8 +30,13 @@ from vllm_neuron.model.state_cache import (
 # the decode attention kernels need that to be a multiple of 128.
 STATE_PAGE_ALIGN_TOKENS = 256
 
-# Manager blocks cleared per call of the compiled KV-clearing graph (fixed shape: one compile).
+# Manager blocks cleared per call of the compiled KV-clearing graphs (fixed shapes, one compile
+# each): small chunks for the few blocks of a decode step, large ones for a long prompt.
 KV_CLEAR_CHUNK = 8
+KV_CLEAR_CHUNK_LARGE = 256
+# Clearing calls submitted before the clearer waits for them: the runtime's execution queue
+# holds a bounded number of in-flight graph executions ("Execution Queue Full").
+KV_CLEAR_MAX_INFLIGHT = 32
 
 
 def state_page_align_pages(kernel_block: int) -> int:
@@ -216,9 +221,11 @@ class KVBlockClearer:
     """Clear attention KV blocks when the scheduler allocates them.
 
     Block ids are global across KV groups, so a block can previously have held float32
-    state, which reads as NaN/Inf in bf16 (the decode kernel reads whole blocks). One small
-    compiled graph zeroes ``KV_CLEAR_CHUNK`` manager blocks of every attention layer per
-    call, in place.
+    state, which reads as NaN/Inf in bf16 (the decode kernel reads whole blocks). Two small
+    compiled graphs zero ``KV_CLEAR_CHUNK`` or ``KV_CLEAR_CHUNK_LARGE`` manager blocks of
+    every attention layer per call, in place: a long prompt with 32-token blocks allocates
+    thousands of blocks in one step. The clearer waits for its submissions every
+    ``KV_CLEAR_MAX_INFLIGHT`` calls, so a step never overflows the runtime's queue.
 
     Args:
         caches: Every attention K and V cache tensor ``[num_kernel_blocks, ...]``.
@@ -240,15 +247,33 @@ class KVBlockClearer:
         self.zero_fn = compile_zero_kv_blocks() if zero_fn is None else zero_fn
 
     def clear_blocks(self, manager_blocks: list[int]) -> None:
-        """Zero the given manager blocks (chunks padded with the null block 0)."""
+        """Zero the given manager blocks (chunks padded with the null block 0).
+
+        Large chunks while more than a few small chunks' worth remains, then small ones.
+        """
         ratio = self.ratio
-        for start in range(0, len(manager_blocks), KV_CLEAR_CHUNK):
-            chunk = list(manager_blocks[start : start + KV_CLEAR_CHUNK])
-            chunk = chunk + [0] * (KV_CLEAR_CHUNK - len(chunk))
+        blocks = list(manager_blocks)
+        pending = []
+        start = 0
+        while start < len(blocks):
+            remaining = len(blocks) - start
+            size = (
+                KV_CLEAR_CHUNK_LARGE
+                if remaining > 4 * KV_CLEAR_CHUNK
+                else KV_CLEAR_CHUNK
+            )
+            chunk = blocks[start : start + size]
+            chunk = chunk + [0] * (size - len(chunk))
+            start += size
             kernel_blocks = (
                 torch.tensor(chunk)[:, None] * ratio + torch.arange(ratio)
             ).reshape(-1)
-            self.zero_fn(self.caches, kernel_blocks.to(self.device))
+            pending.append(self.zero_fn(self.caches, kernel_blocks.to(self.device)))
+            if len(pending) >= KV_CLEAR_MAX_INFLIGHT:
+                for out in pending:  # wait for the submitted clears
+                    if torch.is_tensor(out):
+                        out.cpu()
+                pending.clear()
 
     def clear(self, block_ids: Iterable[int] | None) -> None:
         """Zero newly allocated blocks (``SchedulerOutput.new_block_ids_to_zero``); the null
@@ -259,6 +284,7 @@ class KVBlockClearer:
             self.clear_blocks(sorted(blocks))
 
     def warm_up(self) -> None:
-        """Compile the graph (clears the null block). Call after model warmup: executing on
-        device earlier would precede the parallel-trace forks."""
+        """Compile both graphs (they clear the null block). Call after model warmup:
+        executing on device earlier would precede the parallel-trace forks."""
         self.clear_blocks([0])
+        self.clear_blocks([0] * (4 * KV_CLEAR_CHUNK + 1))
