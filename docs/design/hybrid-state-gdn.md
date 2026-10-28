@@ -186,7 +186,8 @@ parameters. Two device issues were specific to batches:
 With `decode_context_length_buckets`, the runner trims each attention group's block table to
 the bucket's block count. The GDN groups' tables (`1 + k` state blocks, block size as large as
 `max_model_len`) are not trimmed: they do not grow with the context, and warmup compiles them
-whole.
+whole. Model Runner V2 does the same (with or without MTP; see
+[MRv2 speculative decoding](speculation/mrv2-spec-decode.md#decode-context-length-buckets)).
 
 ## Full-attention prefill
 

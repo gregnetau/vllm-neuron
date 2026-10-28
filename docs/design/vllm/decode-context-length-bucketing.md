@@ -123,6 +123,16 @@ The `decode_context_length_buckets` list, when set, must satisfy:
 2. Every value strictly less than `max_model_len`. Equality is redundant — the `max_model_len` fallback NEFF is always compiled.
 3. Every value divisible by `P_MAX = 128`. This is the NKI attention kernel's tile-size constraint; the same constant the SWA helper rounds to.
 
+### Model Runner V2
+
+Model Runner V2 serves `decode_context_length_buckets` for models with recurrent state
+(Qwen3.5 / Qwen3.8 hybrids), with and without MTP: one decode graph per
+`(num_seqs bucket, ctx bucket)`, the MTP verify graph included (the draft head runs inside
+it, so there is no separate draft family), headroom `1` without and `2k` with MTP, and the
+same head trim of the attention groups only. Other models keep V1 for it, and expert
+parallelism across DP ranks is not supported (no cross-DP bucket sync on V2). See
+[MRv2 speculative decoding](../speculation/mrv2-spec-decode.md#decode-context-length-buckets).
+
 ## User-facing knob
 
 See `additional-config` for the full `decode_context_length_buckets` option reference and configuration examples.

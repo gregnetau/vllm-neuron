@@ -55,7 +55,7 @@ class _SpecModel:
         pass
 
 
-def _runner():
+def _runner(max_model_len=MAX_MODEL_LEN, decode_ctx_buckets=None):
     from vllm_neuron.vllm.worker.neuron_model_runner_v2 import NeuronModelRunnerV2
     from vllm_neuron.vllm.worker.neuron_request_state import NeuronRequestState
 
@@ -66,7 +66,7 @@ def _runner():
         model_config=SimpleNamespace(dtype=torch.float32),
     )
     runner.model = _SpecModel()
-    runner.max_num_reqs, runner.max_model_len = MAX_REQS, MAX_MODEL_LEN
+    runner.max_num_reqs, runner.max_model_len = MAX_REQS, max_model_len
     runner.neuron_config = SimpleNamespace(
         fp8_packed_kv=False, num_batched_tokens_buckets=[BUCKET]
     )
@@ -74,6 +74,7 @@ def _runner():
     runner.kv_segment_size = 512
     runner._has_state_layers = True
     runner.num_speculative_tokens = 0
+    runner.decode_ctx_buckets, runner.decode_ctx_headroom = decode_ctx_buckets, 1
     runner.draft_model = None
     runner._state_real_pages = {}
     runner._kv_cache_config = None
@@ -83,7 +84,7 @@ def _runner():
     runner._next_token_by_slot = torch.zeros(MAX_REQS, 1, dtype=torch.int32)
     runner.request_state = NeuronRequestState(
         max_num_reqs=MAX_REQS,
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
         vocab_size=128,
         device=runner.device,
         block_sizes=[BLOCK],
@@ -91,7 +92,7 @@ def _runner():
     return runner
 
 
-def _build_steps(prompts, plan):
+def _build_steps(prompts, plan, max_model_len=MAX_MODEL_LEN, decode_ctx_buckets=None):
     """Phase A: run the plan through vLLM's KV cache manager and the V2 runner."""
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
@@ -102,7 +103,7 @@ def _build_steps(prompts, plan):
     )
     from vllm.v1.request import Request
 
-    runner = _runner()
+    runner = _runner(max_model_len, decode_ctx_buckets)
     vllm_config = VllmConfig()
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     groups = get_kv_cache_groups(vllm_config, runner.get_kv_cache_spec())
@@ -113,9 +114,9 @@ def _build_steps(prompts, plan):
     runner.initialize_kv_cache(config)
     manager = KVCacheManager(
         config,
-        max_model_len=MAX_MODEL_LEN,
-        scheduler_block_size=MAX_MODEL_LEN,
-        hash_block_size=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
+        scheduler_block_size=max_model_len,
+        hash_block_size=max_model_len,
         enable_caching=False,
     )
     requests = {
@@ -311,6 +312,14 @@ def test_v2_inputs_match_hf_through_interleaved_chunked_prefills(moe):
         {"b": 1, "a": 1},  # other row order
     ]
     runner, steps = _build_steps(prompts, plan)
+    state_rows = _check_steps_against_hf(runner, steps, prompts, plan, moe)
+    # Slots 0 and 1 own pool pages 1 and 2 across every step; padded rows are -1.
+    assert state_rows == [[1], [2], [1], [1], [2], [1, 2, -1, -1], [2, 1, -1, -1]]
+
+
+def _check_steps_against_hf(runner, steps, prompts, plan, moe):
+    """Phase B: run every step's inputs through the Qwen3.5 module; each sampled row's
+    logits must equal the HF model's. Returns each step's state-pool rows."""
     hf_model, model = _hf_and_model(moe)
     model.bind_kv_cache(runner.kv_caches)
     model.bind_state_cache(runner.state_caches)
@@ -351,5 +360,63 @@ def test_v2_inputs_match_hf_through_interleaved_chunked_prefills(moe):
         state_rows.append(
             md["layers.0.linear_attn"]["block_table_tensor"][:, 0].tolist()
         )
-    # Slots 0 and 1 own pool pages 1 and 2 across every step; padded rows are -1.
-    assert state_rows == [[1], [2], [1], [1], [2], [1, 2, -1, -1], [2, 1, -1, -1]]
+    return state_rows
+
+
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_v2_decode_ctx_buckets_match_hf_across_bucket_boundaries(moe):
+    """Decode context-length buckets [128, 256] with max_model_len 384: a request decodes
+    across the 128 boundary next to a short one (the long row picks the bucket of the
+    whole batch), the short one decodes alone in the small bucket again, and attention
+    reads only the trimmed table, so a bucket too small would miss keys and diverge
+    from HF."""
+    torch.manual_seed(5)
+    max_model_len, buckets = 384, [128, 256]
+    prompts = {
+        "a": torch.randint(1, 128, (125,)).tolist(),
+        "b": torch.randint(1, 128, (20,)).tolist(),
+    }
+    plan = [
+        {"a": 32},
+        {"a": 32},
+        {"a": 32},
+        {"a": 29},  # a's last chunk: 125 computed
+        {"b": 20},
+        {"a": 1, "b": 1},  # a at 125
+        {"b": 1, "a": 1},  # a at 126
+        {"a": 1, "b": 1},  # a at 127: the last position of the 128 bucket
+        {"a": 1, "b": 1},  # a at 128: the 256 bucket, for b's row too
+        {"b": 1},  # b alone: back to 128
+        {"a": 1},  # a alone at 129
+    ]
+    runner, steps = _build_steps(prompts, plan, max_model_len, buckets)
+    attn_groups = [
+        g for g in range(len(runner.block_sizes)) if g not in runner._state_groups
+    ]
+    state_group = min(runner._state_groups)
+    full_width = runner.request_state.block_table(attn_groups[0]).shape[1]
+    assert full_width == 24  # ceil(384 / 16)
+    state_width = runner.request_state.block_table(state_group).shape[1]
+    seen = []
+    for model_input, md, order in steps:
+        attn_table = md[f"layers.{ATTN_LAYERS[0]}.self_attn"]["block_table_tensor"]
+        state_table = md["layers.0.linear_attn"]["block_table_tensor"]
+        assert state_table.shape[1] == state_width  # never trimmed
+        if model_input.is_prefill:
+            # Prefill keeps the full table and has no bucket.
+            assert model_input.decode_ctx_bucket is None
+            assert attn_table.shape[1] == full_width
+            continue
+        # Every attention group is trimmed alike.
+        for g in attn_groups:
+            assert model_input.block_tables[g].shape == attn_table.shape
+        seen.append((model_input.decode_ctx_bucket, attn_table.shape[1], tuple(order)))
+    assert seen == [
+        (128, 8, ("a", "b")),
+        (128, 8, ("b", "a")),
+        (128, 8, ("a", "b")),
+        (256, 16, ("a", "b")),
+        (128, 8, ("b",)),
+        (256, 16, ("a",)),
+    ]
+    _check_steps_against_hf(runner, steps, prompts, plan, moe)

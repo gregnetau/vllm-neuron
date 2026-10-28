@@ -45,6 +45,9 @@ __all__ = [
     "build_swa_kernel_block_rows",
     "build_slot_mapping",
     "compute_slot_mapping_cpu",
+    "decode_ctx_headroom",
+    "select_decode_ctx_bucket",
+    "decode_ctx_num_blocks",
 ]
 
 
@@ -95,6 +98,10 @@ class NeuronModelInput:
     # per row (1 + k). Other steps: None and 1.
     num_draft_by_row: torch.Tensor | None = None
     spec_width: int = 1
+    # Decode steps with decode context-length buckets: the selected bucket (a
+    # configured one or max_model_len); the attention groups' block tables are
+    # trimmed to it. None for prefill and without buckets.
+    decode_ctx_bucket: int | None = None
 
 
 def build_flat_positions(
@@ -267,6 +274,7 @@ def build_kernel_block_rows(
     idx_mapping_np: np.ndarray,
     padded_num_reqs: int,
     *,
+    num_columns: int | None = None,
     output_device: torch.device | None = None,
 ) -> torch.Tensor:
     """Build batch-ordered attention-kernel block rows.
@@ -275,23 +283,37 @@ def build_kernel_block_rows(
     ``PAD_SLOT_ID`` so the kernel skips inactive slots. Preserve block ID zero
     inside valid prefixes. Fill all padded rows with the sentinel.
 
+    ``num_columns`` keeps only the first columns of each row (a head trim, for
+    decode context-length buckets): the kernel then reads only the KV of the
+    positions below ``num_columns * block_size``, with absolute positions. Blocks
+    a row holds past the trim are dropped from the kernel table; KV writes still
+    resolve through the untrimmed rows (:func:`gather_block_rows_raw`).
+
     Args:
         state: State that owns the block table.
         group: KV-cache group index.
         idx_mapping_np: ``[num_active]`` stable slots in scheduler order.
         padded_num_reqs: Compiled batch width.
+        num_columns: Optional trimmed width, at most the row width. ``None``
+            keeps the whole row.
         output_device: Device for the returned tensor. Defaults to
             ``state.device``.
 
     Returns:
         An int32 tensor on the selected device with shape
-        ``[padded_num_reqs, block_row_width]``.
+        ``[padded_num_reqs, num_columns or block_row_width]``.
 
     Raises:
-        AssertionError: If active rows exceed the padded batch width.
+        AssertionError: If active rows exceed the padded batch width or
+            ``num_columns`` is not in ``1 .. block_row_width``.
     """
     table = state.block_table(group)
     width = table.shape[1]
+    if num_columns is not None:
+        assert 0 < num_columns <= width, (
+            f"trimmed width {num_columns} not in 1 .. {width} (group {group})"
+        )
+        width = num_columns
     out = np.full((padded_num_reqs, width), PAD_SLOT_ID, dtype=np.int32)
     num_active = idx_mapping_np.shape[0]
     assert num_active <= padded_num_reqs, (
@@ -299,7 +321,7 @@ def build_kernel_block_rows(
     )
     for row in range(num_active):
         slot = int(idx_mapping_np[row])
-        n = state.num_blocks(group, slot)
+        n = min(state.num_blocks(group, slot), width)
         if n:
             out[row, :n] = table[
                 slot, :n
@@ -504,3 +526,72 @@ def build_swa_kernel_block_rows(
         torch.from_numpy(out).to(device),
         torch.from_numpy(offsets).to(device),
     )
+
+
+def decode_ctx_headroom(num_speculative_tokens: int) -> int:
+    """Return the positions past a row's computed count that one decode step touches.
+
+    A plain decode step writes and attends one token (``1``). A speculative step
+    verifies ``1 + k`` tokens, and the in-graph MTP head then runs ``k - 1`` more
+    draft steps, each one position further than the last accepted token, which is at
+    most ``num_computed + k``: the step touches positions up to
+    ``num_computed + 2k - 1``, so ``2k`` (the V1 runner's Eagle headroom).
+
+    Args:
+        num_speculative_tokens: Drafts per request and step, ``k`` (0 without
+            speculative decoding).
+
+    Returns:
+        ``max(1, 2 * k)``.
+    """
+    return max(1, 2 * num_speculative_tokens)
+
+
+def select_decode_ctx_bucket(
+    max_num_computed: int,
+    headroom: int,
+    buckets: list[int],
+    max_model_len: int,
+) -> int:
+    """Return the smallest decode context-length bucket that covers a decode step.
+
+    The step reads and writes positions below ``max_num_computed + headroom``
+    (:func:`decode_ctx_headroom`), so the bucket is the smallest of
+    ``buckets + [max_model_len]`` at least that large; ``max_model_len`` (the full
+    block table) when none is.
+
+    Args:
+        max_num_computed: Largest computed-token count of the step's rows (under
+            async scheduling the scheduler's count, an upper bound of the device
+            count). Zero for a step without rows.
+        headroom: Positions past the computed count the step touches.
+        buckets: Validated ascending buckets, each below ``max_model_len``.
+        max_model_len: The fallback bucket.
+
+    Returns:
+        The selected bucket, in ``buckets`` or ``max_model_len``.
+    """
+    needed = max_num_computed + headroom
+    for bucket in buckets:
+        if needed <= bucket:
+            return bucket
+    return max_model_len
+
+
+def decode_ctx_num_blocks(ctx_bucket: int, block_size: int, row_width: int) -> int:
+    """Return the kernel block-table width of an attention group for a context bucket.
+
+    ``ceil(ctx_bucket / block_size)`` blocks, at most the group's block-row width.
+    Warmup and serving both size the compiled block table with this function; the
+    runner does not trim for the ``max_model_len`` fallback bucket, whose graph keeps
+    the whole (aligned) row, the same graph as without context-length buckets.
+
+    Args:
+        ctx_bucket: Decode context-length bucket in tokens.
+        block_size: The group's kernel block size.
+        row_width: The group's block-row width (:func:`block_row_width`).
+
+    Returns:
+        The trimmed width.
+    """
+    return min(-(-ctx_bucket // block_size), row_width)

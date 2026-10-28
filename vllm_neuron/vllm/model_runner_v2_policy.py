@@ -405,7 +405,17 @@ def get_neuron_model_runner_v2_policy(
         unsupported.append("malformed neuron_config")
     neuron_cfg = _neuron_config_dict(vllm_config)
     if neuron_cfg.get("decode_context_length_buckets") is not None:
-        unsupported.append("decode context-length bucketing")
+        # V2 trims the attention block tables per decode context bucket for models
+        # with recurrent state (with or without MTP), but does not synchronize the
+        # bucket across DP ranks whose graphs share collectives (EP with DP).
+        if not recurrent_state:
+            unsupported.append("decode context-length bucketing")
+        elif _parallel_degree(parallel_config, "data_parallel_size") > 1 and getattr(
+            parallel_config, "enable_expert_parallel", False
+        ):
+            unsupported.append(
+                "decode context-length bucketing with expert and data parallelism"
+            )
 
     # MRv2 supports dense, non-speculative disaggregated inference with tensor
     # parallelism. Connector compatibility is validated during KV transfer
