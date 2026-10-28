@@ -620,13 +620,14 @@ class NeuronPlatform(Platform):
         """Pick the scheduling mode for models with host inputs (interfaces.HasHostInputs).
 
         The host builds these inputs from the true current tokens every step. Under async
-        scheduling the V1 runner prepares each step ahead and joins on the previous step's
-        sampled tokens right before the forward (``NeuronModelRunner._host_input_join``).
-        The join covers non-speculative decoding only. So async scheduling is turned off
-        when speculative decoding is configured, or when VLLM_NEURON_HOST_INPUTS_ASYNC=0.
-        VllmConfig resolves ``async_scheduling`` (None -> True) before this hook runs, so
-        set it here; the scheduler class choice below then picks the synchronous
-        NeuronScheduler.
+        scheduling the runner prepares each step ahead and joins on the earlier steps'
+        sampled tokens right before the forward (``NeuronModelRunner._host_input_join``,
+        ``NeuronModelRunnerV2._host_input_join``). The V1 join covers non-speculative
+        decoding only; the V2 join also reads back each slot's drafts, so it covers
+        verify steps too. So async scheduling is turned off when speculative decoding is
+        configured on V1, or when VLLM_NEURON_HOST_INPUTS_ASYNC=0. VllmConfig resolves
+        ``async_scheduling`` (None -> True) before this hook runs, so set it here; the
+        scheduler class choice below then picks the synchronous NeuronScheduler.
         """
         from vllm_neuron import envs
         from vllm_neuron.model.interfaces import HasHostInputs
@@ -636,7 +637,9 @@ class NeuronPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         if not scheduler_config.async_scheduling:
             return
-        if vllm_config.speculative_config is not None:
+        # check_and_update_config caches the runner decision before this hook.
+        on_v2 = vars(vllm_config).get("use_v2_model_runner") is True
+        if vllm_config.speculative_config is not None and not on_v2:
             reason = "speculative decoding is configured"
         elif not envs.VLLM_NEURON_HOST_INPUTS_ASYNC:
             reason = "VLLM_NEURON_HOST_INPUTS_ASYNC=0"

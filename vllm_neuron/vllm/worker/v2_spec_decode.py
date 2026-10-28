@@ -26,7 +26,15 @@ logger = logging.getLogger(__name__)
 # Speculative methods V2 serves, each with the target architectures it is validated
 # for. Everything else stays on V1 (model_runner_v2_policy).
 V2_SPEC_DECODE_METHODS: dict[str, frozenset[str]] = {
-    "mtp": frozenset({"Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"}),
+    "mtp": frozenset(
+        {
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            # Qwen3.8-Flash-Next: the Qwen4ExpMTP head has the same fused draft forward.
+            "Qwen4ExpForCausalLM",
+            "Qwen4ExpForConditionalGeneration",
+        }
+    ),
 }
 
 # Rejection methods the in-graph fixed-layout sampler implements.

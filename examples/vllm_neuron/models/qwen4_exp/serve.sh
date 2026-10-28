@@ -9,6 +9,8 @@
 #   # MTP speculative decoding with 2 draft tokens, for single-request latency (GPU_MEM_UTIL
 #   # stays at its default of 0.82; 0.83 and up run out of device memory with 2 draft tokens):
 #   MODEL=... MTP_TOKENS=2 examples/vllm_neuron/models/qwen4_exp/serve.sh
+#   # Model Runner V2 (opt-in; the same knobs, async scheduling also with MTP):
+#   MODEL=... RUNNER=v2 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #
 # Knobs:
 #   MAX_MODEL_LEN (default 65536), MAX_NUM_SEQS (8), PREFILL_BUCKETS ("1024, 4096": short prompts
@@ -16,7 +18,9 @@
 #   DECODE_CTX_BUCKETS ("4096, 16384, 32768": decode reads only the bucket's KV; MAX_MODEL_LEN is
 #   the implicit last one), GPU_MEM_UTIL (0.82: 16.5 GiB weights + ~3.2 GiB KV per 24 GiB core; the QSA indexer views share the KV pool and the graph I/O check NCC_EVRF009 counts it twice), KV_CAP_FRACTION (0.5), SERVED_MODEL_NAME
 #   (qwen3.8-flash-next), MTP_TOKENS (unset; 1 or 2: MTP draft tokens, which turns async scheduling
-#   off and is faster at batch 1 only, see the recipe).
+#   off on V1 and is faster at batch 1 only, see the recipe), RUNNER (v1 default, or v2: Model
+#   Runner V2, which runs every prefill with the first KV segment size, so only that one is
+#   passed).
 #
 # The n-gram embedding rows are built on the host from the sampled tokens every step
 # (HasHostInputs); async scheduling joins on the sampled tokens before each step (host-token join).
@@ -38,9 +42,16 @@ export VLLM_NEURON_BACKEND=${BACKEND:-${VLLM_NEURON_BACKEND:-vllm_neuron}}
 export NEURON_LIBTORCH_COMPILATION_TIMEOUT=${NEURON_LIBTORCH_COMPILATION_TIMEOUT:-3600}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP_FRACTION:-0.5}
 
+KV_SEGMENT_BUCKETS=${PREFILL_BUCKETS}
+case "${RUNNER:-v1}" in
+  v1) ;;
+  v2) export VLLM_USE_V2_MODEL_RUNNER=1; KV_SEGMENT_BUCKETS=${PREFILL_BUCKETS%%,*} ;;
+  *) echo "RUNNER must be v1 or v2, got ${RUNNER}" >&2; exit 1 ;;
+esac
+
 NEURON_CONFIG="\"quantization\": \"fp8\""
 NEURON_CONFIG="${NEURON_CONFIG}, \"num_batched_tokens_buckets\": [${PREFILL_BUCKETS}]"
-NEURON_CONFIG="${NEURON_CONFIG}, \"kv_segment_size_buckets\": [${PREFILL_BUCKETS}]"
+NEURON_CONFIG="${NEURON_CONFIG}, \"kv_segment_size_buckets\": [${KV_SEGMENT_BUCKETS}]"
 NEURON_CONFIG="${NEURON_CONFIG}, \"num_seqs_buckets\": [${SEQS_BUCKETS:-1, ${MAX_NUM_SEQS}}]"
 if [[ -n "${DECODE_CTX_BUCKETS:-}" ]]; then
   NEURON_CONFIG="${NEURON_CONFIG}, \"decode_context_length_buckets\": [${DECODE_CTX_BUCKETS}]"

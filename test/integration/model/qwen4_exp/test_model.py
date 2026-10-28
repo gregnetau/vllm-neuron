@@ -21,6 +21,8 @@ Running (trn2.48xlarge, TP=8):
     QWEN4_EXP_MODEL_PATH=/path/to/Qwen3.8-Flash-Next QWEN4_EXP_NUM_LAYERS=4 \
     VLLM_NEURON_GOLDEN_CACHE_DIR=/path/to/golden_cache \
     pytest test/integration/model/qwen4_exp/test_model.py -v -s --timeout=10800
+
+Add ``VLLM_USE_V2_MODEL_RUNNER=1`` to run it on Model Runner V2.
 """
 
 import os
@@ -36,6 +38,10 @@ QUANTIZATION = os.environ.get("QWEN4_EXP_QUANTIZATION") or None
 GPU_MEM_UTIL = float(os.environ.get("QWEN4_EXP_GPU_MEM_UTIL", "0.9"))
 # vLLM --kv-cache-dtype, e.g. "fp8" (the QSA indexer side cache stays BF16).
 KV_CACHE_DTYPE = os.environ.get("QWEN4_EXP_KV_CACHE_DTYPE", "auto")
+# Segmented prefill's KV segment size. Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) needs
+# segmented prefill for recurrent-state models, so it defaults to 1024 there; V1 to none.
+_V2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1"
+KV_SEGMENT = int(os.environ.get("QWEN4_EXP_KV_SEGMENT", "1024" if _V2 else "0"))
 
 # The rendered prompts are part of the golden cache key: any edit invalidates cached goldens.
 MESSAGES = [
@@ -191,6 +197,7 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
                 "num_batched_tokens_buckets": [seq_len],
                 "num_seqs_buckets": [batch_size],
                 **({"quantization": QUANTIZATION} if QUANTIZATION else {}),
+                **({"kv_segment_size_buckets": [KV_SEGMENT]} if KV_SEGMENT else {}),
             }
         },
     )
