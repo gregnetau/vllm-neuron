@@ -102,6 +102,17 @@ class NeuronModelInput:
     # configured one or max_model_len); the attention groups' block tables are
     # trimmed to it. None for prefill and without buckets.
     decode_ctx_bucket: int | None = None
+    # Host inputs (interfaces.HasHostInputs): name -> [padded_num_tokens, *shape] device
+    # tensor, passed to the model by keyword. Zero-filled by the assembly; a real step
+    # replaces them with the host-built ones. None without the capability.
+    host_inputs: dict[str, torch.Tensor] | None = None
+    # Host layout of the active rows, for building the host inputs: scheduled tokens
+    # and scheduled drafts per row (scheduler order). None for synthetic inputs.
+    query_lens_np: np.ndarray | None = None
+    num_drafts_np: np.ndarray | None = None
+    # Prefill steps of a model with ``prefill_dense_context``: the attention groups'
+    # block tables are trimmed to that context (the dense prefill graph variant).
+    dense_prefill: bool = False
 
 
 def build_flat_positions(

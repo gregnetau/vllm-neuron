@@ -9,11 +9,13 @@ lifecycle without importing or subclassing the V1 runner.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import fields as dc_fields
 
 from typing import NamedTuple
@@ -47,6 +49,13 @@ from vllm.v1.worker.gpu.kv_connector import (
 )
 
 from . import hybrid_state
+from .host_inputs import (
+    HostInputSpecs,
+    _host_input_specs_of,
+    build_step_host_inputs,
+    build_v2_host_input_layout,
+    host_input_zero_kwargs,
+)
 from .neuron_forward_adapter import (
     NeuronForwardAdapter,
     build_attention_metadata,
@@ -119,6 +128,10 @@ class _PendingStep(NamedTuple):
     kv_connector_output: object | None
     # Tokens per row of the gathered logits: 1, or 1 + k for a verify step.
     spec_width: int = 1
+    # Host inputs: the stable slot and scheduled tokens of each submitted row, to
+    # apply the step's sampled tokens to the host token history.
+    slots: tuple[int, ...] = ()
+    query_lens: tuple[int, ...] = ()
 
 
 def _trim_sampled(sampled_tokens, valid_rows, num_submitted):
@@ -278,6 +291,15 @@ def _build_verify_logprobs(
     return result._replace(cu_num_generated_tokens=cu)
 
 
+def _changes_slots(scheduler_output) -> bool:
+    """Whether a step frees or admits slots (finished, preempted or new requests)."""
+    return bool(
+        scheduler_output.scheduled_new_reqs
+        or scheduler_output.finished_req_ids
+        or scheduler_output.preempted_req_ids
+    )
+
+
 class _AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
     """Defer materialization of an asynchronous sampled-token future.
 
@@ -326,6 +348,11 @@ class _AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
 
 class NeuronModelRunnerV2:
     """Run a slot-stable scheduler lifecycle with one request-state owner."""
+
+    # Host inputs (interfaces.HasHostInputs), set by _init_host_inputs. Class defaults so a
+    # runner built without __init__ (tests) behaves as a model without host inputs.
+    _host_input_specs: HostInputSpecs | None = None
+    _host_token_ids: np.ndarray | None = None
 
     def __init__(self, vllm_config, device) -> None:
         """Initialize standalone runner state from the vLLM configuration.
@@ -404,6 +431,17 @@ class NeuronModelRunnerV2:
         self._state_pool_slot_pages = 1
         self.state_caches: dict[str, list[torch.Tensor]] = {}
         self._kv_clearer: hybrid_state.KVBlockClearer | None = None
+        # Host inputs (interfaces.HasHostInputs, docs/design/host-inputs.md), resolved by
+        # load_model. V2 builds input_ids on the device, so the host keeps its own copy
+        # of each slot's token history and computed count, advanced exactly as the graphs
+        # commit them, and joins on the earlier steps' sampled tokens before it builds a
+        # step's host inputs (_host_input_join).
+        self._host_input_specs: HostInputSpecs | None = None
+        self._host_token_ids: np.ndarray | None = None
+        self._host_num_computed = np.zeros(self.max_num_reqs, dtype=np.int64)
+        self._host_total_len = np.zeros(self.max_num_reqs, dtype=np.int64)
+        # Async outputs whose tokens the host history has not taken yet, oldest first.
+        self._host_join_queue: deque = deque()
 
         # Placeholder geometry only: vLLM applies the backend block-size default after constructing
         # the worker's model runner. initialize_kv_cache replaces this from the validated per-group
@@ -769,6 +807,8 @@ class NeuronModelRunnerV2:
         self._pending_step = None
         self._submitted_forward_keepalive = None
         self.capture_backend_model = None
+        self._host_input_specs = None
+        self._host_token_ids = None
 
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture, model_config=model_config
@@ -822,6 +862,7 @@ class NeuronModelRunnerV2:
             self.model = model
             if self.speculative_config is not None:
                 self._load_draft_model()
+            self._init_host_inputs()
 
             # Stamp each parallel group's rank_in_group as an on-device tensor
             # (SPMD): collective helpers (MoE all-to-all, routed-token permute)
@@ -944,6 +985,26 @@ class NeuronModelRunnerV2:
                 page = hybrid_state.state_page(name, spec, self._state_real_pages)[1]
                 total += n_pages * page
         return total
+
+    def kv_side_cache_ratio(self) -> float:
+        """Bytes the model allocates outside the KV pool per byte of attention KV cache.
+
+        A model with a side cache per attention layer, addressed by that layer's block
+        ids (a sparse-attention indexer's keys), reports its bytes per cached token with
+        ``kv_side_bytes_per_token_per_attn_layer``. The ratio is that over one layer's
+        attention K/V bytes per token, 0 without the hook. The worker divides the KV
+        budget by 1 + ratio so the side caches fit next to the KV cache. Mirrors V1.
+        """
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        model = getattr(self.model, "_orig_mod", self.model)
+        side = getattr(model, "kv_side_bytes_per_token_per_attn_layer", 0)
+        if not side:
+            return 0.0
+        for spec in self.get_kv_cache_spec().values():
+            if isinstance(spec, FullAttentionSpec):
+                return side / (spec.page_size_bytes / spec.block_size)
+        return 0.0
 
     def warm_up_hybrid_graphs(self) -> None:
         """Compile the KV-block clearing graph of a recurrent-state model.
@@ -2039,6 +2100,8 @@ class NeuronModelRunnerV2:
             kwargs["num_accepted"] = state_tensor("num_accepted", rs.num_accepted)
             if model_input.num_draft_by_row is not None:
                 kwargs["num_draft_by_row"] = model_input.num_draft_by_row
+        if model_input.host_inputs:
+            kwargs["host_inputs"] = model_input.host_inputs
         return kwargs
 
     def _record_neff_execution(self, model_input: NeuronModelInput) -> None:
@@ -2051,6 +2114,8 @@ class NeuronModelRunnerV2:
             bucket_name = f"prefill_s{model_input.padded_num_tokens}"
             if model_input.kv_segment_size:
                 bucket_name += f"_kv{model_input.kv_segment_size}"
+            if model_input.dense_prefill:
+                bucket_name += "_dense"
         else:
             bucket_name = f"decode_b{model_input.padded_num_reqs}"
             if model_input.spec_width > 1:
@@ -2084,6 +2149,10 @@ class NeuronModelRunnerV2:
         )
 
         self._drain_async_output_for_new_request_join(scheduler_output)
+        if self._host_input_specs and _changes_slots(scheduler_output):
+            # The host token history is kept by slot: take every earlier step's tokens
+            # before update_states frees or admits slots.
+            self._host_input_join()
 
         # Reap completed graphs before allocation. update_states then frees
         # finished/preempted slots (quarantine-aware) and
@@ -2120,6 +2189,12 @@ class NeuronModelRunnerV2:
 
         with record_function_or_nullcontext("neuron_model_runner: prepare_input"):
             model_input = self._prepare_model_input(scheduler_output)
+        if self._host_input_specs:
+            # The step was prepared while the previous one ran; only the host inputs
+            # need its sampled tokens (docs/design/host-inputs.md).
+            with record_function_or_nullcontext("neuron_model_runner: host_inputs"):
+                self._host_input_join()
+                model_input = self._with_host_inputs(model_input)
         # The submitted rows this step runs (scheduler order): scope the input-snapshot
         # capture now; associate output + quarantine after the forward.
         active_req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs] + list(
@@ -2218,6 +2293,12 @@ class NeuronModelRunnerV2:
             num_logprobs_by_row=num_logprobs_by_row,
             kv_connector_output=kv_connector_output,
             spec_width=model_input.spec_width,
+            slots=tuple(int(s) for s in model_input.idx_mapping_np.tolist()),
+            query_lens=(
+                tuple(int(q) for q in model_input.query_lens_np.tolist())
+                if model_input.query_lens_np is not None
+                else ()
+            ),
         )
         return None
 
@@ -2249,9 +2330,13 @@ class NeuronModelRunnerV2:
                 self._async_steps += 1
                 output = _AsyncNeuronModelRunnerOutput(self, pending)
                 self._last_async_output = output
+                if self._host_input_specs:
+                    self._host_join_queue.append(output)
                 return output
 
             self._sync_fallback_steps += 1
+            if self._host_input_specs:
+                self._apply_host_tokens(pending, token_lists)
             logprobs = self._materialize_gathered_logits(pending, token_lists)
             pending.completed["done"] = True  # completion fence (output materialized)
             return self.get_output(
@@ -2672,18 +2757,26 @@ class NeuronModelRunnerV2:
             self._materialize_output(output)
 
     def warmup_prefill(self, bucket_size: int, kv_segment_size: int = 0) -> None:
-        """Compile one configured prefill graph via the synthetic prefill input."""
+        """Compile one configured prefill graph via the synthetic prefill input, and its
+        dense-context variant for a model with ``prefill_dense_context``."""
         self._validate_prefill_compile_target(bucket_size, kv_segment_size)
-        compile_start = time.perf_counter()
-        self._warmup(self._build_prefill_synthetic_inputs(bucket_size, kv_segment_size))
-        compile_elapsed = time.perf_counter() - compile_start
-        bucket_name = f"prefill_s{bucket_size}"
-        if kv_segment_size > 0:
-            bucket_name += f"_kv{kv_segment_size}"
-        COMPILATION_TIME.labels(
-            model_name=self.vllm_config.model_config.model,
-            bucket_name=bucket_name,
-        ).set(compile_elapsed)
+        for dense_ctx in self.prefill_ctx_variants(kv_segment_size, bucket_size):
+            compile_start = time.perf_counter()
+            self._warmup(
+                self._build_prefill_synthetic_inputs(
+                    bucket_size, kv_segment_size, dense_ctx=dense_ctx
+                )
+            )
+            compile_elapsed = time.perf_counter() - compile_start
+            bucket_name = f"prefill_s{bucket_size}"
+            if kv_segment_size > 0:
+                bucket_name += f"_kv{kv_segment_size}"
+            if dense_ctx:
+                bucket_name += "_dense"
+            COMPILATION_TIME.labels(
+                model_name=self.vllm_config.model_config.model,
+                bucket_name=bucket_name,
+            ).set(compile_elapsed)
 
     def _capture_model_input(self, model_input: NeuronModelInput) -> None:
         """Capture one synthetic input with the graph-capture adapter."""
@@ -2712,12 +2805,14 @@ class NeuronModelRunnerV2:
             bucket_size,
             kv_segment_size,
         )
-        model_input = self._build_prefill_synthetic_inputs(
-            bucket_size,
-            kv_segment_size,
-            device=device,
-        )
-        self._capture_model_input(model_input)
+        for dense_ctx in self.prefill_ctx_variants(kv_segment_size, bucket_size):
+            model_input = self._build_prefill_synthetic_inputs(
+                bucket_size,
+                kv_segment_size,
+                device=device,
+                dense_ctx=dense_ctx,
+            )
+            self._capture_model_input(model_input)
         logger.debug(
             "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
             bucket_size,
@@ -3112,6 +3207,154 @@ class NeuronModelRunnerV2:
         )
 
     # ------------------------------------------------------------------
+    # Host inputs (interfaces.HasHostInputs).
+    # ------------------------------------------------------------------
+    def _init_host_inputs(self) -> None:
+        """Resolve the loaded model's host inputs and allocate the host token history."""
+        self._host_input_specs = _host_input_specs_of(self.model)
+        self._host_token_ids = None
+        self._host_join_queue.clear()
+        if not self._host_input_specs:
+            return
+        self._host_token_ids = np.zeros(
+            (self.max_num_reqs, self.max_model_len), dtype=np.int32
+        )
+        logger.info(
+            "Host inputs %s: built on the host every step from a host copy of the "
+            "token history; with async scheduling each step joins on the earlier "
+            "steps' sampled tokens before its forward",
+            sorted(self._host_input_specs),
+        )
+
+    def _host_input_join(self) -> None:
+        """Apply every earlier step's sampled tokens to the host token history.
+
+        Materializes the queued async outputs oldest first, on every TP rank: each
+        rank builds the host inputs from its own history, and upstream materializes
+        an async output only on the output rank. ``get_output`` is idempotent, so the
+        output rank's async-output thread and this join read each future once. After
+        the join every submitted graph has completed.
+        """
+        if not self._host_join_queue:
+            return
+        while self._host_join_queue:
+            output = self._host_join_queue.popleft()
+            result = output.get_output()
+            self._apply_host_tokens(output._pending, result.sampled_token_ids)
+        self._last_async_output = None
+        self._inflight_graphs.clear()
+
+    def _apply_host_tokens(
+        self, pending: _PendingStep, token_lists: list[list[int]]
+    ) -> None:
+        """Advance the host token history by one step, as the step's graph committed it.
+
+        Mirrors ``_compute_next_device_state(_multi)``: a prefill row advances its
+        computed count by its chunk and, on the final chunk, appends the sampled token;
+        a decode or verify row advances by its committed tokens and appends them. The
+        history stops at ``max_model_len``.
+
+        Args:
+            pending: The step, with the slot and scheduled tokens of each row.
+            token_lists: The step's committed tokens per row (``[]`` for a non-final
+                prefill chunk).
+        """
+        rs = self.request_state
+        history = self._host_token_ids
+        for req_id, slot, query_len, tokens in zip(
+            pending.req_ids, pending.slots, pending.query_lens, token_lists
+        ):
+            if rs.req_id_to_index.get(req_id) != slot:
+                # The request left (or was readmitted) after this step; its new
+                # admission seeded the history from the scheduler.
+                continue
+            num_computed = int(self._host_num_computed[slot])
+            if num_computed < int(rs.prefill_len[slot]):
+                new_num_computed = num_computed + query_len
+                commit = new_num_computed == int(rs.prefill_len[slot])
+            else:
+                new_num_computed = num_computed + len(tokens)
+                commit = True
+            self._host_num_computed[slot] = new_num_computed
+            if not commit or not tokens:
+                continue
+            total = int(self._host_total_len[slot])
+            stored = tokens[: max(self.max_model_len - total, 0)]
+            history[slot, total : total + len(stored)] = stored
+            self._host_total_len[slot] = total + len(stored)
+
+    def _with_host_inputs(self, model_input: NeuronModelInput) -> NeuronModelInput:
+        """Return the step's input with its host inputs built and uploaded.
+
+        Rebuilds on the host the token layout the graph builds on the device
+        (``NeuronForwardAdapter``): a prefill chunk reads the slot's history; a decode
+        row its next token at its computed count; a verify row that token and then the
+        slot's drafts, read back from the device draft table (the join completed the
+        graph that wrote it). Positions come from the host computed counts, which are
+        exact after the join (the scheduler's are an upper bound under async
+        speculative decoding).
+
+        Args:
+            model_input: The prepared step (``_prepare_model_input``).
+
+        Returns:
+            The input with ``host_inputs`` on the device.
+
+        Raises:
+            RuntimeError: If a row's token is not in the host history yet.
+        """
+        rs = self.request_state
+        slots = model_input.idx_mapping_np.astype(np.int64)
+        num_active = model_input.num_active
+        base = self._host_num_computed[slots]
+        drafts_cpu = None
+        if model_input.is_prefill:
+            num_real = model_input.query_lens_np.astype(np.int64)
+            row_starts = np.zeros(num_active, dtype=np.int64)
+            scheduler_base = rs.scheduler_num_computed_tokens[slots]
+            if not (base == scheduler_base).all():
+                raise RuntimeError(
+                    f"host computed counts {base.tolist()} differ from the scheduler's "
+                    f"{scheduler_base.tolist()} on a prefill step"
+                )
+        else:
+            width = model_input.spec_width
+            num_real = np.ones(num_active, dtype=np.int64)
+            if model_input.num_drafts_np is not None and width > 1:
+                num_real = num_real + model_input.num_drafts_np.astype(np.int64)
+                drafts_cpu = rs.draft_tokens.cpu().numpy()
+            row_starts = np.arange(num_active, dtype=np.int64) * width
+            lagging = base >= self._host_total_len[slots]
+            if lagging.any():
+                raise RuntimeError(
+                    "host token history lags the device for slots "
+                    f"{slots[lagging].tolist()}: computed {base[lagging].tolist()}, "
+                    f"stored {self._host_total_len[slots][lagging].tolist()}"
+                )
+        input_ids, req_rows, positions = build_v2_host_input_layout(
+            num_tokens=model_input.padded_num_tokens,
+            slots=slots,
+            base_positions=base,
+            num_real_tokens=num_real,
+            row_starts=row_starts,
+            token_ids_cpu=self._host_token_ids,
+            drafts_cpu=drafts_cpu,
+        )
+        host = build_step_host_inputs(
+            self.model,
+            self._host_input_specs,
+            input_ids,
+            req_rows,
+            positions,
+            self._host_token_ids,
+        )
+        device = model_input.positions.device
+        return dataclasses.replace(
+            model_input,
+            host_inputs={name: t.to(device) for name, t in host.items()},
+        )
+
+    # ------------------------------------------------------------------
     # Per-step input preparation.
     # ------------------------------------------------------------------
     def _prepare_model_input(self, scheduler_output) -> NeuronModelInput:
@@ -3223,6 +3466,9 @@ class NeuronModelRunnerV2:
             )
             row_bucket = 1
             kv_segment_size = self.kv_segment_size
+            dense_prefill = self._use_prefill_dense(
+                int(num_computed[0]) + token_bucket, kv_segment_size
+            )
         else:
             assert bool((num_computed >= prefill_lens_active - 1).all()), (
                 "V2 decode classified (padded==1) but a row is mid-prompt "
@@ -3248,6 +3494,7 @@ class NeuronModelRunnerV2:
             # as [rows, 1 + k] tokens; rows with fewer drafts are padded in place.
             token_bucket = row_bucket * (1 + self.num_speculative_tokens)
             kv_segment_size = 0
+            dense_prefill = False
 
         return self._assemble_model_input(
             idx_mapping_np=idx_mapping_np,
@@ -3259,6 +3506,7 @@ class NeuronModelRunnerV2:
             row_bucket=row_bucket,
             kv_segment_size=kv_segment_size,
             num_drafts=num_drafts,
+            dense_prefill=dense_prefill,
         )
 
     def _assemble_model_input(
@@ -3275,6 +3523,7 @@ class NeuronModelRunnerV2:
         device: torch.device | None = None,
         num_drafts: np.ndarray | None = None,
         ctx_bucket: int | None = None,
+        dense_prefill: bool = False,
     ) -> NeuronModelInput:
         """Pad host vectors and assemble a fixed-shape model input.
 
@@ -3298,6 +3547,8 @@ class NeuronModelRunnerV2:
             ctx_bucket: Decode context-length bucket of a decode step (warmup
                 compiles each one). ``None`` selects the smallest bucket covering
                 the rows. Ignored for prefill and without context-length buckets.
+            dense_prefill: A prefill step's dense-context variant: the attention
+                groups' block tables trimmed to ``prefill_dense_context``.
 
         Returns:
             The fixed-shape device operands and host metadata.
@@ -3397,14 +3648,20 @@ class NeuronModelRunnerV2:
                     output_device=device,
                 )
             else:
-                # Decode context-length buckets trim only these (attention) tables;
-                # the state groups' 1 + k pages do not grow with the context.
+                # Decode context-length buckets, and the dense prefill variant, trim
+                # only these (attention) tables; the state groups' 1 + k pages do not
+                # grow with the context.
+                num_columns = (
+                    self._prefill_dense_width(g)
+                    if dense_prefill
+                    else self._decode_ctx_trim_width(g, decode_ctx_bucket)
+                )
                 rows = build_kernel_block_rows(
                     rs,
                     g,
                     idx_mapping_np,
                     padded_num_reqs,
-                    num_columns=self._decode_ctx_trim_width(g, decode_ctx_bucket),
+                    num_columns=num_columns,
                     output_device=device,
                 )
                 offsets = None
@@ -3549,7 +3806,62 @@ class NeuronModelRunnerV2:
             ),
             spec_width=spec_width,
             decode_ctx_bucket=decode_ctx_bucket,
+            dense_prefill=bool(dense_prefill),
+            host_inputs=(
+                host_input_zero_kwargs(
+                    self._host_input_specs, padded_num_tokens, device
+                )
+                or None
+            ),
+            query_lens_np=np.asarray(query_lens, dtype=np.int64),
+            num_drafts_np=(
+                np.asarray(num_drafts, dtype=np.int64)
+                if num_drafts is not None
+                else None
+            ),
         )
+
+    def _prefill_dense_context(self) -> int | None:
+        """The model's ``prefill_dense_context`` opt-in, or None without it.
+
+        A prefill step whose whole context (cached prefix plus padded chunk) fits this
+        many tokens gets its attention block tables trimmed to it, so the model can
+        pick a cheaper path from the static shape (a sparse attention that selects
+        every block below that context runs its dense kernels). Every prefill graph
+        that fits is then compiled in both variants. Mirrors V1.
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        ctx = getattr(model, "prefill_dense_context", None)
+        if not ctx or int(ctx) >= self.max_model_len:
+            return None
+        return int(ctx)
+
+    def prefill_ctx_variants(
+        self, kv_segment_size: int = 0, bucket_size: int = 0
+    ) -> list[bool]:
+        """Prefill graph variants to compile for a target (the ``dense_ctx`` flags).
+
+        ``[False]``, plus ``True`` (trimmed tables) when the model opts in with
+        ``prefill_dense_context`` and both the chunk and the KV segment fit it.
+        """
+        ctx = self._prefill_dense_context()
+        fits = ctx is not None and kv_segment_size <= ctx and bucket_size <= ctx
+        return [False, True] if fits else [False]
+
+    def _use_prefill_dense(self, padded_ctx_len: int, kv_segment_size: int) -> bool:
+        """Whether a prefill step runs the dense variant: its cached prefix plus padded
+        chunk, and its KV segment, fit ``prefill_dense_context``."""
+        ctx = self._prefill_dense_context()
+        return ctx is not None and padded_ctx_len <= ctx and kv_segment_size <= ctx
+
+    def _prefill_dense_width(self, group: int) -> int:
+        """Block-table width of an attention group in the dense prefill variant: the
+        dense context in blocks, aligned to 128 tokens like V1's trimmed table."""
+        block_size = self.block_sizes[group]
+        alignment = 128 // block_size if block_size <= 128 else 1
+        blocks = -(-self._prefill_dense_context() // block_size)
+        blocks = -(-blocks // alignment) * alignment
+        return min(blocks, self.request_state.block_table(group).shape[1])
 
     def _decode_ctx_bucket_for_step(
         self, max_num_computed: int, ctx_bucket: int | None = None
@@ -3620,6 +3932,7 @@ class NeuronModelRunnerV2:
         bucket_size: int | None = None,
         kv_segment_size: int | None = None,
         device: torch.device | None = None,
+        dense_ctx: bool = False,
     ) -> NeuronModelInput:
         """Build a synthetic input for one prefill graph shape.
 
@@ -3631,6 +3944,7 @@ class NeuronModelRunnerV2:
             bucket_size: Optional configured prefill token capacity.
             kv_segment_size: Optional configured KV segment size.
             device: Optional tensor destination. Defaults to the runner device.
+            dense_ctx: Build the dense-context variant (``prefill_ctx_variants``).
 
         Returns:
             Synthetic fixed-shape prefill input.
@@ -3654,6 +3968,7 @@ class NeuronModelRunnerV2:
             row_bucket=1,
             kv_segment_size=kv_segment_size,
             device=device,
+            dense_prefill=dense_ctx,
         )
 
     def _build_decode_synthetic_inputs(
@@ -3835,7 +4150,7 @@ class NeuronModelRunnerV2:
 
         num_computed_tokens = new_req.num_computed_tokens
 
-        rs.add_request(
+        slot = rs.add_request(
             req_id=req_id,
             prompt_len=len(prompt_token_ids),
             prefill_token_ids=list(prefill_token_ids),
@@ -3845,3 +4160,10 @@ class NeuronModelRunnerV2:
             sampling_params=sampling_params,
             release_resident=self._release_resident_for_readmission,
         )
+        if self._host_token_ids is not None:
+            # The host token history starts as the device's: the whole prefill.
+            n = len(prefill_token_ids)
+            self._host_token_ids[slot, :n] = prefill_token_ids
+            self._host_token_ids[slot, n:] = 0
+            self._host_num_computed[slot] = num_computed_tokens
+            self._host_total_len[slot] = n

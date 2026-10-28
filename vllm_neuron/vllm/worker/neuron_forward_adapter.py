@@ -460,6 +460,7 @@ class NeuronForwardAdapter(torch.nn.Module):
         draft_tokens: torch.Tensor | None = None,
         num_accepted: torch.Tensor | None = None,
         num_draft_by_row: torch.Tensor | None = None,
+        host_inputs: dict[str, torch.Tensor] | None = None,
     ):
         """Execute one model step and commit state inside the graph.
 
@@ -501,6 +502,9 @@ class NeuronForwardAdapter(torch.nn.Module):
                 each slot's last step committed (device state).
             num_draft_by_row: Verify steps only: ``[rows]`` scheduled draft
                 count per row.
+            host_inputs: Models with host inputs only (``interfaces.HasHostInputs``):
+                per-token tensors built on the host, aligned with the step's
+                ``input_ids`` rows, passed to the model by keyword.
 
         Returns:
             Sampled tokens, updated state tensors, and the non-aliased
@@ -536,6 +540,7 @@ class NeuronForwardAdapter(torch.nn.Module):
                 draft_tokens=draft_tokens,
                 num_accepted=num_accepted,
                 num_draft_by_row=num_draft_by_row,
+                host_inputs=host_inputs,
             )
 
         # --- prologue: build input_ids on device (never read on host) ---
@@ -596,6 +601,7 @@ class NeuronForwardAdapter(torch.nn.Module):
             sampling_params=selected_sampling_params,
             logit_mask=None,
             rank=rank,
+            **(host_inputs or {}),
         )
         sampled_raw = result[0]
         sampled = _reinterpret_uint32_as_int32(sampled_raw, token_store.dtype)
@@ -670,6 +676,7 @@ class NeuronForwardAdapter(torch.nn.Module):
         draft_tokens,
         num_accepted,
         num_draft_by_row,
+        host_inputs=None,
     ):
         """Run one prefill or verify step with the draft model in the same graph.
 
@@ -737,6 +744,7 @@ class NeuronForwardAdapter(torch.nn.Module):
             sampling_params=selected_sampling_params,
             logit_mask=None,
             rank=rank,
+            **(host_inputs or {}),
         )
         sampled = _reinterpret_uint32_as_int32(result[0], token_store.dtype)
         target_hidden = speculator.target_hidden_states(result)
