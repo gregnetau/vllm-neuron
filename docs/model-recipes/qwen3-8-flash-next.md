@@ -50,7 +50,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | **Quantization** | FP8 routed experts (per-channel weights, BF16 activations) | ✅ |
 | | Full BF16 (48 layers) | ❌ does not fit 8 NeuronCores |
 | | FP8 KV cache | ⚠️ works, 1.67x KV tokens; fails logit validation (see [FP8](#fp8)) |
-| **Attention** | QSA sparse attention (exact selection) | ✅ |
+| **Attention** | QSA sparse attention (exact selection; decode reads only the selected tokens) | ✅ |
 | **Parallelism** | TP=8 (KV heads replicated, experts split across the TP ranks) | ✅ |
 | | Data parallel (independent replicas behind a proxy) | ✅ |
 | **Scheduling** | Async scheduling | ✅ (host-token join, see [Host inputs](../design/host-inputs.md)) |
@@ -113,8 +113,8 @@ STOP=1 examples/vllm_neuron/models/qwen4_exp/run_replicas.sh
 ### Memory and concurrency
 
 - **Per-core memory.** With FP8 experts the weights take 16.5 GiB of each 24 GiB core. At
-  `gpu_memory_utilization=0.85` the KV cache gets about 2.9 GiB, plus a 0.7 GiB side cache for
-  the QSA indexer keys: about 256k tokens.
+  `gpu_memory_utilization=0.85` the KV cache gets about 2.8 GiB, plus 0.9 GiB of side caches for
+  the QSA indexer's raw and compressed keys: about 244k tokens.
 - **Concurrency cap.** The scheduler caps concurrency at KV tokens // max_model_len (3 requests
   at 65,536). `VLLM_NEURON_MAX_KV_CONCURRENT` overrides the cap; requests that outgrow the KV
   cache are then preempted and recomputed.
@@ -162,11 +162,18 @@ Decode, one replica, FP8 experts, greedy:
 
 | Configuration | ms/step |
 |---|---|
-| B=1, short context | ~40 (host-bound) |
-| B=3, short context | ~61 (49 tok/s) |
-| B=3, 20-40k context | ~107 (28 tok/s) |
-| B=1, 14.5k / 29k / 58k context | 40-45 / 43-48 / 48-51 |
-| B=3, 14.5k / 29k / 58k context | 73 / 82 / 106 |
+| B=1, short context | ~38 (host-bound) |
+| B=3, short context | ~48 (62 tok/s) |
+| B=3, 15-60k context | 48-52 (58-62 tok/s) |
+| B=1, 14.5k / 29k / 58k context | 36 / 36 / 36-38 |
+| B=3, 15k / 30k / 60k context | 48-50 / 49-50 / 50-52 |
+| B=8, 1k / 15k / 25k context (`VLLM_NEURON_MAX_KV_CONCURRENT=8`) | 45.5 / 45.8 / 46.9 (~175 tok/s) |
+
+Long-context decode costs about the same as short-context decode: the attention layers read
+only the selected tokens. Short contexts gain too, as decode runs in the 4,096-token context
+bucket, which takes the QSA path (more than 2,048 slots). Before that change (masked
+full-context decode), B=3 took 57-61 ms at 1-15k and 75 / 102-105 ms at 30k / 60k, and B=1
+took 46-49 ms at 58k.
 
 With MTP (short context, ms per output token per request):
 
@@ -177,10 +184,13 @@ With MTP (short context, ms per output token per request):
 | 2 | 27 | 44 |
 
 - **Aggregate.** 8 replicas with 24 concurrent short requests: 364 tok/s.
-- **Prefill.** About 1.1k tokens/s at long context: 3.6-3.9 s per 4,096-token chunk, 57.7k
-  tokens in 50.6 s.
-- **Long-context decode.** QSA decode still reads the full context and masks it, so it is the
-  main cost at long context.
+- **Prefill.** About 1.4k tokens/s at long context: 2.9 s per 4,096-token chunk at 30k, 57.7k
+  tokens in 41.2 s.
+- **Long-context decode.** Decode attends only to the selected tokens: the decode kernel reads
+  a compact context of the 512 selected blocks plus the open tail (2,304 slots) through a block
+  table over the KV cache, whatever the context length. The indexer scores cached compressed
+  keys and takes its top 512 with an NKI top-k kernel. MTP verify steps still read the full
+  context with a selection mask.
 
 ## Accuracy
 
@@ -198,6 +208,10 @@ Logit validation against Hugging Face Transformers (FP32 reference,
   natural-text needles at 15k-63k tokens and depths 0-99%, 34 of 35 correct at B=1 and B=3. The
   one miss was cut off by max_tokens and is correct with a longer limit. The device's block selection
   overlaps HF BF16's by 99.85%, against 99.56% between HF BF16 and FP32.
+- **Compact decode** (attending only to the selected tokens) against the earlier masked
+  full-context decode: the 3,532-token prompt stays greedy 8/8 against HF; passkeys at 14k-58k
+  tokens 9/9; at 15k-60k the answer tokens' logprobs agree within 5e-4, and greedy outputs
+  diverge only at later near-ties, as between batch sizes.
 
 ## Aider Polyglot
 
@@ -225,8 +239,8 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 
 ## Known limitations
 
-- **Long-context decode cost.** QSA decode computes dense-cost attention with a selection mask;
-  a compact gather of the selected 2,051 tokens is the next speedup.
+- **MTP verify steps at long context** read the full context with a QSA selection mask (only
+  plain decode uses the compact context).
 - **Concurrency cap.** Concurrency is capped by the worst-case KV reservation (see
   [Memory and concurrency](#memory-and-concurrency)).
 - **Not supported:** prefix caching (the recurrent state uses dedicated pools), and BF16 for the

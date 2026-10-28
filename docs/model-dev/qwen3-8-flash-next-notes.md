@@ -109,8 +109,14 @@ recurrent-state layer (`layers.1.ple`) in the dedicated state pool. Pages are vi
   - **Why not a KV group.** A key-only vLLM KV group shares the KV pool through a second view.
     The graph-I/O check (NCC_EVRF009) counts the pool twice, and the full model then failed to
     compile, 128 MB over the limit.
-  - **Budget.** The worker shrinks the KV budget by the side-cache ratio (0.25 with BF16 KV).
-  - **Compressed keys.** They are recomputed from the raw keys every step.
+  - **Budget.** The worker shrinks the KV budget by the side-cache ratio (0.3125 with BF16 KV:
+    raw plus compressed keys).
+  - **Compressed keys.** A second side cache holds one compressed key per 4-token block
+    (128 BF16 values, a quarter of the raw keys' size), same block ids. Each step every token
+    recomputes the entry of its own block from the cached raw keys (`write_compressed_keys`),
+    so a block's entry is final once its last token is written, and scoring reads S/4 cached
+    keys. Recomputing all of them from the S raw keys every step cost about 3 ms per layer at
+    64k context and B=8 (the gather plus the FP32 mean, norm and RoPE).
 - **Top-k without sort.**
   - It bisects on the fp32 bit pattern (31 count passes), then breaks ties by lowest block
     index. That is exactly min(512, visible) blocks.
@@ -121,8 +127,20 @@ recurrent-state layer (`layers.1.ple`) in the dedicated state pool. Pages are vi
     which keep the segmented/flash kernels.
   - Longer ones use a masked torch attention in query blocks, with transient memory under about
     0.5 GB per layer at a 4,096-token chunk and 64k context.
-- **Decode.** The selection mask is ANDed into the fused decode kernel's pre-generated mask
-  (`_restrict_decode_mask`). Correct, but it still costs the full context.
+- **Decode: compact context.** With one token per request, decode attends only to the
+  selected tokens (`compact_decode_selection`):
+  - **Top-k as an index list.** The NKI rotational top-k kernel (`vllm_neuron.functional.topk`)
+    returns the 512 block indices; entries with a negative score are invisible blocks. Ties may
+    resolve to other blocks than the bisection's lowest-index rule; both are an exact top-k.
+  - **No K/V copy.** The fused decode kernel reads the K/V caches viewed in pages of one QSA
+    block, `[num_blocks * 64, 4, 256]`, through a block table of the selected pages, then the
+    open tail block, then the null page as padding: 2,304 slots instead of the bucket. Its mask
+    allows the selected tokens before the current position and the active slot if the current
+    token's block is selected or open (`_decode_context` hook of the Qwen3.5 attention).
+  - **Why not compaction of the bisection mask.** Building the index list from the bool mask
+    without sort (0/1 matmul prefix counts and a two-level search) cost 0.6 ms per layer at
+    64k and B=8, on top of 2.7 ms for the bisection itself; the NKI top-k takes 0.4 ms.
+  - **MTP verify rows** (several tokens per request) keep the masked full-context kernel.
 
 ### Kernels
 
@@ -182,10 +200,22 @@ Other measurements:
   - each step dispatches a graph with about 1,177 inputs, so the per-input runtime work is
     16-33 ms;
   - Dynamo guard checks are about 9 ms; `VLLM_NEURON_SKIP_GUARD_EVAL=1` removes them.
-- **QSA decode.** About 0.5 ms extra per attention layer per step (mask build), and dense-cost
-  attention over the context.
-- **Serving.** B=3 decode is about 61 ms/step at short context and about 107 ms/step at
-  20-40k context.
+- **QSA decode, per attention layer.** One rank (3 Q heads, 1 KV head), indexer + top-k +
+  attention, device time from chains of 2-8 layers (`write_raw_keys` to the decode kernel's
+  output):
+
+  | Context bucket, batch | Masked full context (before) | Compact context | Kernel over the whole bucket, no indexer |
+  |---|---|---|---|
+  | 4k, B=1 / B=8 | 0.78 / 2.5-2.7 ms | 0.43 / 0.53-0.93 ms | 0.08 / 0.17 ms |
+  | 16k, B=1 / B=8 | 1.4 / 3.3-3.7 ms | 0.53 / 1.0-1.15 ms | 0.11 / 0.36 ms |
+  | 32k, B=1 / B=8 | 0.9-1.2 / 2.8 ms | 0.34-0.61 / 0.71 ms | 0.10 / 0.61 ms |
+  | 64k, B=1 / B=8 | 1.1 / 4.5-4.7 ms | 0.47 / 0.77-0.79 ms | 0.31 / 1.17 ms |
+
+  Pieces at 64k and B=8, each timed alone (they overlap in the full graph, so they do not
+  add up): recomputing the compressed keys 3.2 ms, the bisection top-k 2.7 ms, the kernel over
+  the whole bucket 1.2 ms; the NKI top-k 0.4 ms, scoring the cached compressed keys 0.2 ms.
+- **Serving.** B=3 decode is about 48 ms/step at short context and 48-52 ms/step at 15-60k
+  context; before the compact decode it was 57-61 ms/step at 1-15k and 102-105 at 60k.
 
 ## Validation method
 
@@ -299,8 +329,10 @@ state-pool pages kept inside the pool. Re-validated on device:
 
 ## Open work
 
-- **QSA decode compact gather.** Gather only the ≤ 2,051 selected K/V rows per query instead of
-  masking the full context. This is the main long-context decode cost.
+- **QSA verify rows.** MTP verify steps still mask the full context; a compact context of the
+  union of the rows' selections would apply there too.
+- **QSA top-k in prefill.** Prefill still selects with the bisection top-k (about 45 count
+  passes per query block).
 - **Serving defaults.**
   - Per-replica concurrency of 8 (used in Aider run 2) as the recommended Aider configuration.
   - MTP for the long single-request tail, once validated beyond 8k context and 4 concurrent
