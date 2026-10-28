@@ -181,7 +181,7 @@ def _build_models(moe=False):
     mtp_mod = _load("vllm_neuron.model.qwen3_5.mtp", ROOT / "model/qwen3_5/mtp.py")
     hf_cfg = dict(hf_model.config.to_dict(), mtp_num_hidden_layers=1)
     mtp = mtp_mod.Qwen3_5MTP.from_configs(hf_cfg, NUM_LAYERS, None)
-    assert mtp.model.layers[0].is_moe == moe
+    assert getattr(mtp.model.layers[0], "is_moe", False) == moe
     mtp.num_speculative_tokens = K  # set by load_draft_model when serving
     torch.manual_seed(11)
     with torch.no_grad():

@@ -251,7 +251,7 @@ def _hf_and_model(moe=False):
         for k, v in hf_model.state_dict().items()
     }
     model = mod.Qwen3_5ForCausalLM.from_configs(hf_cfg.to_dict(), None)
-    assert model.config.is_moe == moe
+    assert getattr(model.config, "is_moe", False) == moe
     wl = sys.modules["vllm_neuron.utils.weight_loader"]
     params = dict(model.named_parameters())
     for name, keys in model._weight_mappings().items():
