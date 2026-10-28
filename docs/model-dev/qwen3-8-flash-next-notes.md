@@ -370,6 +370,13 @@ the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).
   - End to end, the nine-request mix takes 677 s without MTP, 1,031 s with 1 draft token and
     1,214 s with 2; the five 30k prompts take 489 s and 724 s (1 draft token), the three 33k
     prompts 570 s and 867 s (2 draft tokens).
+  - With a batch-2 graph (`SEQS_BUCKETS="1, 2, 8"`), plain decode at B=2 takes 59 ms/token at
+    30k and 49 at 8k, against 75 at 30k in the batch-8 graph. 1 draft token (0.85, same KV
+    cache) then gives 50 and 39 ms/token, 1.2-1.25x. With 2 draft tokens the extra graphs run
+    out of device memory at 0.82 while serving two 30k requests.
+  - An Aider-like load (16 requests, 8 at a time, 3-11k-token prompts, 1.5-4.5k-token outputs,
+    model-card sampling, thinking on) generates 65.8 tok/s with 2 draft tokens against 79.6
+    without MTP (gpu_memory_utilization 0.82 for both).
 
 ## Open work
 
@@ -381,9 +388,9 @@ the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).
   - Per-replica concurrency of 8 (used in Aider run 2) as the recommended Aider configuration.
   - MTP stays off: at the 64k configuration it helps only at batch 1 and shrinks the KV cache
     by 36-57%.
-    Next steps: profile the batch-8 verify graph at long context, and try a batch-2 or
-    batch-4 graph (`SEQS_BUCKETS`) or turning drafting off above batch 1 (vLLM's
-    `num_speculative_tokens_per_batch_size`).
+    Next steps: profile the batch-8 verify graph at long context, and turn drafting off above
+    batch 2 (vLLM's `num_speculative_tokens_per_batch_size`) with a batch-2 graph, which makes
+    1 draft token 1.2x faster at batch 2.
   - FP8 KV needs calibrated scales before it can be a default.
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.

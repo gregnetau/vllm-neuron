@@ -57,7 +57,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | Chunked (segmented) prefill | ✅ |
 | | KV overcommit with preemption (`VLLM_NEURON_MAX_KV_CONCURRENT`) | ✅ |
 | | Prefix caching | ❌ |
-| **Speculative decoding** | MTP (1-2 draft tokens) | ⚠️ faster at batch 1 only, slower from 2 concurrent requests (see [MTP](#mtp-speculative-decoding)) |
+| **Speculative decoding** | MTP (1-2 draft tokens) | ⚠️ faster at batch 1 only (batch 2 with an extra batch-2 graph), slower above (see [MTP](#mtp-speculative-decoding)) |
 
 ## Quick start
 
@@ -150,7 +150,7 @@ automatically with speculative decoding for this model.
 
 MTP is not part of the recommended 8-request configuration. In the 65,536-token configuration
 it speeds up a single request, but is slower than plain decode as soon as two or more requests
-decode together, and it shrinks the KV cache (see [Performance](#performance)). Use it for
+decode together in the default batch buckets, and it shrinks the KV cache (see [Performance](#performance)). Use it for
 single-request latency: `MTP_TOKENS=2` with `serve.sh`'s default `GPU_MEM_UTIL` of 0.82.
 
 - **Batch 1.** With 2 draft tokens, 1.4-1.8x per token up to 60k context (1.2-1.6x with
@@ -159,7 +159,11 @@ single-request latency: `MTP_TOKENS=2` with `serve.sh`'s default `GPU_MEM_UTIL` 
   There, a verify step costs 2.3-3.2x a plain decode step: for a batch of 3 at 20/30/40k
   context, 242 ms with 1 draft token and 332 ms with 2, against 105 ms; for 8 at 8k, 182 ms
   with 2, against 63 ms. That outweighs the 1.8-2.5 tokens accepted per step. Turning async
-  scheduling off costs only 0-13% of a plain step.
+  scheduling off costs only 0-13% of a plain step. With an extra batch-2 graph
+  (`SEQS_BUCKETS="1, 2, 8"`), 1 draft token is 1.2-1.25x faster than plain decode at batch 2;
+  with 2 draft tokens those graphs run out of device memory. An Aider-like load (8 requests at a time,
+  3-11k-token prompts, 1.5-4.5k-token outputs, model-card sampling) generates 65.8 tok/s per
+  replica with 2 draft tokens, against 79.6 without MTP (both at `gpu_memory_utilization` 0.82).
 - **Memory.** The draft head (about 1 GiB per core) and its state pools reduce the KV cache at
   65,536 context:
 
@@ -180,8 +184,8 @@ single-request latency: `MTP_TOKENS=2` with `serve.sh`'s default `GPU_MEM_UTIL` 
   step matches Hugging Face exactly in an FP32 CPU test. At 65,536 context with up to 8
   concurrent 1k-60k-token prompts, 800-4,000-token outputs and preemption, every first
   divergence from plain decode was at a top-2 logprob gap of at most 0.5 (mostly 0 or 0.125).
-- **Long context.** Passkeys and natural-text needles at 15k-60k tokens (depths 10-90%, three
-  at a time) are all retrieved with 1 and 2 draft tokens.
+- **Long context.** Natural-text needles at 15k-60k tokens (depths 10-90%, three at a time) are
+  all retrieved with 1 and 2 draft tokens, and passkeys at 14k-58k tokens with 2.
 - **Logprobs** are returned for every emitted token, speculated ones included, with and
   without async scheduling.
 
@@ -225,6 +229,8 @@ buckets 4,096 / 16,384 / 32,768, `DECODE_INTERLEAVE=1`); greedy unless noted:
 | B=1, 60k | 50 | 46 | 33 |
 | B=1, 60k, model-card sampling | 46 | | 39 |
 | B=2, 30k | 75 | | 88 |
+| B=2, 30k, `SEQS_BUCKETS="1, 2, 8"` | 59 | 50 | out of memory |
+| B=2, 8k, `SEQS_BUCKETS="1, 2, 8"` | 49 | 39 | out of memory |
 | B=3, 20/30/40k | 105 (28.6) | 131 (23.0) | 130 (22.9) |
 | B=3, 20/30/40k, model-card sampling | 105 (28.6) | 140 (21.5) | 150 (20.2) |
 | B=8, 8k | 63 (128) | | 72 (111) |
