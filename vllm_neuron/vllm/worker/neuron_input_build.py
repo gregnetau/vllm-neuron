@@ -275,6 +275,7 @@ def build_kernel_block_rows(
     padded_num_reqs: int,
     *,
     num_columns: int | None = None,
+    valid_blocks: np.ndarray | None = None,
     output_device: torch.device | None = None,
 ) -> torch.Tensor:
     """Build batch-ordered attention-kernel block rows.
@@ -296,6 +297,11 @@ def build_kernel_block_rows(
         padded_num_reqs: Compiled batch width.
         num_columns: Optional trimmed width, at most the row width. ``None``
             keeps the whole row.
+        valid_blocks: Optional ``[num_active]`` cap on each row's valid entries
+            (the rest get the sentinel). A group whose KV-manager blocks are split
+            into kernel blocks holds the kernel blocks of a whole manager block
+            past the context; the cap keeps only those a step can touch, as the
+            table of an unsplit group would.
         output_device: Device for the returned tensor. Defaults to
             ``state.device``.
 
@@ -322,6 +328,8 @@ def build_kernel_block_rows(
     for row in range(num_active):
         slot = int(idx_mapping_np[row])
         n = min(state.num_blocks(group, slot), width)
+        if valid_blocks is not None:
+            n = min(n, int(valid_blocks[row]))
         if n:
             out[row, :n] = table[
                 slot, :n

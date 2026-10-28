@@ -331,7 +331,7 @@ def test_apc_initialize_splits_attention_blocks_and_builds_checkpointer():
 def test_apc_metadata_uses_kernel_blocks():
     runner = _apc_runner()
     runner.initialize_kv_cache(_apc_config(runner))
-    state, _ = base._state_and_attn_groups(runner)
+    state, (attn,) = base._state_and_attn_groups(runner)
     groups = runner._kv_cache_config.kv_cache_groups
     req = base._new_req(runner, "a", 600, state_block=10, attn_blocks=[20, 21])
     req.block_ids = tuple(
@@ -344,7 +344,12 @@ def test_apc_metadata_uses_kernel_blocks():
     md = kwargs["attn_metadata"]
     attn_md = md["layers.3.self_attn"]
     assert attn_md["block_size"] == base.BLOCK
-    assert attn_md["block_table_tensor"][0, : 2 * RATIO].tolist() == list(
+    # Manager blocks 20 and 21 as kernel blocks; the 512-token chunk touches only the
+    # first manager block's, so the rest of the row is the -1 sentinel.
+    row = attn_md["block_table_tensor"][0].tolist()
+    assert row[:RATIO] == list(range(20 * RATIO, 21 * RATIO))
+    assert set(row[RATIO:]) == {-1}
+    assert runner.request_state.block_table(attn)[0, : 2 * RATIO].tolist() == list(
         range(20 * RATIO, 22 * RATIO)
     )
     gdn_md = md["layers.0.linear_attn"]
