@@ -143,8 +143,13 @@ program's heads.
   hardware descriptor generation. With static FP8, `gdn_kernels.gdn_decode_fp8` runs the
   whole sub-layer instead (input RMSNorm, projections, the step above, `out_proj`): each
   program owns half the value heads and the key heads they read, and updates only its own
-  state and conv rows, so it needs no core barrier and supports up to 32 requests. Other cases
-  use the PyTorch ops in `gdn_ops`.
+  state and conv rows, so it needs no core barrier and supports up to 32 requests. With BF16
+  (and FP8 where the fused kernel does not apply), steps of more than one token (B > 1, or an
+  MTP verify step) run `gdn_kernels.gdn_decode_batched`: the same head split and recurrence
+  after the PyTorch input projections, for up to 32 tokens, returning the normed output for
+  `out_proj`. `VLLM_NEURON_GDN_BATCHED_DECODE` selects it: `0` off (PyTorch path), `1`
+  (default) for steps of more than one token, `2` also for single-token steps instead of
+  `gdn_decode`. Other cases use the PyTorch ops in `gdn_ops`.
 - State writes are in place (`index_copy_` on the bound views, or the kernel's aliased
   outputs). The runner's block tables use `-1` for unused entries; the model maps them to
   the null block before indexing.
@@ -154,7 +159,8 @@ program's heads.
 With vLLM's `mtp` speculative method and `k` draft tokens, each `MambaSpec` gets
 `num_speculative_blocks = k`, so a request holds `1 + k` state blocks per GDN layer group
 (`block_table_tensor` is `[B, 1 + k]`). A verify step runs `1 + k` tokens per request through
-the GDN layers in order (`gdn_kernels.gdn_decode_fp8` keeps the state in SBUF between them)
+the GDN layers in order (`gdn_kernels.gdn_decode_fp8` and `gdn_decode_batched` keep the state
+in SBUF between them)
 and writes the state after token `j` to block `j`. The next step reads the state from the
 block of the last accepted token, passed as `state_in` in the GDN metadata. Prefills and
 single-token steps read `state_in` (0 after a prefill) and write block 0.
@@ -171,8 +177,9 @@ kernels that write them gave wrong results and cost about 13 ms per step.
 ## Decode batches
 
 Decode buckets above one request pad the batch with rows whose block-table entries are `-1`.
-Padded rows write their K/V to slot 0 of the null block, their GDN state DMAs are skipped
-(out-of-bounds page index), and their hidden state is zeroed after every layer, so the null
+Padded rows write their K/V to slot 0 of the null block, their GDN state writes are skipped
+(out-of-bounds page index; `gdn_decode_batched` reads the null page for them, so their output
+stays finite), and their hidden state is zeroed after every layer, so the null
 block (read, masked, for unused table entries) stays finite. Padded sampling rows get neutral
 parameters. Two device issues were specific to batches:
 

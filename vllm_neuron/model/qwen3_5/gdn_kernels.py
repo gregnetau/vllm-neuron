@@ -6,6 +6,13 @@ gather each request's state page, causal conv + SiLU, q/k L2-norm, gating, the g
 rule, gated RMSNorm, and the in-place state write-back. Returns the normed output ready for
 ``out_proj``. The pure-torch reference is ``Qwen3_5GatedDeltaNet._decode_torch``.
 
+``gdn_decode_batched``: the same step for B requests x S tokens (S > 1: MTP verify, state read
+from one page and written per token), up to 32 tokens, with the head split of
+``gdn_decode_fp8`` (no core barrier). Reference: ``_decode_torch`` / ``_decode_spec``.
+
+``gdn_decode_fp8``: the whole sub-layer (input norm, static-FP8 projections, the step above,
+``out_proj``) for up to 32 tokens.
+
 State page (per layer, per request; see state.py / model._read_state): rows of 128 float32
 split over two halves ``state_a``/``state_b`` [pages, R, 128] (R % 128 == 0, so no head
 straddles the halves):
@@ -898,6 +905,406 @@ def gdn_decode_fp8(
         eps,
     )
     return parts[0] + parts[1]
+
+
+def _sigmoid_t(x, shape):
+    """_sigmoid for a tile of any shape."""
+    e = _sb(shape)
+    nisa.activation(dst=e, op=nl.exp, data=x, scale=-1.0)
+    nisa.tensor_scalar(dst=e, data=e, op0=nl.add, operand0=1.0)
+    r = _sb(shape)
+    nisa.reciprocal(dst=r, data=e)
+    return r
+
+
+def _to_cols(dst, rows, n):
+    """rows [T, n*128] f32 -> dst [128, n, T] (dst[p, j, t] = rows[t, j*128 + p])."""
+    T = rows.shape[0]
+    for j in range(n):
+        tp = _ps((128, T))
+        nisa.nc_transpose(dst=tp, data=rows[:, j * 128 : (j + 1) * 128])
+        nisa.tensor_copy(dst=dst[:, j, :], src=tp)
+
+
+@nki.jit
+def gdn_decode_batched_kernel(
+    mixed,
+    z,
+    b,
+    a,
+    conv_w,
+    A_log,
+    dt_bias,
+    norm_w,
+    state_a,
+    state_b,
+    slots_in,
+    slots_out,
+    eps=1e-6,
+):
+    """Batched decode step after the input projections (any projection dtype) for NR requests
+    of Sq tokens each (Sq > 1: speculative-decoding verify), T = NR * Sq <= MAX_TOKENS.
+
+    mixed [T, C] / z [T, Hv*D] / b, a [T, Hv] (request-major token rows); conv_w [C, K];
+    A_log, dt_bias [Hv] f32; norm_w [D]; state_a/b [P, R, 128] f32 (updated in place).
+    A request's state is read from page slots_in[r] (int32, must be a valid page: padded rows
+    read the null page) and the state after its token j is written to page slots_out[r, j]
+    (int32; -1 for padded rows: the write DMAs are skipped as out of bounds).
+    Returns (out [T, Hv*D] in z.dtype, the gated-RMSNormed output for out_proj, state_a, state_b).
+
+    The recurrence of gdn_decode_fp8 without the projections: each logical-core program owns
+    half the value heads (h0 + [0, hp)) and the key heads they read (kh0 + [0, hkp)), and reads
+    and writes only their state rows and conv-state rows, so B > 1 needs no core barrier. The
+    state stays in SBUF between a request's tokens."""
+    # rev 1: the NKI compile cache keys on this function's source only; bump on helper edits.
+    T, C = mixed.shape
+    NR, Sq = slots_out.shape
+    assert NR * Sq == T and T <= FK.MAX_TOKENS
+    D = norm_w.shape[0]
+    Hv = z.shape[1] // D
+    K = conv_w.shape[1]
+    Hk = (C - Hv * D) // (2 * D)
+    rep = Hv // Hk
+    P, R, W = state_a.shape
+    NCB = C // D
+    CONV0 = Hv * D
+    assert D == 128 and W == D and C % D == 0 and R % D == 0
+    assert CONV0 % R + (K - 1) * NCB <= R, "conv rows must not straddle the page halves"
+
+    _, n_prgs, prg_id = get_verified_program_sharding_info("gdn_decode_batched", (0, 1))
+    hp = Hv // n_prgs
+    hkp = Hk // n_prgs
+    assert hp == hkp * rep
+    h0 = prg_id * hp
+    kh0 = prg_id * hkp
+    NCBl = 2 * hkp + hp  # local channel blocks: q | k | v
+    # [local first block, global first block, blocks] of each local channel run
+    runs = [[0, kh0, hkp], [hkp, Hk + kh0, hkp], [2 * hkp, 2 * Hk + h0, hp]]
+
+    va = state_a.reshape((P, R * D))
+    vb = state_b.reshape((P, R * D))
+    conv_view = va
+    if CONV0 >= R:
+        conv_view = vb
+    conv_off = (CONV0 % R) * D
+    out = nl.ndarray((T, Hv * D), dtype=z.dtype, buffer=nl.shared_hbm)
+
+    # ---- constants
+    ones = _sb((128, 128))
+    nisa.memset(ones, 1.0)
+    # local blocks q | k (Hk blocks apart) | v
+    w_raw = _sb((128, NCBl, K), conv_w.dtype)
+    nisa.dma_copy(
+        dst=w_raw[:, 0 : 2 * hkp, :],
+        src=conv_w.ap(
+            pattern=[[K, D], [Hk * D * K, 2], [D * K, hkp], [1, K]], offset=kh0 * D * K
+        ),
+    )
+    nisa.dma_copy(
+        dst=w_raw[:, 2 * hkp : NCBl, :],
+        src=conv_w.ap(
+            pattern=[[K, D], [D * K, hp], [1, K]], offset=(2 * Hk + h0) * D * K
+        ),
+    )
+    w = _sb((128, NCBl, K))
+    nisa.tensor_copy(dst=w, src=w_raw)
+    normw = _cols_load(norm_w, 1, 0, D)
+    alog = _bcast_load(A_log, hp, h0)
+    dtb = _bcast_load(dt_bias, hp, h0)
+    neg_c = _sb((128, hp))
+    nisa.activation(dst=neg_c, op=nl.exp, data=alog)
+    nisa.tensor_scalar(dst=neg_c, data=neg_c, op0=nl.multiply, operand0=-1.0)
+    oh_i = _sb((hp, hp), nl.int32)
+    nisa.iota(oh_i, [[-1, hp]], offset=0, channel_multiplier=1)
+    oh_f = _sb((hp, hp))
+    nisa.tensor_copy(dst=oh_f, src=oh_i)
+    onehot = _sb((hp, hp))
+    nisa.tensor_scalar(dst=onehot, data=oh_f, op0=nl.equal, operand0=0.0)
+
+    # ---- this program's channels of every token: one row DMA per run, then on-chip
+    # transposes to the channel layout yc[p, l, t] (local block l, channel p)
+    NQ = NCBl * D
+    xr = _sb((T, NQ), mixed.dtype)
+    for ri in range(len(runs)):
+        lc = runs[ri][0] * D
+        nc = runs[ri][2] * D
+        nisa.dma_copy(
+            dst=xr[:, lc : lc + nc],
+            src=mixed.ap(pattern=[[C, T], [1, nc]], offset=runs[ri][1] * D),
+        )
+    xf = _sb((T, NQ))
+    nisa.tensor_copy(dst=xf, src=xr)
+    yc = _sb((128, NCBl, T))
+    _to_cols(yc, xf, NCBl)
+
+    NZ = hp * D
+    zr = _sb((T, NZ), z.dtype)
+    nisa.dma_copy(dst=zr, src=z.ap(pattern=[[Hv * D, T], [1, NZ]], offset=h0 * D))
+    zf = _sb((T, NZ))
+    nisa.tensor_copy(dst=zf, src=zr)
+    zc = _sb((128, hp, T))
+    _to_cols(zc, zf, hp)
+
+    # ---- gating of every token (softplus table first, then the exp-based ones):
+    # decay = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b), silu(z)
+    a_raw = _sb((128, T, hp), a.dtype)
+    nisa.dma_copy(dst=a_raw, src=a.ap(pattern=[[0, 128], [Hv, T], [1, hp]], offset=h0))
+    b_raw = _sb((128, T, hp), b.dtype)
+    nisa.dma_copy(dst=b_raw, src=b.ap(pattern=[[0, 128], [Hv, T], [1, hp]], offset=h0))
+    ga = _sb((128, T, hp))
+    nisa.tensor_copy(dst=ga, src=a_raw)
+    for ti in range(T):
+        nisa.tensor_tensor(dst=ga[:, ti, :], data1=ga[:, ti, :], data2=dtb, op=nl.add)
+    sp = _sb((128, T, hp))
+    nisa.activation(dst=sp, op=nl.softplus, data=ga)
+    for ti in range(T):
+        nisa.tensor_tensor(
+            dst=sp[:, ti, :], data1=sp[:, ti, :], data2=neg_c, op=nl.multiply
+        )
+    decay_all = _sb((128, T, hp))
+    nisa.activation(dst=decay_all, op=nl.exp, data=sp)
+    bf = _sb((128, T, hp))
+    nisa.tensor_copy(dst=bf, src=b_raw)
+    beta_all = _sigmoid_t(bf, (128, T, hp))
+    zs_all = _sb((128, hp, T))
+    nisa.tensor_tensor(
+        dst=zs_all, data1=zc, data2=_sigmoid_t(zc, (128, hp, T)), op=nl.multiply
+    )
+
+    o_all = _sb((128, hp, T))
+    for r in range(NR):
+        slot = _sb((1, 1), nl.int32)
+        nisa.dma_copy(dst=slot, src=slots_in[r : r + 1].reshape((1, 1)))
+        S = _sb((128, hp, D))
+        _heads_dma(S, h0, hp, D, R, va, vb, slot, write=False)
+        cs_blk = _sb((NCBl, K - 1, D))
+        for ri in range(len(runs)):
+            l0 = runs[ri][0]
+            n = runs[ri][2]
+            nisa.dma_copy(
+                dst=cs_blk[l0 : l0 + n, :, :],
+                src=_page_ap(
+                    conv_view,
+                    slot,
+                    conv_off + runs[ri][1] * D,
+                    [[D, n], [NCB * D, K - 1], [1, D]],
+                ),
+                dge_mode=nisa.dge_mode.hwdge,
+                oob_mode=oob_mode.skip,
+            )
+        cs = _sb((128, K - 1, NCBl))  # cs[p, j, l]: tap j of local block l
+        for j in range(K - 1):
+            cs_ps = _ps((128, NCBl))
+            nisa.nc_transpose(dst=cs_ps, data=cs_blk[:, j, :])
+            nisa.tensor_copy(dst=cs[:, j, :], src=cs_ps)
+        for jq in range(Sq):  # the request's tokens in order; state in SBUF
+            bi = r * Sq + jq
+            oslot = _sb((1, 1), nl.int32)
+            nisa.dma_copy(dst=oslot, src=slots_out[r : r + 1, jq : jq + 1])
+            xc = _sb((128, NCBl))
+            nisa.tensor_copy(dst=xc, src=yc[:, 0:NCBl, bi])
+            decay = _sb((128, hp))
+            nisa.tensor_copy(dst=decay, src=decay_all[:, bi, :])
+            beta = _sb((128, hp))
+            nisa.tensor_copy(dst=beta, src=beta_all[:, bi, :])
+
+            # ---- causal conv + SiLU
+            yv = _sb((128, NCBl))
+            nisa.tensor_tensor(dst=yv, data1=xc, data2=w[:, :, K - 1], op=nl.multiply)
+            for j in range(K - 1):
+                t = _sb((128, NCBl))
+                nisa.tensor_tensor(
+                    dst=t, data1=cs[:, j, :], data2=w[:, :, j], op=nl.multiply
+                )
+                nisa.tensor_tensor(dst=yv, data1=yv, data2=t, op=nl.add)
+            xs = _silu(yv, NCBl)
+
+            # ---- new conv state (drop the oldest tap, append x): own rows only
+            ncs_blk = _sb((NCBl, K - 1, D))
+            for j in range(K - 1):
+                src = xc
+                if j < K - 2:
+                    src = cs[:, j + 1, :]
+                ncs_ps = _ps((NCBl, 128))
+                nisa.nc_transpose(dst=ncs_ps, data=src)
+                nisa.tensor_copy(dst=ncs_blk[:, j, :], src=ncs_ps)
+            for ri in range(len(runs)):
+                l0 = runs[ri][0]
+                n = runs[ri][2]
+                nisa.dma_copy(
+                    dst=_page_ap(
+                        conv_view,
+                        oslot,
+                        conv_off + runs[ri][1] * D,
+                        [[D, n], [NCB * D, K - 1], [1, D]],
+                    ),
+                    src=ncs_blk[l0 : l0 + n, :, :],
+                    dge_mode=nisa.dge_mode.hwdge,
+                    oob_mode=oob_mode.skip,
+                )
+            # the next token's conv state (channel layout)
+            ncs = _sb((128, K - 1, NCBl))
+            for j in range(K - 1):
+                src = xc
+                if j < K - 2:
+                    src = cs[:, j + 1, :]
+                nisa.tensor_copy(dst=ncs[:, j, :], src=src)
+
+            # ---- q, k L2 norm (sum over Dk = partitions via ones-matmul)
+            qk = xs[:, 0 : 2 * hkp]
+            sq2 = _sb((128, 2 * hkp))
+            nisa.tensor_tensor(dst=sq2, data1=qk, data2=qk, op=nl.multiply)
+            ssum = _ps((128, 2 * hkp))
+            nisa.nc_matmul(dst=ssum, stationary=ones, moving=sq2)
+            rinv = _sb((128, 2 * hkp))
+            nisa.activation(dst=rinv, op=nl.rsqrt, data=ssum, bias=_L2_EPS)
+            qkn = _sb((128, 2 * hkp))
+            nisa.tensor_tensor(dst=qkn, data1=qk, data2=rinv, op=nl.multiply)
+            nisa.tensor_scalar(
+                dst=qkn[:, 0:hkp],
+                data=qkn[:, 0:hkp],
+                op0=nl.multiply,
+                operand0=float(D) ** -0.5,
+            )
+            kq = _sb((128, hkp))
+            nisa.tensor_tensor(
+                dst=kq, data1=qkn[:, 0:hkp], data2=qkn[:, hkp : 2 * hkp], op=nl.multiply
+            )
+            kqdot_ps = _ps((128, hkp))
+            nisa.nc_matmul(dst=kqdot_ps, stationary=ones, moving=kq)
+            kqm = _sb((128, hkp, 2))
+            nisa.tensor_copy(dst=kqm[:, :, 0], src=qkn[:, hkp : 2 * hkp])
+            nisa.tensor_copy(dst=kqm[:, :, 1], src=qkn[:, 0:hkp])
+            ke = _sb((128, hp))
+            kqd = _sb((128, hp))
+            for i in range(hp):
+                kh = i // rep  # local key head (h0 is a multiple of rep)
+                nisa.tensor_copy(
+                    dst=ke[:, i : i + 1], src=qkn[:, hkp + kh : hkp + kh + 1]
+                )
+                nisa.tensor_copy(dst=kqd[:, i : i + 1], src=kqdot_ps[:, kh : kh + 1])
+            v = xs[:, 2 * hkp : 2 * hkp + hp]
+
+            # ---- delta rule, all of this program's heads at once
+            mv = _ps((128, hp, 2))
+            for i in range(hp):
+                nisa.nc_matmul(
+                    dst=mv[:, i, :], stationary=S[:, i, :], moving=kqm[:, i // rep, :]
+                )
+            t = _sb((128, hp))
+            nisa.tensor_tensor(dst=t, data1=mv[:, :, 0], data2=decay, op=nl.multiply)
+            nisa.tensor_tensor(dst=t, data1=v, data2=t, op=nl.subtract)
+            delta = _sb((128, hp))
+            nisa.tensor_tensor(dst=delta, data1=t, data2=beta, op=nl.multiply)
+            o = _sb((128, hp))
+            nisa.tensor_tensor(dst=o, data1=mv[:, :, 1], data2=decay, op=nl.multiply)
+            t2 = _sb((128, hp))
+            nisa.tensor_tensor(dst=t2, data1=delta, data2=kqd, op=nl.multiply)
+            nisa.tensor_tensor(dst=o, data1=o, data2=t2, op=nl.add)
+
+            dT_ps = _ps((hp, 128))
+            nisa.nc_transpose(dst=dT_ps, data=delta)
+            dT = _sb((hp, 128))
+            nisa.tensor_copy(dst=dT, src=dT_ps)
+            kT_ps = _ps((hp, 128))
+            nisa.nc_transpose(dst=kT_ps, data=ke)
+            kT = _sb((hp, 128))
+            nisa.tensor_copy(dst=kT, src=kT_ps)
+            mbd = _sb((hp, hp, D))
+            for i in range(hp):
+                nisa.tensor_scalar(
+                    dst=mbd[:, i, :],
+                    data=dT,
+                    op0=nl.multiply,
+                    operand0=onehot[:, i : i + 1],
+                )
+            S_new = _sb((128, hp, D))
+            HG = 512 // D
+            for g0 in range(0, hp, HG):
+                ng = min(HG, hp - g0)
+                outer = _ps((128, ng, D))
+                nisa.nc_matmul(dst=outer, stationary=kT, moving=mbd[:, g0 : g0 + ng, :])
+                for i in range(ng):
+                    nisa.scalar_tensor_tensor(
+                        dst=S_new[:, g0 + i, :],
+                        data=S[:, g0 + i, :],
+                        op0=nl.multiply,
+                        operand0=decay[:, g0 + i : g0 + i + 1],
+                        op1=nl.add,
+                        operand1=outer[:, i, :],
+                    )
+            _heads_dma(S_new, h0, hp, D, R, va, vb, oslot, write=True)
+
+            nisa.tensor_copy(dst=o_all[:, :, bi], src=o)
+            S = S_new
+            cs = ncs
+
+    # ---- gated RMSNorm over Dv (partitions) for all tokens:
+    # o * (mean(o^2) + eps)^-0.5 * w * silu(z)
+    o2 = _sb((128, hp, T))
+    nisa.tensor_tensor(dst=o2, data1=o_all, data2=o_all, op=nl.multiply)
+    rr = _sb((128, hp, T))
+    HN = 512 // T  # heads per PSUM bank
+    for g0 in range(0, hp, HN):
+        ng = min(HN, hp - g0)
+        osum = _ps((128, ng, T))
+        nisa.nc_matmul(dst=osum, stationary=ones, moving=o2[:, g0 : g0 + ng, :])
+        nisa.activation(
+            dst=rr[:, g0 : g0 + ng, :], op=nl.rsqrt, data=osum, scale=1.0 / D, bias=eps
+        )
+    on = _sb((128, hp, T))
+    nisa.tensor_tensor(dst=on, data1=o_all, data2=rr, op=nl.multiply)
+    nisa.tensor_scalar(dst=on, data=on, op0=nl.multiply, operand0=normw)
+    res = _sb((128, hp, T))
+    nisa.tensor_tensor(dst=res, data1=on, data2=zs_all, op=nl.multiply)
+    res_t = _sb((T, NZ), out.dtype)  # rows = tokens: one store per program
+    for i in range(hp):
+        rp = _ps((T, 128))
+        nisa.nc_transpose(dst=rp, data=res[:, i, :])
+        nisa.tensor_copy(dst=res_t[:, i * D : (i + 1) * D], src=rp)
+    nisa.dma_copy(
+        dst=out.ap(pattern=[[Hv * D, T], [1, NZ]], offset=h0 * D),
+        src=res_t,
+    )
+    return out, state_a, state_b
+
+
+def gdn_decode_batched(
+    mixed,
+    z,
+    b,
+    a,
+    conv_w,
+    A_log,
+    dt_bias,
+    norm_w,
+    state_a,
+    state_b,
+    slots_in,
+    slots_out,
+    eps,
+):
+    """Torch entry (inside the compiled graph). Returns out [T, Hv*D]; states updated in place."""
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    out, _, _ = wrap_nki(gdn_decode_batched_kernel)[get_logical_nc_config()](
+        mixed,
+        z,
+        b,
+        a,
+        conv_w,
+        A_log,
+        dt_bias,
+        norm_w,
+        state_a,
+        state_b,
+        slots_in,
+        slots_out,
+        eps,
+    )
+    return out
 
 
 def gdn_ba_decode_layout(w_b, w_a, n_prgs: int = 2):

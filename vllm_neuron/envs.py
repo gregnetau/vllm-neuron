@@ -110,6 +110,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_MEGA_SBUF_ALLOC: bool = True
     # Hybrid (recurrent-state) models: keep the state in vLLM's shared KV pool
     VLLM_NEURON_SHARED_STATE_POOL: bool = False
+    # Qwen3.5 GDN batched decode kernel: 0 off, 1 B > 1 and MTP verify, 2 also B = 1
+    VLLM_NEURON_GDN_BATCHED_DECODE: int = 1
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -550,6 +552,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1 keeps it in vLLM's shared KV pool, as prefix caching does.
     "VLLM_NEURON_SHARED_STATE_POOL": lambda: bool(
         maybe_convert_bool(os.getenv("VLLM_NEURON_SHARED_STATE_POOL"))
+    ),
+    # Qwen3.5 / Qwen3.8 GDN decode with gdn_kernels.gdn_decode_batched (BF16 projections in
+    # torch, the recurrence in one NKI kernel for up to 32 tokens): 0 uses the PyTorch path
+    # for B > 1 and MTP verify steps, 1 (default) the kernel there, 2 the kernel for B = 1
+    # single-token steps too (instead of gdn_decode).
+    "VLLM_NEURON_GDN_BATCHED_DECODE": lambda: int(
+        os.getenv("VLLM_NEURON_GDN_BATCHED_DECODE", "1")
     ),
 }
 
