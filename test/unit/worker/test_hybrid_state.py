@@ -128,6 +128,37 @@ def test_prefix_caching_uses_align_mode_with_enlarged_block():
     assert spec.block_size == 32 * KERNEL_BLOCK
 
 
+def test_prefix_caching_gives_state_layers_of_different_sizes_one_page():
+    """Align mode needs one block size for every KV group: a smaller state layer (the PLE
+    conv state of Qwen3.8-Flash-Next next to its GDN layers) takes the largest page, so
+    vLLM forms groups of one block size. Without prefix caching each keeps its own."""
+    small = StateLayerSpec(
+        name="layers.1.ple", shapes=((9, 2560),), dtypes=(torch.float32,)
+    )
+    layers = _state_layers() + [small]
+
+    def build(prefix_caching):
+        return hybrid_state.build_state_cache_specs(
+            layers,
+            _attn_specs(),
+            kernel_block=KERNEL_BLOCK,
+            max_model_len=MAX_MODEL_LEN,
+            prefix_caching=prefix_caching,
+            dedicated=not prefix_caching,
+            num_spec_blocks=0,
+            placeholder_pages=1,
+            align_pages=1,
+        )
+
+    specs, _ = build(True)
+    gdn, ple = specs["layers.0.linear_attn"], specs["layers.1.ple"]
+    assert ple.page_size_bytes == gdn.page_size_bytes
+    assert ple.block_size == gdn.block_size
+    assert {size for _, size, _ in _groups(specs)} == {gdn.block_size}
+    _, real = build(False)
+    assert real["layers.1.ple"][1] < real["layers.0.linear_attn"][1]
+
+
 def test_spec_blocks_are_carried():
     specs, _ = _specs(placeholder_pages=1, k=2)
     assert specs["layers.0.linear_attn"].num_speculative_blocks == 2
