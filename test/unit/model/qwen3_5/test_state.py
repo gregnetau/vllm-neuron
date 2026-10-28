@@ -42,7 +42,7 @@ def test_real_model_state_sizes_tp4(state, state_cache, cfg):
 
 def test_tp_must_divide(state, cfg):
     with pytest.raises(ValueError):
-        state.gdn_state_shapes(cfg, 8)
+        state.gdn_state_shapes(cfg, 3)
 
 
 def test_paired_halves_match_attention_block_bytes(state_cache):

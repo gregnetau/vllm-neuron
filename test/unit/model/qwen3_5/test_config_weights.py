@@ -53,10 +53,11 @@ def test_config_from_hf_object(qwen3_5_config, raw):
 
 def test_tp_validation(qwen3_5_config, raw):
     cfg = qwen3_5_config.Qwen3_5Config.from_configs(raw)
-    for tp in (1, 2, 4):
+    for tp in (1, 2, 4, 8):  # TP 8: each of the 4 KV heads on two ranks
         cfg.validate_tp(tp)
+    assert cfg.num_kv_heads_per_rank(8) == 1 and cfg.kv_head_shard(5, 8) == (2, 4)
     with pytest.raises(ValueError):
-        cfg.validate_tp(8)  # 4 KV heads: no replication supported
+        cfg.validate_tp(16)  # 24 query heads
     with pytest.raises(ValueError):
         qwen3_5_config.Qwen3_5Config(
             num_hidden_layers=4, layer_types=["full_attention"]

@@ -9,6 +9,11 @@ token after next (as vLLM's ``Qwen3_5MultiTokenPredictor``):
     h = fc(cat(norm_e(embed(t[i+1])), norm_h(target_hidden[i])))   # [T, 2H] -> [T, H]
     h = norm(decoder_layer(h))                                     # predicts t[i+2]
 
+The layer's FFN is built from the config like the backbone's: a dense MLP, or for
+``qwen3_5_moe`` (e.g. Qwen3.5-35B-A3B) the sparse MoE block, whose MTP experts the
+checkpoint stores per expert (``mtp.layers.0.mlp.experts.{e}.{gate,up,down}_proj.weight``)
+rather than fused as in the backbone.
+
 ``target_hidden`` is the backbone's final-normed hidden state. Embedding and LM head are the
 backbone's (loaded again from the checkpoint). Further draft tokens reuse the layer with the
 previous draft's hidden state. The draft is driven by the plugin's EagleProposer, whose
@@ -316,7 +321,7 @@ class Qwen3_5MTP(nn.Module):
     def _setup_weight_loaders(self):
         cfg, tp = self.config, self.world_size
         for layer in self.model.layers:
-            _attach_layer_loaders(layer, cfg, tp)
+            _attach_layer_loaders(layer, cfg, tp, fused_experts=False)
         fold = _loader(lambda t, r: W.fold_zero_centered_norm(t[0]).float())
         for norm in (
             self.model.pre_fc_norm_embedding,
@@ -362,7 +367,12 @@ class Qwen3_5MTP(nn.Module):
         }
         for i, layer in enumerate(self.model.layers):
             m.update(
-                _layer_weight_mappings(layer, f"model.layers.{i}.", f"{MTP}layers.{i}.")
+                _layer_weight_mappings(
+                    layer,
+                    f"model.layers.{i}.",
+                    f"{MTP}layers.{i}.",
+                    fused_experts=False,
+                )
             )
         return m
 

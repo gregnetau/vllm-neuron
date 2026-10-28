@@ -11,15 +11,19 @@ Checkpoint prefixes (``Qwen3_5ForConditionalGeneration``): text weights live und
 ``model.language_model.*`` (``lm_head.weight`` is top level). ``model.visual.*`` is not
 loaded (text only); ``mtp.*`` is loaded only by the MTP draft model (``mtp.py``).
 
-Sharding (TP degree ``tp``; every sharded dim must divide evenly, no KV replication):
+Sharding (TP degree ``tp``; every sharded dim must divide evenly):
   full attention   q_proj   rows, per-head blocks of [query(head_dim) | gate(head_dim)]
-                   k/v_proj rows by KV head, o_proj cols by Q head
+                   k/v_proj rows by KV head (replicated when tp > KV heads: ranks
+                   r*rep .. r*rep+rep-1 hold KV head r), o_proj cols by Q head
                    q_norm / k_norm replicated (head_dim only)
   linear attention in_proj_qkv rows: q | k | v segments each sharded by its own heads
                    conv1d channels: same q | k | v segmentation
                    in_proj_z / in_proj_a / in_proj_b / A_log / dt_bias: by value head
                    out_proj cols by value head; norm (head_v_dim) replicated
   MLP              gate/up rows, down cols
+  MoE (qwen3_5_moe) routed experts [E, 2I, H] / [E, H, I]: every rank holds every expert,
+                   sharded on I (or, with expert parallelism, a contiguous expert range);
+                   shared expert like the MLP; router and shared_expert_gate replicated
   embed_tokens / lm_head vocab rows (generic sharding loaders in model.py); layernorms
                    and the final norm replicated
 Head grouping is preserved: value heads per rank = key heads per rank * (Hv/Hk), so
@@ -118,10 +122,11 @@ def attention_qkv_device(q_proj, k_proj, v_proj, cfg, rank: int, tp: int):
     perm = rotary_channel_permutation(hd, cfg.rotary_dim)
     q = _heads(q_proj, H, 2 * hd)[:, :hd]  # drop the gate rows
     q = _chunk(q[:, perm], 0, rank, tp).reshape(-1, q_proj.shape[1])
-    k = _chunk(_heads(k_proj, Hkv, hd)[:, perm], 0, rank, tp).reshape(
+    kv_rank, kv_tp = cfg.kv_head_shard(rank, tp)  # replicated KV heads: shared shard
+    k = _chunk(_heads(k_proj, Hkv, hd)[:, perm], 0, kv_rank, kv_tp).reshape(
         -1, k_proj.shape[1]
     )
-    v = _chunk(_heads(v_proj, Hkv, hd), 0, rank, tp).reshape(-1, v_proj.shape[1])
+    v = _chunk(_heads(v_proj, Hkv, hd), 0, kv_rank, kv_tp).reshape(-1, v_proj.shape[1])
     return torch.cat([q, k, v], dim=0).t().contiguous()
 
 
@@ -178,6 +183,72 @@ def mlp_gate_up_device(w, rank: int, tp: int):
 def mlp_down_device(w, rank: int, tp: int):
     """[intermediate_r, hidden]."""
     return _chunk(w, 1, rank, tp).t().contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Sparse MoE experts (qwen3_5_moe). Kernel layout (nkilib moe_cte / moe_block_tkg):
+# gate_up [E_local, H, 2, I_r] (index 0 = gate, 1 = up), down [E_local, I_r, H].
+#
+# ``src`` may be a tensor or a checkpoint slice (``get_shape()`` + ``__getitem__``), so only
+# this rank's rows are read: the backbone stores one fused tensor per layer (HF
+# ``Qwen3_5MoeExperts``: gate_up_proj [E, 2I, H] whose first I rows are gate, down_proj
+# [E, H, I]); the MTP layer stores per-expert ``nn.Linear`` weights.
+# ---------------------------------------------------------------------------
+def _shape(src) -> tuple[int, ...]:
+    return tuple(src.get_shape()) if hasattr(src, "get_shape") else tuple(src.shape)
+
+
+def moe_gate_up_device(src, rank: int, tp: int) -> torch.Tensor:
+    """Fused gate_up_proj [E, 2I, H] -> [E, H, 2, I/tp]."""
+    E, two_i, H = _shape(src)
+    inter = two_i // 2
+    if inter % tp:
+        raise ValueError(f"moe_intermediate_size={inter} not divisible by tp={tp}")
+    step = inter // tp
+    lo = rank * step
+    # One half at a time: the transposed copy of the full shard doubles the peak otherwise.
+    gate = src[:, lo : lo + step, :]
+    out = torch.empty(E, H, 2, step, dtype=gate.dtype)
+    out[:, :, 0] = gate.transpose(1, 2)
+    del gate
+    out[:, :, 1] = src[:, inter + lo : inter + lo + step, :].transpose(1, 2)
+    return out
+
+
+def moe_down_device(src, rank: int, tp: int, chunk_experts: int = 32) -> torch.Tensor:
+    """Fused down_proj [E, H, I] -> [E, I/tp, H]. Read in groups of whole experts: slicing the
+    last dim of a checkpoint slice directly is one small read per (expert, row)."""
+    E, _, inter = _shape(src)
+    if inter % tp:
+        raise ValueError(f"moe_intermediate_size={inter} not divisible by tp={tp}")
+    step = inter // tp
+    lo = rank * step
+    parts = []
+    for first in range(0, E, chunk_experts):
+        group = src[first : min(first + chunk_experts, E)]
+        parts.append(group[:, :, lo : lo + step].transpose(1, 2))
+    return torch.cat(parts, dim=0)
+
+
+def moe_gate_up_device_per_expert(gates, ups, rank: int, tp: int) -> torch.Tensor:
+    """Per-expert gate_proj / up_proj [I, H] (lists over experts) -> [E, H, 2, I/tp]."""
+    return torch.stack(
+        [
+            torch.stack(
+                [
+                    mlp_gate_up_device(g[:], rank, tp),
+                    mlp_gate_up_device(u[:], rank, tp),
+                ],
+                dim=1,
+            )
+            for g, u in zip(gates, ups)
+        ]
+    )
+
+
+def moe_down_device_per_expert(downs, rank: int, tp: int) -> torch.Tensor:
+    """Per-expert down_proj [H, I] (list over experts) -> [E, I/tp, H]."""
+    return torch.stack([mlp_down_device(d[:], rank, tp) for d in downs])
 
 
 # ---------------------------------------------------------------------------
