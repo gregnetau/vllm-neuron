@@ -99,13 +99,20 @@ def build_state_cache_specs(
         align_pages = state_page_align_pages(kernel_block)
     specs: dict[str, MambaSpec] = {}
     real_pages: dict[str, tuple[StatePageLayout, int]] = {}
-    for layer in state_layers:
-        layout = page_layout(layer.shapes, layer.dtypes)
+    layouts = [page_layout(layer.shapes, layer.dtypes) for layer in state_layers]
+    pages = []
+    for layout in layouts:
         page = padded_state_page_bytes(layout.page_bytes, attn_page, align_pages)
         # Power-of-two attention pages per state page, so the enlarged attention block
         # divides max_model_len (e.g. Qwen3.8-27B with FP8 KV would otherwise give 1792-token
         # blocks, block tables of 1064 entries, and odd-stride FP8 DMAs neuronx-cc rejects).
-        page = attn_page * (1 << (page // attn_page - 1).bit_length())
+        pages.append(attn_page * (1 << (page // attn_page - 1).bit_length()))
+    if prefix_caching and pages:
+        # Align mode needs one block size for every KV group (a state checkpoint lines up
+        # with an attention prefix block), so state layers of different sizes (the GDN and
+        # PLE state of Qwen3.8-Flash-Next) all take the largest page.
+        pages = [max(pages)] * len(pages)
+    for layer, layout, page in zip(state_layers, layouts, pages):
         shapes, dtypes = tuple(layer.shapes), tuple(layer.dtypes)
         if dedicated:
             real_pages[layer.name] = (layout, page)
