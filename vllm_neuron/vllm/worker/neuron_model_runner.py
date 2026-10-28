@@ -42,6 +42,13 @@ from vllm_neuron.model.state_cache import (
     state_half_elems as _state_half_elems,
 )
 from vllm_neuron.vllm.worker import hybrid_state
+from vllm_neuron.vllm.worker.host_inputs import (
+    HostInputSpecs,
+    _host_input_specs_of,
+    build_step_host_inputs,
+    host_input_req_rows,
+    host_input_zero_kwargs,
+)
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.lnc import get_explicit_compiler_lnc_arg
 from vllm.v1.kv_cache_interface import (
@@ -95,7 +102,7 @@ from vllm_neuron.metrics import (
     MODEL_LOAD_TIME,
     NEFF_EXECUTION_COUNT,
 )
-from vllm_neuron.model.interfaces import HasHostInputs, SupportsMRoPE
+from vllm_neuron.model.interfaces import SupportsMRoPE
 from vllm_neuron.model.kv_cache import KeyOnlyAttentionSpec
 from vllm_neuron.model.neuron_config import (
     NeuronConfig,
@@ -376,133 +383,6 @@ def _supports_async_reorder(model: Any) -> bool:
     """
     model = getattr(model, "_orig_mod", model)
     return getattr(model, "supports_async_reorder", False) is True
-
-
-HostInputSpecs = dict[str, tuple[tuple[int, ...], torch.dtype]]
-
-
-def _host_input_specs_of(model: Any) -> HostInputSpecs | None:
-    """Return the ``HasHostInputs`` specs of a loaded model, or None without the capability.
-
-    ``torch.compile`` wraps the module, so test the original. The spec-decode decorator
-    patches ``forward`` on the class, so the module itself is the model instance.
-
-    Args:
-        model: The loaded model, wrapped or unwrapped.
-
-    Returns:
-        A copy of kwarg name -> (per-token trailing shape, dtype), or None.
-    """
-    model = getattr(model, "_orig_mod", model)
-    if model is None or not isinstance(model, HasHostInputs):
-        return None
-    return {
-        name: (tuple(int(d) for d in shape), dtype)
-        for name, (shape, dtype) in model.host_input_specs().items()
-    }
-
-
-def host_input_req_rows(
-    num_real_tokens: np.ndarray, num_pad_tokens: np.ndarray, num_rows: int
-) -> np.ndarray:
-    """Map each row of the padded token layout to its ``input_batch`` row.
-
-    Request ``i`` (``input_batch`` row ``i``) owns ``num_real_tokens[i]`` rows followed by
-    ``num_pad_tokens[i]`` padding rows (prefill bucket padding). Rows past the last
-    request (decode batch padding, mixed-spec padding, DP padding) are padding too.
-
-    Args:
-        num_real_tokens: [num_reqs] scheduled (unpadded) token count per request.
-        num_pad_tokens: [num_reqs] per-request padding rows appended after the real ones.
-        num_rows: Total row count T of the padded ``input_ids``.
-
-    Returns:
-        [T] int64: the ``input_batch`` row of each token, -1 on padding rows.
-
-    Examples:
-        >>> host_input_req_rows(np.array([2, 1]), np.array([1, 0]), 6).tolist()
-        [0, 0, -1, 1, -1, -1]
-    """
-    num_real = np.asarray(num_real_tokens, dtype=np.int64)
-    num_pad = np.asarray(num_pad_tokens, dtype=np.int64)
-    num_reqs = num_real.shape[0]
-    req_ids = np.arange(num_reqs, dtype=np.int64)
-    # Interleave [real_0, pad_0, real_1, pad_1, ...] segments.
-    seg_vals = np.stack([req_ids, np.full(num_reqs, -1, dtype=np.int64)], 1).reshape(-1)
-    seg_lens = np.stack([num_real, num_pad], 1).reshape(-1)
-    rows = np.repeat(seg_vals, seg_lens)
-    if rows.shape[0] > num_rows:
-        raise ValueError(
-            f"Host-input layout has {rows.shape[0]} rows, more than the {num_rows} "
-            "padded input_ids rows."
-        )
-    return np.concatenate([rows, np.full(num_rows - rows.shape[0], -1, dtype=np.int64)])
-
-
-def host_input_zero_kwargs(
-    specs: HostInputSpecs | None, num_tokens: int, device: torch.device | str
-) -> dict[str, torch.Tensor]:
-    """Zero-filled host inputs ``[num_tokens, *shape]`` for warmup, capture and dummy runs.
-
-    Returns an empty dict when ``specs`` is None, so a model without the capability gets
-    no extra kwargs.
-    """
-    if not specs:
-        return {}
-    return {
-        name: torch.zeros((num_tokens, *shape), dtype=dtype, device=device)
-        for name, (shape, dtype) in specs.items()
-    }
-
-
-def build_step_host_inputs(
-    model: Any,
-    specs: HostInputSpecs,
-    input_ids: np.ndarray,
-    req_rows: np.ndarray,
-    positions: np.ndarray,
-    token_ids_cpu: np.ndarray,
-) -> dict[str, torch.Tensor]:
-    """Call ``build_host_inputs`` and check its result against the declared specs.
-
-    Padding rows (``req_rows == -1``) get position 0. A wrong name, shape or dtype raises
-    here, on the host, instead of tracing a new graph or failing a compiled-graph guard.
-
-    Args:
-        model: The loaded model, wrapped or unwrapped.
-        specs: The model's ``host_input_specs()``.
-        input_ids: [T] padded token ids.
-        req_rows: [T] ``input_batch`` row per token, -1 on padding rows.
-        positions: [T] absolute position per token.
-        token_ids_cpu: ``input_batch.token_ids_cpu``.
-
-    Returns:
-        name -> CPU tensor ``[T, *shape]``.
-    """
-    model = getattr(model, "_orig_mod", model)
-    req_rows = np.asarray(req_rows, dtype=np.int64)
-    positions = np.where(req_rows >= 0, np.asarray(positions, dtype=np.int64), 0)
-    input_ids = np.asarray(input_ids).astype(np.int64, copy=False)
-    num_tokens = input_ids.shape[0]
-    if req_rows.shape != (num_tokens,) or positions.shape != (num_tokens,):
-        raise ValueError(
-            f"Host-input rows mismatch: input_ids {input_ids.shape}, req_rows "
-            f"{req_rows.shape}, positions {positions.shape}."
-        )
-    out = model.build_host_inputs(input_ids, req_rows, positions, token_ids_cpu)
-    if set(out) != set(specs):
-        raise ValueError(
-            f"build_host_inputs returned {sorted(out)}, host_input_specs declares "
-            f"{sorted(specs)}."
-        )
-    for name, (shape, dtype) in specs.items():
-        tensor = out[name]
-        if tuple(tensor.shape) != (num_tokens, *shape) or tensor.dtype != dtype:
-            raise ValueError(
-                f"Host input {name!r}: got {tuple(tensor.shape)} {tensor.dtype}, "
-                f"expected {(num_tokens, *shape)} {dtype}."
-            )
-    return out
 
 
 def _supports_aux_hidden_states(model: Any) -> bool:
