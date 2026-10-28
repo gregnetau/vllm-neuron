@@ -59,6 +59,7 @@ def build_state_cache_specs(
     num_spec_blocks: int,
     placeholder_pages: int,
     align_pages: int | None = None,
+    uniform_shapes: bool = False,
 ) -> tuple[dict[str, MambaSpec], dict[str, tuple[StatePageLayout, int]]]:
     """MambaSpec per recurrent-state layer, and the real pages of a dedicated pool.
 
@@ -89,6 +90,14 @@ def build_state_cache_specs(
             tokens, which the V1 runner's attention kernels need for an enlarged
             block). The V2 runner splits enlarged blocks into kernel blocks and
             passes 1.
+        uniform_shapes: Report every state layer to vLLM with one placeholder shape
+            (and the real page size), returning the real layouts in ``real_pages``
+            as for a dedicated pool. vLLM groups layers by spec equality and sizes
+            the groups by the smallest layer type, so state layers of different
+            shapes (Qwen3.8-Flash-Next's 36 GDN layers and one PLE layer) would each
+            get a group of one layer: every attention layer's KV view would then span
+            the whole pool. The V2 runner's prefix caching passes True (its
+            checkpoints are raw page copies).
 
     Returns:
         ``(specs, real_pages)``: the MambaSpec per layer, and for a dedicated pool the
@@ -121,6 +130,9 @@ def build_state_cache_specs(
                 ((1,),),
                 (torch.float32,),
             )
+        elif uniform_shapes:
+            real_pages[layer.name] = (layout, page)
+            shapes, dtypes = ((1,),), (torch.float32,)
         if prefix_caching:
             block_size = page // attn_page * kernel_block
             mode = "align"
