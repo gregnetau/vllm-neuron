@@ -283,22 +283,25 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 - thinking mode at the template's default `reasoning_effort=xhigh`, model-card sampling
   (temperature 1.0, top_p 0.95, top_k 20);
 - Aider 0.86.3.dev (5dc9490);
-- served by 8 replicas at 64k context.
+- served by replicas at 64k context (8 on Model Runner V1, 7 on V2).
 
-| | Run 1 (2026-10-22) | Run 2 (2026-10-27) |
-|---|---|---|
-| Serving | 3 concurrent requests per replica (default cap), 24 threads | 8 per replica (`VLLM_NEURON_MAX_KV_CONCURRENT=8`), 64 threads |
-| Pass rate, 1 try / 2 tries | 48.9% / 86.2% (194 of 225) | 47.1% / **87.1%** (196 of 225) |
-| Well-formed responses | 99.6% | 100% |
-| Error outputs | 24 (15 Aider-side 3,600 s request timeouts) | 19 (13 timeouts) |
-| Exhausted context windows | 6 | 6 |
-| Tokens (prompt / completion) | 3.0M / 5.47M | 2.8M / 5.67M |
-| Wall time, average generation rate | 12.5 h, ~120 tok/s | 8.8 h, ~180 tok/s |
+| | Run 1 (2026-10-22) | Run 2 (2026-10-27) | Run 3, Model Runner V2 (2026-10-28) |
+|---|---|---|---|
+| Serving | 3 concurrent requests per replica (default cap), 24 threads | 8 per replica (`VLLM_NEURON_MAX_KV_CONCURRENT=8`), 64 threads | 7 replicas (`RUNNER=v2`), 8 per replica, 56 threads |
+| Pass rate, 1 try / 2 tries | 48.9% / 86.2% (194 of 225) | 47.1% / **87.1%** (196 of 225) | **50.2%** / 86.7% (195 of 225) |
+| Well-formed responses | 99.6% | 100% | 100% |
+| Error outputs | 24 (15 Aider-side 3,600 s request timeouts) | 19 (13 timeouts) | 9 (2 timeouts) |
+| Exhausted context windows | 6 | 6 | 7 |
+| Tokens (prompt / completion) | 3.0M / 5.47M | 2.8M / 5.67M | 2.6M / 5.93M |
+| Wall time, average generation rate | 12.5 h, ~120 tok/s | 8.8 h, ~180 tok/s | **5.5 h, ~300 tok/s** |
 
 - **Errors.** The timeouts are very long thinking responses, which Aider abandons after its
   3,600 s request timeout.
 - **Run 2's code.** It used the final branch (MTP not enabled). No preemption occurred at 8
   requests per replica.
+- **Run 3** ran on Model Runner V2 (MTP and prefix caching not enabled), with one replica fewer.
+  It generated about 52 tok/s per replica on average, against about 22 in run 2; at batch 8 a
+  replica decoded about 110 tok/s at the run's contexts. 22 preemptions, no server errors.
 
 ## Known limitations
 
