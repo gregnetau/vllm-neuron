@@ -39,8 +39,9 @@ device per-request table (`req_states.draft_tokens`, read by
 hybrid model resumes from the state block given by a per-slot accepted count
 (`model_states/mamba_hybrid.py`, `num_accepted_tokens_gpu`).
 
-Scope: MTP (`speculative_config.method == "mtp"`, Qwen3.5 / Qwen3.8 dense, the
-`Qwen3_5MTP` head) first. The draft-model contract is the one EAGLE3 and the MTP proposer of
+Scope: MTP (`speculative_config.method == "mtp"`): Qwen3.5 / Qwen3.8 dense with the
+`Qwen3_5MTP` head, and Qwen3.8-Flash-Next (qwen4_exp) with the `Qwen4ExpMTP` head, whose verify
+rows also need host inputs (the n-gram rows of the drafts, [Host inputs](../host-inputs.md)). The draft-model contract is the one EAGLE3 and the MTP proposer of
 upstream PR #78 share (`forward(...) -> (tokens [B, 1 + k], drafts [B, k], logits)`), so
 EAGLE3 is a target-output parser and a hidden-state width away (see [EAGLE3](#eagle3)).
 
@@ -50,8 +51,9 @@ Speculative decoding stays on V1 unless both hold:
 
 - `VLLM_USE_V2_MODEL_RUNNER=1`, and
 - the method and the target architecture are in `V2_SPEC_DECODE_METHODS`
-  (`vllm/worker/v2_spec_decode.py`; initially `mtp` for `Qwen3_5ForCausalLM` /
-  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense).
+  (`vllm/worker/v2_spec_decode.py`: `mtp` for `Qwen3_5ForCausalLM` /
+  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense, and for
+  `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration`).
 
 `get_neuron_model_runner_v2_policy` keeps `default_enabled=False` for every speculative
 configuration (V1 stays the default until device parity runs pass), and
