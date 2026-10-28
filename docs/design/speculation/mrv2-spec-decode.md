@@ -4,7 +4,7 @@
 Model Runner V2: fixed-layout verify graph, in-graph rejection and multi-token commit, and a
 device-resident per-slot accepted count. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-10-28 -->
 
 ## Overview
 
@@ -56,7 +56,7 @@ Speculative decoding stays on V1 unless both hold:
   with the sparse MoE FFN; see [Sparse MoE targets](#sparse-moe-targets)).
 
 `get_neuron_model_runner_v2_policy` keeps `default_enabled=False` for every speculative
-configuration (V1 stays the default until device parity runs pass), and
+configuration (V1 stays the default; the device runs below match V1), and
 `_spec_decode_unsupported` records as unsupported (so a forced V2 fails validation) any
 speculative configuration with: a method or architecture outside the allowlist, KV transfer
 (DI; the bootstrap slot reads its first token from history, and the last-token recompute of
@@ -274,15 +274,19 @@ unchanged: a verify graph touches exactly the slots of its rows.
 ## Near max_model_len
 
 - The scheduler limits a step to `max_model_len - 1 - num_computed` tokens, so a request near
-  the end gets `n_r < k` drafts (sync) or none (async: `NeuronAsyncScheduler` stops drafting
-  for every request while any request is near the end, 932f443). Both are rows with fewer
-  drafts in the fixed layout.
-- The scheduler-side rule of 932f443 does not exclude every mixed step: once the request near
-  the end has finished, a request whose final prefill chunk ran while the others were held back
+  the end gets `n_r < k` drafts (sync) or none (async: the scheduler stops drafting for that
+  request). Both are rows with fewer drafts in the fixed layout, next to rows with `k`.
+- V1 cannot lay out such a mixed step. 932f443 stopped drafting for every request while any
+  request was near the end, which did not exclude every mixed step (once the request near the
+  end has finished, a request whose final prefill chunk ran while the others were held back
   gets placeholders, while the held-back requests keep the empty draft lists of their last
-  step, so the next step mixes rows with `k` and with 0 drafts (seen in the CPU test with
-  `NeuronAsyncScheduler`, `decode_steps_between_prefill_chunks=0`). V1's packed layout would
-  misalign there; the fixed layout does not depend on the rule.
+  step; seen in the CPU test with `NeuronAsyncScheduler`,
+  `decode_steps_between_prefill_chunks=0`) and switched the whole batch between spec and
+  non-spec steps. 45eb294 replaced it: for recurrent-state models on V1,
+  `NeuronAsyncScheduler.add_request` caps `max_tokens` so that a request finishes up to
+  `4 * (1 + k)` tokens before `max_model_len`. V2 is exempt from the cap
+  (`use_v2_model_runner`): its fixed layout does not depend on a scheduler rule, and requests
+  run to `max_model_len`.
 - Padding positions are clamped to `max_model_len - 1` and write the null slot; the drafter's
   recurrent positions are clamped the same way (`mtp._slot_mapping` maps `-1` table entries to
   slot 0).
@@ -427,7 +431,6 @@ token counts (`B * (1 + k)`, then `B` per recurrent draft step).
 
 ## Not done yet
 
-- Device validation (below). Nothing here has run on a Neuron device.
 - EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
 - KV transfer (DI) with speculative decoding, sliding-window targets, decode context-length
   buckets on V2 for models without recurrent state.
@@ -435,7 +438,44 @@ token counts (`B * (1 + k)`, then `B` per recurrent draft step).
 
 ## Device validation
 
-Run on a trn2 instance with no other process on the devices. V2 needs
+Measured on trn2.3xlarge (SDK 2.33, plugin 0.29 fork), Qwen3.8-27B with static FP8 weights
+and FP8 KV, MTP 2, `MAX_MODEL_LEN=65536`, `DECODE_CTX_BUCKETS="16384"`, `MAX_NUM_SEQS=8`,
+`DECODE_INTERLEAVE=1`, `GPU_MEM_UTIL=0.95`, `KV_CAP_FRACTION=0.48`, V1 and V2 in the same
+configuration:
+
+| | V1 | V2 |
+|---|---|---|
+| GSM8K (chat, thinking off), concurrency 8 | 95.9% (1,319 questions) | 96.5% (first 400) |
+| Aggregate output tokens/s, 8 concurrent requests | 295 | 294 |
+| TPOT, batch 1 | 8.8-9.8 ms | 9.0-9.5 ms |
+| TTFT, short prompt | 406 ms | 399 ms |
+| MTP acceptance (tokens per step) | 2.84 | 2.81 |
+
+- Aider Polyglot (225 exercises, diff format, 2 tries, 8 threads, thinking mode): V2 74.7%
+  with 2 tries (32.0% first try, 99.1% well-formed, 0 client timeouts, 4 h 57 min, about
+  280 tokens/s, acceptance 2.53); with prefix caching 71.1% (not significantly different,
+  McNemar p = 0.27). V1 on plugin 0.24: 73.8% and 71.1%.
+- 262k context (`MAX_MODEL_LEN=262144`, `MAX_NUM_SEQS=4`,
+  `DECODE_CTX_BUCKETS="16384, 65536, 131072"`), V2 with MTP 2: passkey retrieval correct at
+  26,936, 105,656 and 220,856 tokens (depths 0.25 and 0.75), TTFT 11.1, 52.5 and 139 s;
+  TPOT 8.95 ms after a 1,000-token prompt.
+- Qwen3.5-35B-A3B (sparse MoE, BF16, TP=4), V2 with MTP 2 and the batched BF16 GDN decode
+  kernel: TPOT 8.6-10.4 ms at batch 1 and 20.0 ms at batch 4, GSM8K 97.0% (300 questions,
+  concurrency 4, as on V1 without MTP), 150 output tokens/s, acceptance 2.81.
+- Prefix caching with and without MTP: see
+  [its device validation](../hybrid-state-gdn.md#device-validation).
+- Stress tests (`examples/vllm_neuron/models/qwen3_5/stress/`): greedy outputs under
+  concurrency against sequential runs with each divergence classified by teacher forcing,
+  chaos (aborts, mixed sampling parameters, `logprobs`, seeds), and randomized
+  near-`max_model_len` and mid-sequence tests. With FP8 a divergence at a near-tie is not a
+  bug: the FP8 prefill, decode and verify graphs can each pick a different token there, so
+  check divergences against the Hugging Face BF16 model before calling them corruption.
+- NKI-simulator tests (`test/unit/model/qwen3_5/test_verify_causality_sim.py`,
+  `RUN_NKI_SIM=1`): one `S = 3` verify step equals three `S = 1` decode steps per layer
+  (attention, GDN FP8 and BF16), and later tokens of a verify row do not change earlier
+  tokens' outputs or state pages.
+
+To reproduce, on a trn2 instance with no other process on the devices. V2 needs
 `VLLM_USE_V2_MODEL_RUNNER=1`; `DECODE_CTX_BUCKETS` and `PREFIX_CACHING=1` are optional (for
 prefix caching see
 [its device validation](../hybrid-state-gdn.md#prefix-caching-on-model-runner-v2)):
