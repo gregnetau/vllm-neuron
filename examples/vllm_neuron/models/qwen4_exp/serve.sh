@@ -6,13 +6,17 @@
 #
 # Usage:
 #   MODEL=<path>/Qwen3.8-Flash-Next CORES=0-7 PORT=8001 examples/vllm_neuron/models/qwen4_exp/serve.sh
+#   # MTP speculative decoding with 2 draft tokens, for single-request latency (GPU_MEM_UTIL
+#   # stays at its default of 0.82; 0.83 and up run out of device memory with 2 draft tokens):
+#   MODEL=... MTP_TOKENS=2 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #
 # Knobs:
 #   MAX_MODEL_LEN (default 65536), MAX_NUM_SEQS (8), PREFILL_BUCKETS ("1024, 4096": short prompts
 #   pad to the smallest, long ones are chunked by the largest), SEQS_BUCKETS ("1, 8"),
 #   DECODE_CTX_BUCKETS ("4096, 16384, 32768": decode reads only the bucket's KV; MAX_MODEL_LEN is
 #   the implicit last one), GPU_MEM_UTIL (0.82: 16.5 GiB weights + ~3.2 GiB KV per 24 GiB core; the QSA indexer views share the KV pool and the graph I/O check NCC_EVRF009 counts it twice), KV_CAP_FRACTION (0.5), SERVED_MODEL_NAME
-#   (qwen3.8-flash-next).
+#   (qwen3.8-flash-next), MTP_TOKENS (unset; 1 or 2: MTP draft tokens, which turns async scheduling
+#   off and is faster at batch 1 only, see the recipe).
 #
 # The n-gram embedding rows are built on the host from the sampled tokens every step
 # (HasHostInputs); async scheduling joins on the sampled tokens before each step (host-token join).
@@ -45,7 +49,12 @@ if [[ -n "${DECODE_INTERLEAVE:-}" ]]; then  # decode steps between the chunks of
   NEURON_CONFIG="${NEURON_CONFIG}, \"decode_steps_between_prefill_chunks\": ${DECODE_INTERLEAVE}"
 fi
 
-exec vllm serve "${MODEL}" \
+SPEC_ARGS=()
+if [[ -n "${MTP_TOKENS:-}" ]]; then
+  SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}")
+fi
+
+exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --served-model-name "${SERVED_MODEL_NAME:-qwen3.8-flash-next}" \
   --port "${PORT}" \
   --tensor-parallel-size 8 \
