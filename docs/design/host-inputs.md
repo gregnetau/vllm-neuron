@@ -1,9 +1,9 @@
 # Host Inputs: Per-Token Tensors Built on the Host
 
-<!-- meta: description: The HasHostInputs model capability. The V1 runner builds extra per-token
-tensors on the host every step and traces every compiled graph with them. -->
+<!-- meta: description: The HasHostInputs model capability. The V1 and V2 runners build extra
+per-token tensors on the host every step and trace every compiled graph with them. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-22 -->
+<!-- meta: date_updated: 2026-10-28 -->
 
 ## Overview
 
@@ -135,25 +135,58 @@ recompute: the scheduler sends their full token ids, and the prefill rows carry 
 `NeuronPlatform._configure_host_input_models` turns async scheduling off for a registered class
 that implements `HasHostInputs` in two cases:
 
-- speculative decoding is configured: the join covers non-speculative steps only, and async
-  spec decode builds its drafts and positions on the device;
+- speculative decoding is configured on V1: V1's join covers non-speculative steps only, and
+  V1's async spec decode builds its drafts and positions on the device (V2's join covers
+  verify steps, see below);
 - `VLLM_NEURON_HOST_INPUTS_ASYNC=0`.
 
-As a backstop the runner raises in `_host_input_specs()` for async scheduling with
+As a backstop the V1 runner raises in `_host_input_specs()` for async scheduling with
 speculative decoding. With `async_scheduling=False` (explicit, or turned off by the hook) the
 synchronous path builds the host inputs in `_prepare_model_input`.
 
+## Model Runner V2
+
+V2 (`neuron_model_runner_v2.py`) builds `input_ids` and positions inside the graph from
+device state (`NeuronForwardAdapter`), so the host never sees the tokens of a decode or verify
+step. To build host inputs it keeps its own copy of the history:
+
+- **Host token history.** `_host_token_ids [max_num_reqs, max_model_len]` with
+  `_host_num_computed` and `_host_total_len` per stable slot, seeded at admission from
+  `prefill_token_ids` (the device's token store gets the same row) and advanced by
+  `_apply_host_tokens` from each step's committed tokens, exactly as the graph commits them
+  (`_compute_next_device_state(_multi)`: a prefill chunk advances by its length and appends
+  the sampled token on the final chunk; a decode or verify row advances by its accepted
+  tokens and appends them; the history stops at `max_model_len`).
+- **Join.** `execute_model` prepares the step as usual, then `_host_input_join` materializes
+  every queued async output, oldest first, on every rank (upstream does so only on the output
+  rank), and applies its tokens. Steps that free or admit slots (finished, preempted or new
+  requests) join before `update_states`, since the history is kept by slot. With sync
+  scheduling `sample_tokens` applies the tokens directly.
+- **Layout.** `_with_host_inputs` rebuilds the graph's token layout on the host
+  (`host_inputs.build_v2_host_input_layout`): the prefill chunk from the history; a decode
+  row's token at its computed count; a `[B, 1 + k]` verify row's first token from the
+  history and the rest from the slot's drafts, read back from the device draft table (the
+  join completed the graph that wrote it). Positions come from the host computed counts,
+  which are exact after the join, while the scheduler's are an upper bound under async
+  speculative decoding.
+- **Operand.** The result goes to the model through the adapter's `host_inputs` operand.
+  Every synthetic input (warmup, capture, trace jobs, DP dummies) carries zeros of the graph's
+  width (`_assemble_model_input`).
+
+So V2 keeps async scheduling also with MTP. Preempted requests are readmitted with their whole
+history and prefix-cache hits with their whole prompt, which the host copy takes as is. Tests:
+`test/unit/model/qwen3_5/test_v2_host_inputs.py` (echo host inputs checked against the graph's
+input ids and positions and the host copy against the device state, sync and async, chunked
+prefills, MTP, preemption) and `test/unit/model/qwen4_exp/test_v2_runner.py` (Qwen3.8-Flash-Next
+against HF, also with prefix caching).
+
 ## Not covered
 
-- Model Runner V2 (`neuron_model_runner_v2.py`, `neuron_forward_adapter.py`) keeps tokens on the
-  device and has its own synthetic-input builders. It does not support host inputs. Recurrent-state
-  models already fall back to V1. A host-input model without recurrent state would also need a
-  `HasHostInputs` entry in `model_runner_v2_policy`.
 - Draft models: the drafter (EAGLE/MTP/DFlash proposers) builds its own forward kwargs, and those
   kwargs do not include host inputs. The Qwen3.8-Flash-Next MTP layer has no n-gram embedding,
   so it does not need them.
-- Host-input cost is on the step's critical path in both modes: under async scheduling it is
-  the device bubble. Make `build_host_inputs` fast, for example with vectorized hashing and a
-  multi-threaded gather.
-- Async speculative decoding (MTP) with host inputs. The join would have to resolve the
-  accepted drafts on the host before building the inputs of the verify rows.
+- Host-input cost is on the step's critical path in every mode and on both runners: under async
+  scheduling it is the device bubble. Make `build_host_inputs` fast, for example with vectorized
+  hashing and a multi-threaded gather.
+- Async speculative decoding (MTP) with host inputs on V1: the join would have to resolve the
+  accepted drafts on the host before building the inputs of the verify rows (V2 does).
