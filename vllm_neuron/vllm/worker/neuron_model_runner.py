@@ -3197,9 +3197,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _mamba_align_state_table(
         self, padded_num_reqs: int, kv_cache_group_id: int
     ) -> torch.Tensor:
-        """[padded_num_reqs, 1] state block of each request's running state (0 for padding)."""
+        """[padded_num_reqs, 1] state block of each request's running state (-1 for padding).
+
+        Padded rows must be -1, not 0: block 0 is the KV null block, which attention reads
+        for unused table entries. The GDN kernels skip page writes only for out-of-range
+        (negative) slots, and the backbone zeroes padded rows by a negative entry, so a 0
+        made padded rows write float32 state into the null block (NaN when read as FP8)."""
         cpu = self.input_batch.block_table[kv_cache_group_id].get_cpu_tensor()
-        col = torch.zeros(padded_num_reqs, 1, dtype=cpu.dtype)
+        col = torch.full((padded_num_reqs, 1), -1, dtype=cpu.dtype)
         for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
             idx = self._mamba_state_idx.get(req_id)
             if idx is not None:
