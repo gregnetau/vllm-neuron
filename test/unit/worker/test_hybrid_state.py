@@ -206,7 +206,42 @@ def test_kv_block_clearer_chunks_and_pads_with_null_block():
     clearer.clear([0])
     assert calls == []
     clearer.warm_up()
-    assert calls == [[0] * hybrid_state.KV_CLEAR_CHUNK]
+    # Both graph sizes compile.
+    assert calls == [
+        [0] * hybrid_state.KV_CLEAR_CHUNK,
+        [0] * hybrid_state.KV_CLEAR_CHUNK_LARGE,
+    ]
+
+
+def test_kv_block_clearer_large_chunks_and_bounded_inflight(monkeypatch):
+    """A long prompt's thousands of blocks take large chunks (small ones for the tail),
+    and the clearer waits for its submissions every KV_CLEAR_MAX_INFLIGHT calls."""
+    monkeypatch.setattr(hybrid_state, "KV_CLEAR_MAX_INFLIGHT", 3)
+    n = 5 * hybrid_state.KV_CLEAR_CHUNK_LARGE + 3 * hybrid_state.KV_CLEAR_CHUNK + 1
+    caches = [torch.ones(n + 1, 1, 2, 4)]
+    sizes, waited = [], []
+
+    class Out:
+        def __init__(self, i):
+            self.i = i
+
+        def cpu(self):
+            waited.append(self.i)
+
+    def zero_fn(c, blocks):
+        sizes.append(len(blocks))
+        hybrid_state.zero_kv_blocks(c, blocks)
+        return Out(len(sizes))
+
+    monkeypatch.setattr(hybrid_state.torch, "is_tensor", lambda x: isinstance(x, Out))
+    clearer = hybrid_state.KVBlockClearer(
+        caches, 1, torch.device("cpu"), zero_fn=zero_fn
+    )
+    clearer.clear(range(1, n + 1))
+    large, small = hybrid_state.KV_CLEAR_CHUNK_LARGE, hybrid_state.KV_CLEAR_CHUNK
+    assert sizes == [large] * 5 + [small] * 4
+    assert waited == [1, 2, 3, 4, 5, 6, 7, 8, 9][: 3 * (len(sizes) // 3)]
+    assert not caches[0][1:].any()
 
 
 def test_kv_block_clearer_expands_manager_blocks_to_kernel_blocks():
