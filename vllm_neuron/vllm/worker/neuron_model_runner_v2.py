@@ -60,6 +60,7 @@ from .neuron_input_build import (
     build_slot_mapping,
     build_state_pool_rows,
     build_swa_kernel_block_rows,
+    build_verify_layout,
     compute_swa_num_blocks,
     gather_block_rows_raw,
 )
@@ -113,25 +114,50 @@ class _PendingStep(NamedTuple):
     gathered_logits_future: torch.Tensor | None
     num_logprobs_by_row: tuple[int, ...]
     kv_connector_output: object | None
+    # Tokens per row of the gathered logits: 1, or 1 + k for a verify step.
+    spec_width: int = 1
 
 
 def _trim_sampled(sampled_tokens, valid_rows, num_submitted):
     """Trim padded sampled rows into per-request token lists.
 
     Emit ``[token]`` for each valid submitted row and ``[]`` for a submitted
-    nonfinal prefill row. Drop rows beyond ``num_submitted``.
+    nonfinal prefill row. Drop rows beyond ``num_submitted``. A speculative verify
+    row is a list of tokens (the accepted prefix, then ``-1``); emit its prefix.
 
     Args:
-        sampled_tokens (Sequence[int]): Materialized sampled rows.
+        sampled_tokens (Sequence[int] | Sequence[Sequence[int]]): Materialized
+            sampled rows.
         valid_rows (Sequence[bool]): Host validity flag for each graph row.
         num_submitted (int): Number of real submitted request rows.
 
     Returns:
         list[list[int]]: One sampled-token list per submitted request.
     """
-    return [
-        [int(sampled_tokens[i])] if valid_rows[i] else [] for i in range(num_submitted)
-    ]
+    out = []
+    for i in range(num_submitted):
+        if not valid_rows[i]:
+            out.append([])
+            continue
+        row = sampled_tokens[i]
+        if isinstance(row, (list, tuple)):
+            tokens = []
+            for token in row:
+                if token < 0:
+                    break
+                tokens.append(int(token))
+            out.append(tokens)
+        else:
+            out.append([int(row)])
+    return out
+
+
+def _sampled_rows(sampled_future: torch.Tensor) -> list:
+    """Materialize a step's sampled tokens: one int per row, or a list per verify row."""
+    host = sampled_future.cpu()
+    if host.dim() == 2 and host.shape[1] > 1:
+        return host.tolist()
+    return host.reshape(-1).tolist()
 
 
 def _build_sampled_token_logprobs(
@@ -204,6 +230,51 @@ def _build_sampled_token_logprobs(
     )
 
 
+def _build_verify_logprobs(
+    gathered_logits: torch.Tensor,
+    token_lists: list[list[int]],
+    logprob_rows: list[int],
+    width: int,
+    max_num_logprobs: int,
+    logprobs_mode: str,
+) -> LogprobsLists:
+    """Build per-token log-probabilities of a speculative verify step.
+
+    Request row ``r`` generated ``len(token_lists[r])`` tokens; token ``j`` was
+    sampled from the target logits at graph row ``r * width + j``. vLLM slices the
+    result per request with ``cu_num_generated_tokens``.
+
+    Args:
+        gathered_logits: ``[rows * width, vocab]`` gathered target logits.
+        token_lists: Generated tokens per request row.
+        logprob_rows: Request rows that asked for log-probabilities.
+        width: Tokens per verify row, ``1 + k``.
+        max_num_logprobs: Candidates per token.
+        logprobs_mode: Requested log-probability format.
+
+    Returns:
+        LogprobsLists with one row per generated token.
+    """
+    cu = [0]
+    for tokens in token_lists:
+        cu.append(cu[-1] + len(tokens))
+    logit_rows, token_ids, output_rows = [], [], []
+    for row in logprob_rows:
+        for j, token in enumerate(token_lists[row]):
+            logit_rows.append(row * width + j)
+            token_ids.append(int(token))
+            output_rows.append(cu[row] + j)
+    result = _build_sampled_token_logprobs(
+        logits=gathered_logits[logit_rows],
+        sampled_token_ids=torch.tensor(token_ids, dtype=torch.int64),
+        output_row_indices=output_rows,
+        max_num_logprobs=max_num_logprobs,
+        num_output_rows=cu[-1],
+        logprobs_mode=logprobs_mode,
+    )
+    return result._replace(cu_num_generated_tokens=cu)
+
+
 class _AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
     """Defer materialization of an asynchronous sampled-token future.
 
@@ -225,7 +296,7 @@ class _AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         with self._lock:
             if self._output is None:
                 pending = self._pending
-                sampled_tokens = pending.sampled_future.reshape(-1).cpu().tolist()
+                sampled_tokens = _sampled_rows(pending.sampled_future)
                 token_lists = _trim_sampled(
                     sampled_tokens,
                     pending.valid_rows,
@@ -282,6 +353,19 @@ class NeuronModelRunnerV2:
         # request slot (see hybrid_state and docs/design/hybrid-state-gdn.md). Read from
         # the registered class: the model is not loaded yet.
         self._has_state_layers = self._model_has_recurrent_state()
+        # Speculative decoding (docs/design/speculation/mrv2-spec-decode.md): k drafts
+        # per request and step, verified in a [B, 1 + k] decode graph. Zero when off.
+        self.speculative_config = getattr(vllm_config, "speculative_config", None)
+        self.num_speculative_tokens = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
+        # The loaded draft model (inside the forward adapter), published by load_model.
+        self.draft_model = None
+        self._synthetic_conditional_rates = None
+        if self.speculative_config is not None:
+            self._validate_spec_decode_config()
         self.neuron_config = self._build_neuron_config()
         self.num_batched_tokens_buckets = list(
             self.neuron_config.num_batched_tokens_buckets
@@ -289,6 +373,14 @@ class NeuronModelRunnerV2:
         self.num_seqs_buckets = list(self.neuron_config.num_seqs_buckets)
         self.prefill_token_capacity = max(self.num_batched_tokens_buckets)
         self.decode_row_capacity = max(self.num_seqs_buckets)
+        if self.num_speculative_tokens and min(self.num_batched_tokens_buckets) <= (
+            1 + self.num_speculative_tokens
+        ):
+            # Models tell prefill from decode by max_query_len > 1 + k.
+            raise ValueError(
+                f"num_batched_tokens_buckets {self.num_batched_tokens_buckets} must "
+                f"exceed 1 + num_speculative_tokens = {1 + self.num_speculative_tokens}"
+            )
         segment_buckets = self.neuron_config.kv_segment_size_buckets
         self.kv_segment_size = segment_buckets[0] if segment_buckets else 0
         if self._has_state_layers:
@@ -316,9 +408,8 @@ class NeuronModelRunnerV2:
         # Worker-facing attribute surface.
         # The model is published only after load_model() fully succeeds.
         self.model = None
-        # First cell is dense/generate/non-spec; these features route to V1, so the runner exposes the
-        # attributes the worker reads unconditionally as their "off" values.
-        self.speculative_config = None
+        # The worker's V1 drafter hooks (separate draft NEFFs, trace jobs) stay off: V2
+        # runs the draft model inside the target graph and exposes it as draft_model.
         self.drafter = None
         self.encoder_neuron_config = None
         # Async-scheduling stats.
@@ -357,7 +448,10 @@ class NeuronModelRunnerV2:
             vocab_size=model_config.get_vocab_size(),
             device=self.device,
             block_sizes=self.block_sizes,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
+        # Request ids of the last executed step, for take_draft_token_ids.
+        self._last_step_req_ids: list[str] = []
         # A bounded list of in-flight submitted graphs, each an
         # ``(is_complete, touched_slots)`` pair, plus the set of slots freed while an in-flight graph
         # may still touch them. A quarantined slot is withheld from ``free_indices`` until every
@@ -403,6 +497,16 @@ class NeuronModelRunnerV2:
         # state-bundle outputs back onto their inputs (the store-version chain).
         self.compile_options = {"alias_meta_to_neuron": True}
         logger.info("Using the standalone V2 Neuron model runner.")
+        if self.speculative_config is not None:
+            logger.info(
+                "V2 speculative decoding: method=%s k=%d draft=%s; verify graphs "
+                "decode_b{B}_s%d for num_seqs_buckets=%s, drafter in the target graph",
+                self.speculative_config.method,
+                self.num_speculative_tokens,
+                self.speculative_config.model,
+                1 + self.num_speculative_tokens,
+                self.num_seqs_buckets,
+            )
 
     def _is_cpu_mode(self) -> bool:
         """Return whether the runner executes on CPU."""
@@ -521,7 +625,26 @@ class NeuronModelRunnerV2:
         pass  # no EC connector in the first cell (EPD/EC denylisted)
 
     def take_draft_token_ids(self):
-        return None  # no speculative decoding in the first cell (spec denylisted)
+        """Return draft placeholders for the last step's requests.
+
+        Draft values stay on the device (the verify graph reads them from the
+        slot's draft table); the scheduler needs only how many to schedule. With
+        synchronous scheduling the engine passes these to
+        ``update_draft_token_ids`` (vLLM ignores them for prefill chunks and trims
+        them near ``max_model_len``); with async scheduling it does not call this.
+        Mirrors GPU MRv2's ``DraftTokensHandler`` without structured outputs.
+
+        Returns:
+            ``DraftTokenIds`` with ``k`` ``-1`` placeholders per request, or
+            ``None`` without speculative decoding.
+        """
+        if not self.num_speculative_tokens or not self._last_step_req_ids:
+            return None
+        from vllm.v1.outputs import DraftTokenIds
+
+        placeholders = [-1] * self.num_speculative_tokens
+        req_ids = list(self._last_step_req_ids)
+        return DraftTokenIds(req_ids, [list(placeholders) for _ in req_ids])
 
     # DI/EPD snapshot + EC accuracy RPCs: never on the dense serve path. RAISE (not empty data that could
     # look valid) so an out-of-cell collective_rpc fails loud with a clear message instead of corrupting.
@@ -620,6 +743,7 @@ class NeuronModelRunnerV2:
         # Clear any previously published model and adapter. A failed reload
         # must not leave stale state.
         self.model = None
+        self.draft_model = None
         self._forward_adapter = None
         self._pending_step = None
         self._submitted_forward_keepalive = None
@@ -675,6 +799,8 @@ class NeuronModelRunnerV2:
                 )
             # Publish only after the selected load path succeeds (no half-loaded self.model).
             self.model = model
+            if self.speculative_config is not None:
+                self._load_draft_model()
 
             # Stamp each parallel group's rank_in_group as an on-device tensor
             # (SPMD): collective helpers (MoE all-to-all, routed-token permute)
@@ -768,6 +894,7 @@ class NeuronModelRunnerV2:
             self._compile_forward_adapter()
         except Exception:
             self.model = None
+            self.draft_model = None
             self._forward_adapter = None
             self._pending_step = None
             self._submitted_forward_keepalive = None
@@ -834,8 +961,9 @@ class NeuronModelRunnerV2:
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
         specs: dict = {}
-        model_kv_spec = self.model.get_kv_spec()
-        for layer in model_kv_spec.layers:
+        # The draft model's attention layers (speculative decoding) share the cache.
+        attn_layers, state_layers = self._kv_spec_layers()
+        for layer in attn_layers:
             if getattr(layer, "sliding_window_size", None) is not None:
                 # SlidingWindowSpec (not FullAttentionSpec) so the hybrid KV
                 # cache manager creates a separate group whose blocks outside
@@ -857,7 +985,6 @@ class NeuronModelRunnerV2:
                 sliding_window=None,
                 attention_chunk_size=getattr(layer, "chunk_size", None),
             )
-        state_layers = getattr(model_kv_spec, "state_layers", None) or []
         if state_layers:
             if not self._has_state_layers:
                 raise RuntimeError(
@@ -865,9 +992,11 @@ class NeuronModelRunnerV2:
                     "class does not implement interfaces.HasRecurrentState"
                 )
             # Dedicated pools only (the policy and _validate_recurrent_state_config
-            # keep prefix caching, spec decode and the shared pool on V1). The
-            # MambaSpecs carry a placeholder of one attention page, so vLLM keeps the
-            # attention block at --block-size and no kernel-block split is needed.
+            # keep prefix caching and the shared pool on V1). The MambaSpecs carry a
+            # placeholder of one attention page, so vLLM keeps the attention block at
+            # --block-size and no kernel-block split is needed. With speculative
+            # decoding each request holds 1 + k state blocks (the state after each
+            # verify token).
             state_specs, self._state_real_pages = hybrid_state.build_state_cache_specs(
                 state_layers,
                 specs,
@@ -875,7 +1004,7 @@ class NeuronModelRunnerV2:
                 max_model_len=self.max_model_len,
                 prefix_caching=False,
                 dedicated=True,
-                num_spec_blocks=0,
+                num_spec_blocks=self.num_speculative_tokens,
                 placeholder_pages=1,
             )
             specs.update(state_specs)
@@ -914,8 +1043,10 @@ class NeuronModelRunnerV2:
         The policy routes them to V1, but ``VLLM_USE_V2_MODEL_RUNNER=1`` forces
         V2 with only a warning, so fail here before any compilation.
 
+        Speculative decoding is checked by ``_validate_spec_decode_config``.
+
         Raises:
-            NotImplementedError: For prefix caching, speculative decoding, or
+            NotImplementedError: For prefix caching or
                 ``VLLM_NEURON_SHARED_STATE_POOL``.
             ValueError: For a prefill bucket the segmented kernel cannot run.
         """
@@ -926,11 +1057,6 @@ class NeuronModelRunnerV2:
             raise NotImplementedError(
                 "The V2 runner does not support prefix caching for models with "
                 "recurrent state; pass --no-enable-prefix-caching" + route
-            )
-        if getattr(self.vllm_config, "speculative_config", None) is not None:
-            raise NotImplementedError(
-                "The V2 runner does not support speculative decoding (MTP) for "
-                "models with recurrent state" + route
             )
         if envs.VLLM_NEURON_SHARED_STATE_POOL:
             raise NotImplementedError(
@@ -966,6 +1092,138 @@ class NeuronModelRunnerV2:
                 f" (unsupported: {unsupported}). Set num_batched_tokens_buckets in "
                 "neuron_config to multiples of 128" + route
             )
+
+    def _validate_spec_decode_config(self) -> None:
+        """Reject speculative configurations V2 does not serve.
+
+        The policy keeps them on V1, but ``VLLM_USE_V2_MODEL_RUNNER=1`` forces V2
+        with only a warning, so fail before any loading or compilation. Also
+        resolve the synthetic acceptance rates of ``rejection_sample_method``
+        ``"synthetic"``.
+
+        Raises:
+            NotImplementedError: For an unsupported method, model or feature.
+            ValueError: For an invalid draft count.
+        """
+        from vllm_neuron.nn.rejection_sampler import (
+            MAX_SPEC_LEN,
+            unconditional_to_conditional_rates,
+        )
+
+        from .v2_spec_decode import (
+            V2_REJECTION_SAMPLE_METHODS,
+            v2_spec_decode_unsupported_reason,
+        )
+
+        spec = self.speculative_config
+        route = "; unset VLLM_USE_V2_MODEL_RUNNER to use the V1 runner"
+        model_config = self.vllm_config.model_config
+        reason = v2_spec_decode_unsupported_reason(
+            spec.method, list(getattr(model_config, "architectures", None) or [])
+        )
+        if reason is not None:
+            raise NotImplementedError(
+                f"The V2 runner does not support {reason}" + route
+            )
+        k = self.num_speculative_tokens
+        if not 1 <= k <= MAX_SPEC_LEN:
+            raise ValueError(
+                f"num_speculative_tokens must be in [1, {MAX_SPEC_LEN}]; got {k}"
+            )
+        method = getattr(spec, "rejection_sample_method", "standard") or "standard"
+        if method not in V2_REJECTION_SAMPLE_METHODS:
+            raise NotImplementedError(
+                f"The V2 runner does not support rejection_sample_method={method!r}"
+                + route
+            )
+        if method == "synthetic":
+            rates = getattr(spec, "synthetic_acceptance_rates", None)
+            if not rates:
+                raise ValueError(
+                    "rejection_sample_method='synthetic' requires "
+                    "synthetic_acceptance_rates"
+                )
+            self._synthetic_conditional_rates = unconditional_to_conditional_rates(
+                list(rates)
+            )
+        unsupported = []
+        if getattr(self.vllm_config, "kv_transfer_config", None) is not None:
+            unsupported.append("KV transfer (disaggregated inference)")
+        get_sw = getattr(model_config, "get_sliding_window", None)
+        if callable(get_sw) and get_sw() is not None:
+            unsupported.append("sliding-window attention")
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        if getattr(parallel_config, "data_parallel_size", 1) > 1 and getattr(
+            parallel_config, "enable_expert_parallel", False
+        ):
+            unsupported.append("expert parallelism with data parallelism")
+        raw = self._raw_neuron_config()
+        for key, feature in (
+            ("debug_logits_dir", "debug logits"),
+            ("enable_structured_outputs", "structured outputs"),
+            ("tensor_capture", "tensor capture"),
+        ):
+            if raw.get(key):
+                unsupported.append(feature)
+        if unsupported:
+            raise NotImplementedError(
+                "The V2 runner does not support speculative decoding with "
+                + ", ".join(unsupported)
+                + route
+            )
+
+    def _load_draft_model(self) -> None:
+        """Load the draft model and switch the target to emit the draft's input.
+
+        The draft runs inside the target's compiled graph (``V2DraftSpeculator``);
+        its layers follow the target's (``start_layer_idx`` = the target's layer
+        count), which names their KV-cache layers.
+
+        Raises:
+            RuntimeError: If the target cannot provide the draft's hidden states.
+        """
+        from .v2_spec_decode import load_draft_model
+
+        if self.speculative_config.method == "mtp":
+            if not hasattr(self.model, "set_mtp_hidden_output"):
+                raise RuntimeError(
+                    "The target model does not support MTP speculative decoding "
+                    "(no set_mtp_hidden_output)"
+                )
+            self.model.set_mtp_hidden_output(True)
+        model_config = self.vllm_config.model_config
+        text_config = getattr(model_config, "hf_text_config", None) or (
+            model_config.hf_config
+        )
+        self.draft_model = load_draft_model(
+            self.vllm_config,
+            self.device,
+            start_layer_idx=text_config.num_hidden_layers,
+        )
+
+    def _build_speculator(self):
+        """Return the adapter's speculator submodule, or None without spec decode."""
+        if self.draft_model is None:
+            return None
+        from .v2_spec_decode import V2DraftSpeculator, draft_layer_names
+
+        return V2DraftSpeculator(
+            self.draft_model,
+            self.num_speculative_tokens,
+            draft_layer_names(self.draft_model),
+            self._synthetic_conditional_rates,
+        )
+
+    def _kv_spec_layers(self) -> tuple[list, list]:
+        """Return the attention and state layer specs of the target and draft models."""
+        spec = self.model.get_kv_spec()
+        layers = list(spec.layers)
+        state_layers = list(getattr(spec, "state_layers", None) or [])
+        if self.draft_model is not None:
+            draft_spec = self.draft_model.get_kv_spec()
+            layers += list(draft_spec.layers)
+            state_layers += list(getattr(draft_spec, "state_layers", None) or [])
+        return layers, state_layers
 
     def _build_neuron_config(self):
         """Build the Neuron model configuration and resolve graph buckets.
@@ -1120,12 +1378,13 @@ class NeuronModelRunnerV2:
         Supports ``FullAttentionSpec`` and ``SlidingWindowSpec`` groups, and
         ``UniformTypeKVCacheSpecs`` that hold per-layer specs of those types.
         Dense, non-speculative KV transfer is supported. Recurrent-state layers
-        (``MambaSpec`` groups of a ``HasRecurrentState`` model, mode ``none``, no
-        speculative blocks) get dedicated pools: the shared buffer is bound only as
-        attention KV, and each state layer gets two zeroed float32 halves of
-        ``1 + max_num_reqs`` pages, bound with ``bind_state_cache``. Speculative
-        decoding, chunked attention, Mamba ``align`` mode (prefix caching), and
-        FP8-packed configurations route to MRv1.
+        (``MambaSpec`` groups of a ``HasRecurrentState`` model, mode ``none``, ``k``
+        speculative blocks with ``k`` draft tokens) get dedicated pools: the shared
+        buffer is bound only as attention KV, and each state layer gets two zeroed
+        float32 halves of ``1 + max_num_reqs * (1 + k)`` pages, bound with
+        ``bind_state_cache``. A draft model's attention layers (speculative
+        decoding) are bound like the target's. Chunked attention, Mamba ``align``
+        mode (prefix caching), and FP8-packed configurations route to MRv1.
 
         Args:
             kv_cache_config: Grouped full-attention KV-cache configuration.
@@ -1265,11 +1524,9 @@ class NeuronModelRunnerV2:
             pooled_layers.extend(names)
         if len(pooled_layers) != len(set(pooled_layers)):
             raise ValueError("a layer appears in more than one KV cache tensor")
-        model_kv_spec = self.model.get_kv_spec()
-        model_layers = {layer.name for layer in model_kv_spec.layers}
-        model_layers |= {
-            layer.name for layer in getattr(model_kv_spec, "state_layers", None) or []
-        }
+        attn_layers, state_layers = self._kv_spec_layers()
+        model_layers = {layer.name for layer in attn_layers}
+        model_layers |= {layer.name for layer in state_layers}
         group_set = set(group_layers)
         pooled_set = set(pooled_layers)
         if not (group_set == pooled_set == model_layers):
@@ -1340,7 +1597,16 @@ class NeuronModelRunnerV2:
         # This is the first authoritative block geometry the worker receives. The constructor ran
         # before the executor applied Neuron's backend default, so configure the host block rows from
         # the same validated group specs that size the scheduler and device KV cache.
-        self.request_state.configure_block_sizes(resolved_block_sizes)
+        # A state group's block spans max_model_len, but with speculative decoding a
+        # request holds 1 + k of them.
+        state_pages_per_slot = 1 + self.num_speculative_tokens
+        self.request_state.configure_block_sizes(
+            resolved_block_sizes,
+            min_widths=[
+                state_pages_per_slot if g in state_groups else 0
+                for g in range(len(resolved_block_sizes))
+            ],
+        )
         self.block_sizes = list(resolved_block_sizes)
         # Trimmed kernel block-row width per group: None for full-attention
         # groups, the window-derived width for sliding-window groups. Computed
@@ -1441,18 +1707,24 @@ class NeuronModelRunnerV2:
 
         # --- bind + publish (last) ---
         self.model.bind_kv_cache(kv_caches)
+        if self.draft_model is not None:
+            self.draft_model.bind_kv_cache(kv_caches)
         kv_clearer = None
         if state_caches:
             self.model.bind_state_cache(state_caches)
             kv_clearer = self._build_kv_block_clearer(kv_caches)
             if kv_clearer is not None:
                 self.model.set_runner_clears_kv_blocks(True)
+                if self.draft_model is not None and hasattr(
+                    self.draft_model, "set_runner_clears_kv_blocks"
+                ):
+                    self.draft_model.set_runner_clears_kv_blocks(True)
         self._kv_cache_config = kv_cache_config
         self.kv_caches = kv_caches
         self.state_caches = state_caches
         self._state_groups = frozenset(state_groups)
-        # Pool pages per slot: 1 + num_speculative_blocks (zero, checked above).
-        self._state_pool_slot_pages = 1
+        # Pool pages per slot: 1 + num_speculative_blocks (checked above).
+        self._state_pool_slot_pages = state_pages_per_slot
         self._kv_clearer = kv_clearer
         if state_caches:
             pool_bytes = sum(
@@ -1505,10 +1777,11 @@ class NeuronModelRunnerV2:
                 f"pools); got {layer_spec.mamba_cache_mode!r} for layer {name!r} "
                 "(prefix caching routes to V1)"
             )
-        if layer_spec.num_speculative_blocks:
+        if layer_spec.num_speculative_blocks != self.num_speculative_tokens:
             raise NotImplementedError(
-                "V2 runner does not support speculative state blocks "
-                f"(num_speculative_blocks={layer_spec.num_speculative_blocks}) for "
+                "V2 runner needs one speculative state block per draft token "
+                f"(num_speculative_tokens={self.num_speculative_tokens}); got "
+                f"num_speculative_blocks={layer_spec.num_speculative_blocks} for "
                 f"layer {name!r}"
             )
         if name not in self._state_real_pages:
@@ -1602,7 +1875,15 @@ class NeuronModelRunnerV2:
         Returns:
             Arguments accepted by :class:`NeuronForwardAdapter`.
         """
-        max_query_len = model_input.padded_num_tokens if model_input.is_prefill else 1
+        # A verify step runs 1 + k tokens per row as decode; with speculative decoding
+        # every graph uses that threshold (as V1).
+        spec_width = 1 + self.num_speculative_tokens
+        max_query_len = (
+            model_input.padded_num_tokens
+            if model_input.is_prefill
+            else model_input.spec_width
+        )
+        decode_token_threshold = spec_width if self.num_speculative_tokens else 1
         # Recurrent-state models read cached_seq_len on every prefill (zero: start from
         # zero state), segmented or not. Gated so other models' graphs are unchanged.
         state_prefill = self._has_state_layers and model_input.is_prefill
@@ -1620,13 +1901,30 @@ class NeuronModelRunnerV2:
             model_input.block_tables,
             model_input.slot_mapping,
             max_query_len=max_query_len,
-            decode_token_threshold=1,
+            decode_token_threshold=decode_token_threshold,
             cached_seq_len=cached_seq_len,
             kv_segment_size=model_input.kv_segment_size,
             slot_mappings=model_input.slot_mappings,
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
             always_cached_seq_len=state_prefill,
         )
+        if model_input.num_draft_by_row is not None:
+            # The verify graph rebuilds each group's metadata once (slot mappings from
+            # device positions). It finds a group by this constant index, not by the
+            # dict's identity, which Dynamo would guard on (a recompile every step).
+            groups = self._kv_cache_config.kv_cache_groups
+            for g, group in enumerate(groups):
+                metadata = attn_metadata[group.layer_names[0]]
+                metadata["kv_group"] = g
+                if g in self._state_groups:
+                    # Recurrent-state groups resume from the block of the slot's last
+                    # accepted token: the graph fills state_in from the device accepted
+                    # counts (the key selects the models' multi-token state path).
+                    metadata["state_in"] = torch.zeros(
+                        model_input.padded_num_reqs,
+                        dtype=torch.int32,
+                        device=model_input.positions.device,
+                    )
         rs = self.request_state
 
         def state_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -1641,7 +1939,7 @@ class NeuronModelRunnerV2:
             if state_device is None
             else torch.empty((1,), dtype=torch.int32, device=state_device)
         )
-        return {
+        kwargs = {
             "positions": model_input.positions,
             "attn_metadata": attn_metadata,
             "sampling_positions": model_input.sampling_positions,
@@ -1665,6 +1963,12 @@ class NeuronModelRunnerV2:
                 "next_token_by_slot", self._next_token_by_slot
             ),
         }
+        if self.num_speculative_tokens:
+            kwargs["draft_tokens"] = state_tensor("draft_tokens", rs.draft_tokens)
+            kwargs["num_accepted"] = state_tensor("num_accepted", rs.num_accepted)
+            if model_input.num_draft_by_row is not None:
+                kwargs["num_draft_by_row"] = model_input.num_draft_by_row
+        return kwargs
 
     def _record_neff_execution(self, model_input: NeuronModelInput) -> None:
         """Record one dispatch in the compatible execution metric bucket.
@@ -1678,6 +1982,8 @@ class NeuronModelRunnerV2:
                 bucket_name += f"_kv{model_input.kv_segment_size}"
         else:
             bucket_name = f"decode_b{model_input.padded_num_reqs}"
+            if model_input.spec_width > 1:
+                bucket_name += f"_s{model_input.spec_width}"
 
         NEFF_EXECUTION_COUNT.labels(
             model_name=self.vllm_config.model_config.model,
@@ -1819,6 +2125,7 @@ class NeuronModelRunnerV2:
             active_req_ids,
         )
         touched_slots = {int(s) for s in model_input.idx_mapping_np.tolist()}
+        self._last_step_req_ids = list(active_req_ids)
         completed = {"done": False}
         self.note_graph_submitted(lambda: completed["done"], touched_slots)
 
@@ -1839,6 +2146,7 @@ class NeuronModelRunnerV2:
             gathered_logits_future=gathered_logits_future,
             num_logprobs_by_row=num_logprobs_by_row,
             kv_connector_output=kv_connector_output,
+            spec_width=model_input.spec_width,
         )
         return None
 
@@ -1858,7 +2166,7 @@ class NeuronModelRunnerV2:
                     "sample_tokens called without a pending execute_model step"
                 )
             if not self.use_async_scheduling:
-                sampled_tokens = pending.sampled_future.reshape(-1).cpu().tolist()
+                sampled_tokens = _sampled_rows(pending.sampled_future)
                 token_lists = _trim_sampled(
                     sampled_tokens,
                     pending.valid_rows,
@@ -2082,6 +2390,15 @@ class NeuronModelRunnerV2:
             max(pending.num_logprobs_by_row[row] for row in logprob_rows),
             vocab_size,
         )
+        if pending.spec_width > 1:
+            return _build_verify_logprobs(
+                gathered_logits_cpu,
+                token_lists,
+                logprob_rows,
+                pending.spec_width,
+                max_num_logprobs,
+                self._logprobs_mode,
+            )
         requested_logits = gathered_logits_cpu[logprob_rows]
         sampled_token_ids = torch.tensor(
             [int(token_lists[row][0]) for row in logprob_rows],
@@ -2194,6 +2511,7 @@ class NeuronModelRunnerV2:
         adapter = NeuronForwardAdapter(
             self.model,
             emit_gathered_logits=(self._emit_debug_logits or self._logprobs_enabled),
+            speculator=self._build_speculator(),
         )
 
         # Match Model Runner V1: configured buckets intentionally specialize
@@ -2366,6 +2684,8 @@ class NeuronModelRunnerV2:
             self._warmup(self._build_decode_synthetic_inputs(batch_size))
         compile_elapsed = time.perf_counter() - compile_start
         bucket_name = f"decode_b{batch_size}"
+        if self.num_speculative_tokens:
+            bucket_name += f"_s{1 + self.num_speculative_tokens}"
         if ctx_bucket is not None:
             bucket_name += f"_ctx{ctx_bucket}"
         COMPILATION_TIME.labels(
@@ -2458,12 +2778,12 @@ class NeuronModelRunnerV2:
             "V2 DP sync assumes decode_context_length_buckets is None; "
             "syncing the decode context bucket across DP ranks is not implemented"
         )
-        assert self.speculative_config is None, (
-            "V2 DP sync assumes no speculative decoding; the spec/non-spec "
-            "NEFF vote is not synchronized across DP ranks"
-        )
         if not self._dp_collectives_active():
             return prefill_tokens, decode_rows
+        assert self.speculative_config is None, (
+            "V2 DP sync assumes no speculative decoding across EP-spanning DP ranks "
+            "(_validate_spec_decode_config rejects it)"
+        )
 
         from vllm.distributed.parallel_state import get_dp_group
 
@@ -2580,6 +2900,9 @@ class NeuronModelRunnerV2:
                 "sampling_params": torch.zeros_like(rs.sampling_params),
                 "next_token_by_slot": torch.zeros_like(self._next_token_by_slot),
             }
+            if rs.draft_tokens is not None:
+                self._dp_dummy_state["draft_tokens"] = torch.zeros_like(rs.draft_tokens)
+                self._dp_dummy_state["num_accepted"] = torch.ones_like(rs.num_accepted)
         return self._dp_dummy_state
 
     # ------------------------------------------------------------------
@@ -2591,6 +2914,8 @@ class NeuronModelRunnerV2:
         num_computed_tokens,
         total_len,
         last_sampled_tokens,
+        draft_tokens=None,
+        num_accepted=None,
     ) -> None:
         """Store the state tensors returned by the model graph.
 
@@ -2606,6 +2931,10 @@ class NeuronModelRunnerV2:
         rs.num_computed_tokens = num_computed_tokens
         rs.total_len = total_len
         rs.last_sampled_tokens = last_sampled_tokens
+        if draft_tokens is not None:
+            # Speculative decoding: the drafts and accepted counts the graph committed.
+            rs.draft_tokens = draft_tokens
+            rs.num_accepted = num_accepted
 
     # ------------------------------------------------------------------
     # Quarantine ledger for async recycle safety.
@@ -2770,10 +3099,17 @@ class NeuronModelRunnerV2:
             [req_id_to_padded_token_count[req_id] for req_id in active_req_ids],
             dtype=np.int64,
         )
+        # Speculative decoding: a decode row carries its scheduled drafts (the
+        # scheduler pads nothing for decode, so its width is 1 + drafts).
+        spec_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        num_drafts = np.array(
+            [len((spec_tokens or {}).get(r, ())) for r in active_req_ids],
+            dtype=np.int64,
+        )
         # Standard prefill uses a multi-token bucket. In DI, the first decode
         # invocation processes the final prompt token, so a single-token input
         # is handled by the decode graph.
-        is_prefill = bool(padded_token_counts.max() > 1)
+        is_prefill = bool((padded_token_counts > 1 + num_drafts).any())
         if is_prefill:
             assert bool((num_computed < prefill_lens_active).all()), (
                 "V2 prefill classified (padded>1) but a row has num_computed >= prefill_len: "
@@ -2808,8 +3144,14 @@ class NeuronModelRunnerV2:
                 "(num_computed < prefill_len - 1): "
                 f"num_computed {num_computed.tolist()}, prefill_len {prefill_lens_active.tolist()}"
             )
-            assert (query_lens == 1).all(), (
-                f"V2 first cell decode is 1 token/row (non-spec); got query_lens {query_lens.tolist()}"
+            assert (query_lens == 1 + num_drafts).all(), (
+                "V2 decode runs one token per row plus its scheduled drafts; got "
+                f"query_lens {query_lens.tolist()}, drafts {num_drafts.tolist()}"
+            )
+            assert int(num_drafts.max()) <= self.num_speculative_tokens, (
+                f"a row has {int(num_drafts.max())} drafts > num_speculative_tokens "
+                f"{self.num_speculative_tokens} (dynamic speculation lengths are not "
+                "supported)"
             )
             _, group_rows = self._dp_sync_shape(0, num_active)
             row_bucket = self._select_bucket(
@@ -2817,7 +3159,9 @@ class NeuronModelRunnerV2:
                 self.num_seqs_buckets,
                 "num_active",
             )
-            token_bucket = row_bucket
+            # With speculative decoding every decode step is a verify step laid out
+            # as [rows, 1 + k] tokens; rows with fewer drafts are padded in place.
+            token_bucket = row_bucket * (1 + self.num_speculative_tokens)
             kv_segment_size = 0
 
         return self._assemble_model_input(
@@ -2829,6 +3173,7 @@ class NeuronModelRunnerV2:
             token_bucket=token_bucket,
             row_bucket=row_bucket,
             kv_segment_size=kv_segment_size,
+            num_drafts=num_drafts,
         )
 
     def _assemble_model_input(
@@ -2843,6 +3188,7 @@ class NeuronModelRunnerV2:
         row_bucket: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        num_drafts: np.ndarray | None = None,
     ) -> NeuronModelInput:
         """Pad host vectors and assemble a fixed-shape model input.
 
@@ -2860,6 +3206,9 @@ class NeuronModelRunnerV2:
             row_bucket: Compiled row capacity.
             kv_segment_size: Segmented-prefill KV length, or zero.
             device: Optional tensor destination. Defaults to the runner device.
+            num_drafts: Scheduled drafts per active row (speculative decoding).
+                A decode step of a speculative configuration is a verify step
+                (``[rows, 1 + k]`` tokens) whatever the counts.
 
         Returns:
             The fixed-shape device operands and host metadata.
@@ -2881,10 +3230,26 @@ class NeuronModelRunnerV2:
         padded_num_tokens = token_bucket
         padded_num_reqs = row_bucket
         num_sample_rows = row_bucket
+        is_verify = self.num_speculative_tokens > 0 and not is_prefill
+        spec_width = 1 + self.num_speculative_tokens if is_verify else 1
+        if is_verify:
+            assert token_bucket == row_bucket * spec_width, (
+                f"verify token bucket {token_bucket} != {row_bucket} rows x {spec_width}"
+            )
+            if num_drafts is None:
+                num_drafts = np.zeros(num_active, dtype=np.int64)
 
         # Flat positions + per-token row index (scheduler order), covering fresh / prefix-cache /
-        # chunked windows uniformly.
-        positions_flat, req_indices = build_flat_positions(num_computed, query_lens)
+        # chunked windows uniformly. A verify step keeps each row 1 + k wide; its host
+        # positions are an upper bound under async scheduling (the graph derives the
+        # real ones from the device counts) and only shape the placeholder operands.
+        if is_verify:
+            positions_flat, req_indices, token_index = build_verify_layout(
+                num_computed, num_drafts, spec_width
+            )
+        else:
+            positions_flat, req_indices = build_flat_positions(num_computed, query_lens)
+            token_index = None
         total_scored = positions_flat.shape[0]
         # Token capacity is the flavor's own width (P prefill / B decode) -- NOT P for decode, since a
         # valid config can have B > P (e.g. a small chunked-prefill max_num_batched_tokens with a large
@@ -2947,12 +3312,15 @@ class NeuronModelRunnerV2:
             )
 
         # Pad positions + slot mapping to the fixed token width (pad positions 0, pad slot NULL_BLOCK_ID).
+        # A verify step places each row's tokens at row * (1 + k) + j.
+        if token_index is None:
+            token_index = np.arange(total_scored, dtype=np.int64)
         positions = np.zeros(padded_num_tokens, dtype=np.int32)
-        positions[:total_scored] = positions_flat
+        positions[token_index] = positions_flat
         slot_mappings: list[np.ndarray] = []
         for flat in slot_mappings_flat:
             padded = np.full(padded_num_tokens, NULL_BLOCK_ID, dtype=np.int64)
-            padded[:total_scored] = flat
+            padded[token_index] = flat
             slot_mappings.append(padded)
         slot_mapping = slot_mappings[0]
 
@@ -2977,11 +3345,12 @@ class NeuronModelRunnerV2:
 
         # sampling_positions [R] (row -> FLAT hidden-token row): decode is row-aligned arange(B);
         # prefill (R=1) is the single request's last scored token in the flat [P] layout.
-        sampling_positions = np.zeros(num_sample_rows, dtype=np.int64)
+        # A verify step samples every position of every row.
+        sampling_positions = np.zeros(num_sample_rows * spec_width, dtype=np.int64)
         if is_prefill:
             sampling_positions[0] = max(total_scored - 1, 0)
         else:
-            sampling_positions[:] = np.arange(row_bucket, dtype=np.int64)
+            sampling_positions[:] = np.arange(row_bucket * spec_width, dtype=np.int64)
 
         # A non-final chunked-prefill row advances its count but discards its
         # sampled token; decode padding rows do not produce output.
@@ -3007,8 +3376,12 @@ class NeuronModelRunnerV2:
         prefill_len_operand = rs.prefill_len.astype(np.int32)  # [B]
 
         sample_position_ids = tuple(
-            int(positions[position]) for position in sampling_positions
+            int(positions[position]) for position in sampling_positions[::spec_width]
         )
+        num_draft_by_row = None
+        if is_verify:
+            num_draft_by_row = np.zeros(row_bucket, dtype=np.int32)
+            num_draft_by_row[:num_active] = num_drafts
 
         # Segmented (chunked) prefill operands: the cached prefix length for the single active prefill row
         # + the resolved singleton segment size. Decode, non-segmented prefill, and zero-active-row DP
@@ -3065,6 +3438,10 @@ class NeuronModelRunnerV2:
             linear_idx=_to_dev(linear_idx) if linear_idx is not None else None,
             slot_mappings=tuple(_to_dev(m) for m in slot_mappings),
             swa_kv_pos_offsets=tuple(swa_kv_pos_offsets),
+            num_draft_by_row=(
+                _to_dev(num_draft_by_row) if num_draft_by_row is not None else None
+            ),
+            spec_width=spec_width,
         )
 
     # ------------------------------------------------------------------
@@ -3132,7 +3509,11 @@ class NeuronModelRunnerV2:
             batch_size = self.decode_row_capacity
         idx_mapping_np = np.arange(batch_size, dtype=np.int32)
         num_computed = np.zeros(batch_size, dtype=np.int64)
-        query_lens = np.ones(batch_size, dtype=np.int64)
+        # With speculative decoding the decode graph is the verify graph: k drafts
+        # per row (the same shape for any draft counts).
+        k = self.num_speculative_tokens
+        num_drafts = np.full(batch_size, k, dtype=np.int64)
+        query_lens = 1 + num_drafts
         # decode requires num_computed >= prefill_len; make prefill_len 0 so every row reads as decode.
         prefill_lens_active = np.zeros(batch_size, dtype=np.int64)
         return self._assemble_model_input(
@@ -3141,10 +3522,11 @@ class NeuronModelRunnerV2:
             query_lens=query_lens,
             prefill_lens_active=prefill_lens_active,
             is_prefill=False,
-            token_bucket=batch_size,
+            token_bucket=batch_size * (1 + k),
             row_bucket=batch_size,
             kv_segment_size=0,
             device=device,
+            num_drafts=num_drafts,
         )
 
     # ------------------------------------------------------------------

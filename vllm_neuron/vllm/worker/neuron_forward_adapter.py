@@ -30,6 +30,11 @@ from vllm_neuron.functional.combine_sampled_tokens import (
 # padded rows are excluded from sampling host-side and from attention by the block-table -1 sentinel, so
 # the pad embedding never pollutes a real output. NEVER use a negative id (embedding is not defined there).
 PAD_TOKEN = 0
+# KV write sink for padded tokens: slot 0 of the reserved null block (NULL_BLOCK_ID 0),
+# the runner's host padding value for slot mappings.
+NULL_SLOT = 0
+# Rejected or padding position of a verify step's rejection output.
+PLACEHOLDER = -1
 
 
 # Forked from the V1 model runner's _reinterpret_uint32_as_int32 helper.
@@ -62,8 +67,8 @@ def build_attention_metadata(
     decode_token_threshold: int = 1,
     cached_seq_len: torch.Tensor | None = None,
     kv_segment_size: int = 0,
-    slot_mappings: "Sequence[torch.Tensor] | None" = None,
-    swa_kv_pos_offsets: "Sequence[torch.Tensor | None] | None" = None,
+    slot_mappings: Sequence[torch.Tensor] | None = None,
+    swa_kv_pos_offsets: Sequence[torch.Tensor | None] | None = None,
     always_cached_seq_len: bool = False,
 ) -> dict[str, dict]:
     """Build per-layer attention metadata for dense model execution.
@@ -200,17 +205,229 @@ def _compute_next_device_state(
     return new_token_ids, new_num_computed, new_total_len, new_last_sampled
 
 
+def _compute_next_device_state_multi(
+    token_ids: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    total_len: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    prefill_len: torch.Tensor,
+    slot_active_row: torch.Tensor,
+    query_len_by_slot: torch.Tensor,
+    sampled_tokens: torch.Tensor,
+    num_committed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the next state bundle of a step that commits several tokens per row.
+
+    Same contract as :func:`_compute_next_device_state` (and the same result for
+    one committed token per row), for speculative decoding: a verify step commits
+    the accepted prefix of each row of its ``[rows, 1 + k]`` rejection output, and
+    the computed count advances by the committed count instead of by the scheduled
+    query length (which includes the rejected drafts). A prefill step of a
+    speculative configuration passes ``num_committed`` ones and advances by its
+    query length. Token history gets one guarded indexed write per column.
+
+    Args:
+        token_ids: ``[max_num_reqs, max_model_len]`` token history.
+        num_computed_tokens: ``[max_num_reqs]`` computed-token counts.
+        total_len: ``[max_num_reqs]`` stored token lengths.
+        last_sampled_tokens: ``[max_num_reqs, 1]`` sampled-token store.
+        prefill_len: ``[max_num_reqs]`` prefill completion lengths.
+        slot_active_row: ``[max_num_reqs]`` output row per active slot.
+        query_len_by_slot: ``[max_num_reqs]`` scheduled token count by slot.
+        sampled_tokens: Sampled tokens in output-row order, ``[rows]`` or
+            ``[rows, width]`` (the committed prefix of each row first).
+        num_committed: ``[rows]`` committed-token count per row.
+
+    Returns:
+        Updated token history, computed counts, total lengths, and sampled
+        token store.
+    """
+    max_model_len = token_ids.shape[1]
+    num_rows = sampled_tokens.shape[0]
+    sampled_2d = sampled_tokens.reshape(num_rows, -1)
+    width = sampled_2d.shape[1]
+
+    active = slot_active_row >= 0
+    row_idx = torch.clamp(slot_active_row.to(torch.int64), min=0)
+    committed_by_slot = num_committed.reshape(-1).to(num_computed_tokens.dtype)[row_idx]
+    # A prefill row advances by its chunk; a verify row by its accepted tokens.
+    delta = torch.where(
+        num_computed_tokens >= prefill_len,
+        committed_by_slot,
+        query_len_by_slot.to(num_computed_tokens.dtype),
+    )
+    delta = torch.where(active, delta, torch.zeros_like(num_computed_tokens))
+    new_num_computed = num_computed_tokens + delta
+    already_decode = num_computed_tokens >= prefill_len
+    in_bounds = total_len < max_model_len
+    commit = active & (already_decode | (new_num_computed == prefill_len)) & in_bounds
+
+    # The last committed token of each row feeds the next step.
+    last_col = torch.clamp(committed_by_slot.to(torch.int64) - 1, min=0, max=width - 1)
+    # One 1-D gather per column, and a select for the last committed token: neuronx-cc
+    # fails 2-D gathers here (NCC_ISMP902, simplifier "tuple index out of range").
+    token_by_slot = [
+        sampled_2d[:, col].reshape(-1).to(token_ids.dtype)[row_idx]
+        for col in range(width)
+    ]  # width x [max_num_reqs]
+    last_by_slot = torch.zeros_like(token_by_slot[0])
+    for col in range(width):
+        last_by_slot = torch.where(last_col == col, token_by_slot[col], last_by_slot)
+    last_by_slot = last_by_slot.view(-1, 1)
+    new_last_sampled = torch.where(
+        commit.view(-1, 1),
+        last_by_slot.to(last_sampled_tokens.dtype),
+        last_sampled_tokens,
+    )
+
+    state_rows = torch.arange(
+        token_ids.shape[0], dtype=torch.int64, device=token_ids.device
+    )
+    stored = torch.zeros_like(total_len)
+    for col in range(width):
+        dest = total_len.to(torch.int64) + col
+        store = commit & (committed_by_slot > col) & (dest < max_model_len)
+        append_col = torch.clamp(dest, max=max_model_len - 1)
+        old_token_at_append = token_ids[state_rows, append_col]
+        token_to_store = torch.where(store, token_by_slot[col], old_token_at_append)
+        token_ids.index_put_((state_rows, append_col), token_to_store)
+        stored = stored + store.to(total_len.dtype)
+    new_token_ids = token_ids
+    new_total_len = total_len + stored
+
+    return new_token_ids, new_num_computed, new_total_len, new_last_sampled
+
+
+def _build_verify_inputs(
+    *,
+    attn_metadata: dict,
+    row_to_slot: torch.Tensor,
+    input_valid_mask: torch.Tensor,
+    num_draft_by_row: torch.Tensor,
+    decode_token_by_slot: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    max_model_len: int,
+    token_dtype: torch.dtype,
+):
+    """Build a verify step's tokens, positions and metadata from device state.
+
+    Row ``r`` holds the slot's next token and its first ``num_draft_by_row[r]``
+    drafts in a ``1 + k`` wide row, then padding. Positions start at the slot's
+    device computed count, which is exact even when the scheduler's count is
+    optimistic (async scheduling); slot mappings of attention groups follow from
+    the positions. Recurrent-state groups (metadata with ``state_in``) resume from
+    block ``num_accepted - 1``. Padding tokens and padded rows get the pad token
+    and slot 0 of the null block.
+
+    Positions stay consecutive inside a row (padding tokens continue the row,
+    clamped to ``max_model_len - 1``; padded rows count from 0), as the decode
+    attention mask expects.
+
+    Returns:
+        ``(input_ids [B, 1 + k], drafts [B, k], positions [B * (1 + k)] int32,
+        attn_metadata)``.
+    """
+    num_rows = row_to_slot.shape[0]
+    k = draft_tokens.shape[1]
+    width = 1 + k
+    slot_idx = torch.clamp(row_to_slot.to(torch.int64), min=0)
+    real_row = input_valid_mask.reshape(num_rows, 1)
+    cols = torch.arange(width, dtype=torch.int64, device=row_to_slot.device).view(
+        1, width
+    )
+    token_valid = real_row & (cols <= num_draft_by_row.to(torch.int64).view(-1, 1))
+
+    first = decode_token_by_slot.reshape(-1).to(token_dtype)[slot_idx].view(-1, 1)
+    drafts = draft_tokens.to(token_dtype)[slot_idx]  # [B, k]
+    input_ids = torch.cat([first, drafts], dim=1)
+    input_ids = torch.where(
+        token_valid, input_ids, torch.full_like(input_ids, PAD_TOKEN)
+    )
+    drafts = input_ids[:, 1:]
+
+    base = num_computed_tokens.to(torch.int64)[slot_idx].view(-1, 1)
+    base = torch.where(real_row, base, torch.zeros_like(base))
+    positions_2d = torch.clamp(base + cols, max=max_model_len - 1)
+
+    state_in = torch.clamp(num_accepted.to(torch.int32)[slot_idx] - 1, min=0)
+    state_in = torch.where(
+        input_valid_mask.reshape(-1), state_in, torch.zeros_like(state_in)
+    )
+
+    new_metadata: dict[str, dict] = {}
+    # One rebuilt dict per KV group (the runner tags each group's dict with its
+    # constant kv_group index); untagged metadata is rebuilt per layer.
+    by_group: dict[int, dict] = {}
+    for layer_name, meta in attn_metadata.items():
+        group = meta.get("kv_group")
+        new_meta = by_group.get(group) if group is not None else None
+        if new_meta is None:
+            new_meta = dict(meta)
+            if "state_in" in meta:
+                new_meta["state_in"] = state_in.to(meta["state_in"].dtype)
+            else:
+                block_table = meta["block_table_tensor"]
+                block_size = meta["block_size"]
+                blocks = torch.clamp(
+                    positions_2d // block_size, max=block_table.shape[1] - 1
+                )
+                block_ids = torch.gather(block_table.to(torch.int64), 1, blocks)
+                slots = block_ids * block_size + positions_2d % block_size
+                null_slot = torch.full_like(slots, NULL_SLOT)
+                slots = torch.where(token_valid & (block_ids >= 0), slots, null_slot)
+                new_meta["slot_mapping"] = slots.reshape(-1)
+            if group is not None:
+                by_group[group] = new_meta
+        new_metadata[layer_name] = new_meta
+    return (
+        input_ids,
+        drafts,
+        positions_2d.reshape(-1).to(torch.int32),
+        new_metadata,
+    )
+
+
+def _shifted_prefill_draft_ids(
+    token_store: torch.Tensor,
+    linear_idx: torch.Tensor,
+    input_valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Gather each prefill token's successor from the token store.
+
+    A draft head reads token ``i + 1`` with the target state of token ``i``. Inside
+    a chunk that is the next prompt token, also for the chunk's last token when
+    the chunk is not the final one (the store holds the whole prompt). The final
+    chunk's last token has no successor in the store; the caller patches it with
+    the sampled token.
+    """
+    max_model_len = token_store.shape[1]
+    in_row = linear_idx % max_model_len
+    next_idx = torch.where(in_row < max_model_len - 1, linear_idx + 1, linear_idx)
+    shifted = torch.index_select(token_store.reshape(-1), 0, next_idx)
+    return torch.where(input_valid_mask, shifted, torch.full_like(shifted, PAD_TOKEN))
+
+
 class NeuronForwardAdapter(torch.nn.Module):
     """Wrap an unchanged model with the runner's compiled forward contract.
 
     Use an ``nn.Module`` so ``torch.compile`` traces the explicit tensor ABI in
     :meth:`forward`. Retain the wrapped model as an unmodified submodule.
+
+    With a ``speculator`` (speculative decoding) the adapter also runs, in the same
+    graph, the rejection sampler of a verify step and the draft model, and commits
+    each slot's accepted tokens, drafts and accepted count (see
+    ``docs/design/speculation/mrv2-spec-decode.md``).
     """
 
-    def __init__(self, model, emit_gathered_logits: bool = False) -> None:
+    def __init__(
+        self, model, emit_gathered_logits: bool = False, speculator=None
+    ) -> None:
         super().__init__()
         self.model = model
         self.emit_gathered_logits = emit_gathered_logits
+        self.speculator = speculator
 
     def forward(
         self,
@@ -230,6 +447,9 @@ class NeuronForwardAdapter(torch.nn.Module):
         rank: torch.Tensor,
         next_token_by_slot: torch.Tensor,
         linear_idx: torch.Tensor | None = None,
+        draft_tokens: torch.Tensor | None = None,
+        num_accepted: torch.Tensor | None = None,
+        num_draft_by_row: torch.Tensor | None = None,
     ):
         """Execute one model step and commit state inside the graph.
 
@@ -265,16 +485,49 @@ class NeuronForwardAdapter(torch.nn.Module):
             next_token_by_slot: Non-aliased sampled-token output from the
                 previous step.
             linear_idx: Optional flat prefill gather index. Omit for decode.
+            draft_tokens: Speculative decoding only: ``[max_num_reqs, k]`` drafts
+                each slot's last step proposed (device state).
+            num_accepted: Speculative decoding only: ``[max_num_reqs]`` tokens
+                each slot's last step committed (device state).
+            num_draft_by_row: Verify steps only: ``[rows]`` scheduled draft
+                count per row.
 
         Returns:
             Sampled tokens, updated state tensors, and the non-aliased
-            next-token output. Append gathered logits in debug mode.
+            next-token output. Append gathered logits in debug mode. With
+            speculative decoding the sampled tokens of a verify step are the
+            ``[rows, 1 + k]`` rejection output (``-1`` past the accepted
+            prefix) and the state bundle also holds the new draft table and
+            accepted counts.
 
         Raises:
             AssertionError: If the decode carry dtype does not match the token
                 history dtype.
             RuntimeError: If debug mode does not receive tensor logits.
         """
+        if self.speculator is not None:
+            return self._forward_speculative(
+                positions=positions,
+                attn_metadata=attn_metadata,
+                sampling_positions=sampling_positions,
+                row_to_slot=row_to_slot,
+                input_valid_mask=input_valid_mask,
+                slot_active_row=slot_active_row,
+                query_len_by_slot=query_len_by_slot,
+                prefill_len=prefill_len,
+                token_store=token_store,
+                num_computed_tokens=num_computed_tokens,
+                total_len=total_len,
+                last_sampled_tokens=last_sampled_tokens,
+                sampling_params=sampling_params,
+                rank=rank,
+                next_token_by_slot=next_token_by_slot,
+                linear_idx=linear_idx,
+                draft_tokens=draft_tokens,
+                num_accepted=num_accepted,
+                num_draft_by_row=num_draft_by_row,
+            )
+
         # --- prologue: build input_ids on device (never read on host) ---
         if linear_idx is not None:
             # PREFILL: gather each scored token from its request's stable-slot row in the flattened store.
@@ -360,3 +613,212 @@ class NeuronForwardAdapter(torch.nn.Module):
                 )
             return sampled, bundle, next_token_out, gathered_logits
         return sampled, bundle, next_token_out
+
+    @staticmethod
+    def _decode_token_by_slot(
+        token_store,
+        num_computed_tokens,
+        prefill_len,
+        slot_active_row,
+        next_token_by_slot,
+    ):
+        """Return the ``[max_num_reqs, 1]`` token each slot's decode row consumes."""
+        assert next_token_by_slot.dtype == token_store.dtype, (
+            "decode carry must match token_store dtype before bootstrap "
+            f"selection; got {next_token_by_slot.dtype} and {token_store.dtype}"
+        )
+        bootstrap_slot = (slot_active_row >= 0) & (num_computed_tokens < prefill_len)
+        bootstrap_col = torch.clamp(
+            num_computed_tokens.to(torch.int64), max=token_store.shape[1] - 1
+        )
+        bootstrap_token_by_slot = torch.gather(
+            token_store, dim=1, index=bootstrap_col.unsqueeze(1)
+        )
+        return torch.where(
+            bootstrap_slot.unsqueeze(1), bootstrap_token_by_slot, next_token_by_slot
+        )
+
+    def _forward_speculative(
+        self,
+        *,
+        positions,
+        attn_metadata,
+        sampling_positions,
+        row_to_slot,
+        input_valid_mask,
+        slot_active_row,
+        query_len_by_slot,
+        prefill_len,
+        token_store,
+        num_computed_tokens,
+        total_len,
+        last_sampled_tokens,
+        sampling_params,
+        rank,
+        next_token_by_slot,
+        linear_idx,
+        draft_tokens,
+        num_accepted,
+        num_draft_by_row,
+    ):
+        """Run one prefill or verify step with the draft model in the same graph.
+
+        Prefill: the target runs the chunk, then the draft head runs over the same
+        tokens (each with its successor) and proposes ``k`` drafts for the slot.
+        Verify: tokens, positions, slot mappings and ``state_in`` come from device
+        state (:func:`_build_verify_inputs`); the target samples every position,
+        the fixed-layout rejection sampler accepts a prefix of each row, and the
+        draft head proposes the next drafts from the last accepted position. The
+        commit appends the accepted tokens and records the drafts and the accepted
+        count per slot.
+        """
+        assert draft_tokens is not None and num_accepted is not None, (
+            "speculative decoding needs the draft table and the accepted counts"
+        )
+        speculator = self.speculator
+        is_prefill = linear_idx is not None
+        num_rows = row_to_slot.shape[0]
+        k = draft_tokens.shape[1]
+        sampling_row_to_slot = torch.clamp(row_to_slot, min=0)
+
+        if is_prefill:
+            gathered = torch.index_select(token_store.reshape(-1), 0, linear_idx)
+            input_ids = torch.where(
+                input_valid_mask, gathered, torch.full_like(gathered, PAD_TOKEN)
+            )
+            token_sampling_slots = sampling_row_to_slot
+        else:
+            assert num_draft_by_row is not None, "a verify step needs draft counts"
+            decode_token_by_slot = self._decode_token_by_slot(
+                token_store,
+                num_computed_tokens,
+                prefill_len,
+                slot_active_row,
+                next_token_by_slot,
+            )
+            input_ids_2d, drafts_in, positions, attn_metadata = _build_verify_inputs(
+                attn_metadata=attn_metadata,
+                row_to_slot=row_to_slot,
+                input_valid_mask=input_valid_mask,
+                num_draft_by_row=num_draft_by_row,
+                decode_token_by_slot=decode_token_by_slot,
+                draft_tokens=draft_tokens,
+                num_computed_tokens=num_computed_tokens,
+                num_accepted=num_accepted,
+                max_model_len=token_store.shape[1],
+                token_dtype=token_store.dtype,
+            )
+            input_ids = input_ids_2d.reshape(-1)
+            # Every token of a row samples with the row's parameters.
+            token_sampling_slots = (
+                sampling_row_to_slot.view(num_rows, 1)
+                .expand(num_rows, 1 + k)
+                .reshape(-1)
+            )
+        selected_sampling_params = torch.index_select(
+            sampling_params, 0, token_sampling_slots
+        )
+
+        result = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            attn_metadata=attn_metadata,
+            sampling_positions=sampling_positions,
+            sampling_params=selected_sampling_params,
+            logit_mask=None,
+            rank=rank,
+        )
+        sampled = _reinterpret_uint32_as_int32(result[0], token_store.dtype)
+        target_hidden = speculator.target_hidden_states(result)
+
+        if is_prefill:
+            # Draft over the chunk: token i + 1 with the target state of token i.
+            # The final chunk's last token is followed by the token just sampled.
+            draft_ids = _shifted_prefill_draft_ids(
+                token_store, linear_idx, input_valid_mask
+            )
+            slot0 = sampling_row_to_slot[:1]
+            final_chunk = (
+                num_computed_tokens[slot0] + query_len_by_slot[slot0]
+            ) >= prefill_len[slot0]
+            next_after_chunk = torch.index_select(draft_ids, 0, sampling_positions)
+            next_token = torch.where(
+                final_chunk,
+                sampled.reshape(-1)[:1].to(draft_ids.dtype),
+                next_after_chunk,
+            )
+            raw_sampled = next_token.view(1, 1)
+            draft_sampling_positions = sampling_positions
+            sampled_out = sampled
+            num_committed = torch.ones(
+                num_rows, dtype=torch.int32, device=sampled.device
+            )
+        else:
+            from vllm_neuron.nn.rejection_sampler import rejection_sample_fixed
+
+            targets = sampled.reshape(num_rows, 1 + k)
+            sampled_out = rejection_sample_fixed(
+                targets,
+                drafts_in,
+                num_draft_by_row,
+                speculator.synthetic_conditional_rates,
+            )
+            num_committed = (sampled_out != PLACEHOLDER).sum(dim=1).to(torch.int32)
+            # The draft head reads token j + 1 with the target state of token j, so
+            # shift each row left by one. It patches the row's next token at its
+            # last accepted position, read from the rejection output.
+            draft_ids = torch.cat(
+                [
+                    input_ids_2d[:, 1:],
+                    torch.full_like(input_ids_2d[:, :1], PAD_TOKEN),
+                ],
+                dim=1,
+            ).reshape(-1)
+            raw_sampled = sampled_out
+            draft_sampling_positions = (
+                torch.arange(num_rows, dtype=torch.int64, device=sampled.device)
+                * (1 + k)
+                + k
+            )
+
+        new_drafts = speculator(
+            input_ids=draft_ids,
+            positions=positions,
+            target_hidden_states=target_hidden,
+            attn_metadata=attn_metadata,
+            sampling_positions=draft_sampling_positions,
+            raw_sampled_token_ids=raw_sampled,
+            rank=rank,
+        )
+
+        bundle = _compute_next_device_state_multi(
+            token_ids=token_store,
+            num_computed_tokens=num_computed_tokens,
+            total_len=total_len,
+            last_sampled_tokens=last_sampled_tokens,
+            prefill_len=prefill_len,
+            slot_active_row=slot_active_row,
+            query_len_by_slot=query_len_by_slot,
+            sampled_tokens=sampled_out,
+            num_committed=num_committed,
+        )
+        active = slot_active_row >= 0
+        row_idx = torch.clamp(slot_active_row.to(torch.int64), min=0)
+        new_draft_tokens = torch.where(
+            active.view(-1, 1),
+            new_drafts.reshape(num_rows, k).to(draft_tokens.dtype)[row_idx],
+            draft_tokens,
+        )
+        new_num_accepted = torch.where(
+            active, num_committed.to(num_accepted.dtype)[row_idx], num_accepted
+        )
+        bundle = (*bundle, new_draft_tokens, new_num_accepted)
+        next_token_out = bundle[3].clone()
+        if self.emit_gathered_logits:
+            gathered_logits = speculator.gathered_logits(result)
+            if not torch.is_tensor(gathered_logits):
+                raise RuntimeError(
+                    "V2 gathered logits require the model to return a tensor"
+                )
+            return sampled_out, bundle, next_token_out, gathered_logits
+        return sampled_out, bundle, next_token_out

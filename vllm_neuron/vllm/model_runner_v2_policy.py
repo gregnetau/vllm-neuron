@@ -304,8 +304,8 @@ def get_neuron_model_runner_v2_policy(
         # Hybrid models with recurrent-state layers (interfaces.HasRecurrentState) default to
         # V1 while V2 support is validated, but are not recorded unsupported, so an explicit
         # VLLM_USE_V2_MODEL_RUNNER=1 request is honored (same pattern as MoE and SWA). V2
-        # keeps the state in dedicated pools without speculative state blocks; the
-        # features below need V1 (speculative decoding is rejected for every model below).
+        # keeps the state in dedicated pools (1 + k state blocks per request with MTP);
+        # the features below need V1 (speculative decoding is gated further down).
         if recurrent_state:
             dense_generate = False
             if getattr(cache_config, "enable_prefix_caching", False):
@@ -320,8 +320,14 @@ def get_neuron_model_runner_v2_policy(
     if getattr(vllm_config, "diffusion_config", None) is not None:
         unsupported.append("diffusion model")
         dense_generate = False
-    if getattr(vllm_config, "speculative_config", None) is not None:
-        unsupported.append("speculative decoding")
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is not None:
+        # Speculative decoding defaults to V1. V2 serves the methods and models in
+        # v2_spec_decode.V2_SPEC_DECODE_METHODS when VLLM_USE_V2_MODEL_RUNNER=1
+        # (docs/design/speculation/mrv2-spec-decode.md); everything else is
+        # recorded unsupported, so a forced V2 fails validation.
+        dense_generate = False
+        unsupported.extend(_spec_decode_unsupported(vllm_config, speculative_config))
     # MRv2 supports KV transfer for dense, non-speculative models.
     # Configurations that use unsupported model types, parallelism modes, or
     # serving features continue to use MRv1.
@@ -464,6 +470,47 @@ def get_neuron_model_runner_v2_policy(
             dense_generate = False
 
     return NeuronModelRunnerPolicy(dense_generate, tuple(unsupported))
+
+
+def _spec_decode_unsupported(vllm_config: object, speculative_config: object) -> list:
+    """Return why V2 cannot serve a speculative configuration (empty if it can).
+
+    Args:
+        vllm_config: Configuration to inspect.
+        speculative_config: Its ``speculative_config``.
+
+    Returns:
+        Unsupported feature names for the policy.
+    """
+    from vllm_neuron.vllm.worker.v2_spec_decode import (
+        V2_REJECTION_SAMPLE_METHODS,
+        v2_spec_decode_unsupported_reason,
+    )
+
+    model_config = getattr(vllm_config, "model_config", None)
+    reason = v2_spec_decode_unsupported_reason(
+        getattr(speculative_config, "method", None),
+        _model_architectures(model_config) if model_config is not None else [],
+    )
+    if reason is not None:
+        return [reason]
+    unsupported = []
+    method = getattr(speculative_config, "rejection_sample_method", None) or "standard"
+    if method not in V2_REJECTION_SAMPLE_METHODS:
+        unsupported.append(f"rejection sample method {method!r}")
+    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+        unsupported.append("speculative decoding with KV transfer")
+    get_sw = getattr(model_config, "get_sliding_window", None)
+    if callable(get_sw) and get_sw() is not None:
+        unsupported.append("speculative decoding with sliding-window attention")
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if _parallel_degree(parallel_config, "data_parallel_size") > 1 and getattr(
+        parallel_config, "enable_expert_parallel", False
+    ):
+        unsupported.append("speculative decoding with expert and data parallelism")
+    if _neuron_config_dict(vllm_config).get("debug_logits_dir") is not None:
+        unsupported.append("speculative decoding with debug logits")
+    return unsupported
 
 
 def _neuron_config_dict(vllm_config: object) -> dict:
