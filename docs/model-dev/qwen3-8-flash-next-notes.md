@@ -298,9 +298,9 @@ Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2
 
 - **Same quality as V1.** pass_rate_2 is within run-to-run variance of runs 1 and 2.
 - **Shorter, but not from faster steps.** About 52 tok/s per replica averaged over the run,
-  against about 22 in run 2, while a V2 step is slower than a V1 step on a fixed workload (see
-  [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s timeout (run 3:
-  2), and the long tail of the last exercises varies from run to run.
+  against about 22 in run 2, while a V2 step is about 8% slower than a V1 step on a fixed
+  workload (see [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s
+  timeout (run 3: 2), and the long tail of the last exercises varies from run to run.
 - **22 preemptions** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`, no server errors.
 
 ## Device validation (2026-10-26)
@@ -457,10 +457,15 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **Serving** (64k configuration, `RUNNER=v2`): needles at 3k-45k tokens 6 of 6, three at a
   time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
   19 minutes.
-- **Speed against V1** (same commit, same knobs, one replica each, greedy, `ignore_eos`): time
-  to first token equal; inter-token time 39.5 ms against 34.5 at B=1 (8k prompt), 62.5 ms
-  against 55.3 at B=8 (4k prompts), 130 ms against 115 at B=4 (30k prompts, decode interleaved
-  with the others' prefill chunks). V2 steps are 13-14% slower.
+- **Speed against V1** (same commit, same knobs, one freshly started replica each, greedy,
+  `ignore_eos`): time to first token equal; inter-token time 37.3 ms against 34.5 at B=1 (8k
+  prompt), 59.9 ms against 55.3 at B=8 (4k prompts), 125 ms against 115 at B=4 (30k prompts,
+  decode interleaved with the others' prefill chunks). V2 steps are about 8% slower (a V2
+  replica that had served the Aider run for 6 hours: 39.5 / 62.5 / 130 ms).
+  - Where a B=8 step goes on the host: input preparation 1.2 ms (overlapped with the previous
+    step), the join's wait for the previous step 52 ms, host inputs 0.9 ms and the forward call
+    3.2 ms (2.5 with `VLLM_NEURON_SKIP_GUARD_EVAL=1`, which gains 0.7 ms per step). The host
+    bubble between steps is about 4 ms, so most of the gap is device time.
 - **Aider Polyglot** (run 3 above): 86.7% after 2 tries in 5.5 h on 7 replicas.
 - **Preemption** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`: 22 preemptions during the Aider run,
   no errors.
@@ -495,6 +500,8 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **Prefix caching on V1.** V2 serves it (align-mode checkpoints of the GDN and PLE state).
 - **Dense prefill with MTP on V2.** The compiler error above; short prompts take the masked
   QSA prefill instead.
+- **V2 step time.** About 8% slower than V1 at B=1 and B=8, mostly on the device: profile the
+  adapter graph (in-graph input building and state commit) against V1's decode graph.
 - **Smaller costs:**
   - batch the GDN decode kernel's per-request instruction chains (~5 ms/step at B=8);
   - fix the gated-residual group RMSNorm layout (~2 ms/step at B=1);
