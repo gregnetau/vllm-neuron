@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Load qwen3_5 modules by file path so tests run without vllm / Neuron installed.
+
+``import vllm_neuron`` pulls in vLLM, so for the pure-torch modules we register a bare
+``vllm_neuron`` package stub (only if the real one is unavailable) and import the
+files under ``vllm_neuron.model.qwen3_5`` directly.
+"""
+
+import importlib.util
+import pathlib
+import sys
+import types
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[4] / "vllm_neuron"
+
+# Modules a test installed or replaced (name -> previous entry or _MISSING); see
+# set_module and the autouse _restore_stubbed_modules fixture.
+_MISSING = object()
+_REPLACED: dict = {}
+_PARENT_ATTRS: dict = {}  # (parent module, attribute) -> previous value
+
+
+def _set_parent_attr(name: str, mod) -> None:
+    """``import a.b as c`` reads ``a.b`` from the parent package, not sys.modules."""
+    parent_name, _, attr = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is None:
+        return
+    key = (parent, attr)
+    if key not in _PARENT_ATTRS:
+        _PARENT_ATTRS[key] = getattr(parent, attr, _MISSING)
+    setattr(parent, attr, mod)
+
+
+def set_module(name: str, mod) -> None:
+    """``sys.modules[name] = mod``, undone after the test."""
+    if name not in _REPLACED:
+        _REPLACED[name] = sys.modules.get(name, _MISSING)
+    sys.modules[name] = mod
+    _set_parent_attr(name, mod)
+
+
+def hide_modules(prefix: str) -> None:
+    """Drop already-imported modules under ``prefix`` for this test (restored after it), so
+    they are loaded again against the test's stubs rather than reused."""
+    for name in [n for n in sys.modules if n == prefix or n.startswith(prefix + ".")]:
+        if name not in _REPLACED:
+            _REPLACED[name] = sys.modules[name]
+        del sys.modules[name]
+
+
+def _stub_packages():
+    try:
+        import vllm_neuron  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+    for name, path in (
+        ("vllm_neuron", ROOT),
+        ("vllm_neuron.model", ROOT / "model"),
+        ("vllm_neuron.model.qwen3_5", ROOT / "model" / "qwen3_5"),
+    ):
+        if name not in sys.modules:
+            pkg = types.ModuleType(name)
+            pkg.__path__ = [str(path)]
+            set_module(name, pkg)
+
+
+def _load(name: str, path: pathlib.Path):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    set_module(name, mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(autouse=True)
+def _restore_stubbed_modules():
+    """Undo the module stubs a test installs (test_model_smoke._install_stubs replaces vllm,
+    vllm_neuron.nn and others), and drop qwen3_5 modules imported against them, so stubs
+    never leak into other tests."""
+    before = set(sys.modules)
+    yield
+    for name in [
+        n
+        for n in sys.modules
+        if n not in before and n.startswith("vllm_neuron.model.qwen3_5")
+    ]:
+        del sys.modules[name]
+    for name, prev in _REPLACED.items():
+        if prev is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = prev
+    _REPLACED.clear()
+    for (parent, attr), prev in _PARENT_ATTRS.items():
+        if prev is _MISSING:
+            if hasattr(parent, attr):
+                delattr(parent, attr)
+        else:
+            setattr(parent, attr, prev)
+    _PARENT_ATTRS.clear()
+
+
+@pytest.fixture(scope="session")
+def gdn_ops():
+    _stub_packages()
+    return _load("vllm_neuron.model.qwen3_5.gdn_ops", ROOT / "model/qwen3_5/gdn_ops.py")
+
+
+@pytest.fixture(scope="session")
+def qwen3_5_config():
+    _stub_packages()
+    _load("vllm_neuron.model.neuron_config", ROOT / "model/neuron_config.py")
+    return _load("vllm_neuron.model.qwen3_5.config", ROOT / "model/qwen3_5/config.py")
+
+
+@pytest.fixture(scope="session")
+def weights(qwen3_5_config):
+    return _load("vllm_neuron.model.qwen3_5.weights", ROOT / "model/qwen3_5/weights.py")
+
+
+@pytest.fixture(scope="session")
+def state_cache(qwen3_5_config):
+    return _load("vllm_neuron.model.state_cache", ROOT / "model/state_cache.py")
+
+
+@pytest.fixture(scope="session")
+def state(state_cache):
+    return _load("vllm_neuron.model.qwen3_5.state", ROOT / "model/qwen3_5/state.py")
