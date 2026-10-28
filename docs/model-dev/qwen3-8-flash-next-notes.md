@@ -297,8 +297,10 @@ Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2
 | wall time | 5.5 h (about 300 tok/s average) |
 
 - **Same quality as V1.** pass_rate_2 is within run-to-run variance of runs 1 and 2.
-- **Faster.** About 52 tok/s per replica averaged over the run, against about 22 in run 2;
-  pure-decode windows at batch 8 averaged about 110 tok/s per replica.
+- **Shorter, but not from faster steps.** About 52 tok/s per replica averaged over the run,
+  against about 22 in run 2, while a V2 step is slower than a V1 step on a fixed workload (see
+  [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s timeout (run 3:
+  2), and the long tail of the last exercises varies from run to run.
 - **22 preemptions** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`, no server errors.
 
 ## Device validation (2026-10-26)
@@ -453,8 +455,12 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   and batch 4 (prompt 1 diverges at token 4 on a 0.375 near-tie on both runners; prompt 4
   exceeds K5 by 0.003-0.006). The 4-layer BF16 truncation passes (three-way).
 - **Serving** (64k configuration, `RUNNER=v2`): needles at 3k-45k tokens 6 of 6, three at a
-  time; 24 mixed requests 8 at a time without errors; B=8 decode about 65 ms/step (V1: 63);
-  B=1 about 40 ms/token. Startup with a warm compile cache about 19 minutes.
+  time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
+  19 minutes.
+- **Speed against V1** (same commit, same knobs, one replica each, greedy, `ignore_eos`): time
+  to first token equal; inter-token time 39.5 ms against 34.5 at B=1 (8k prompt), 62.5 ms
+  against 55.3 at B=8 (4k prompts), 130 ms against 115 at B=4 (30k prompts, decode interleaved
+  with the others' prefill chunks). V2 steps are 13-14% slower.
 - **Aider Polyglot** (run 3 above): 86.7% after 2 tries in 5.5 h on 7 replicas.
 - **Preemption** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`: 22 preemptions during the Aider run,
   no errors.
