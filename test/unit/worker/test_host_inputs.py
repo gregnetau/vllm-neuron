@@ -285,16 +285,19 @@ class _HostInputFactory(torch.nn.Module, HasHostInputs):
 
 
 @pytest.mark.parametrize(
-    "model_cls, spec, env, expect_async",
+    "model_cls, spec, env, v2, expect_async",
     [
-        (_HostInputFactory, None, None, True),  # async with the host-token join
-        (_HostInputFactory, SimpleNamespace(method="mtp"), None, False),
-        (_HostInputFactory, None, "0", False),
-        (PlainModel, SimpleNamespace(method="mtp"), "0", True),
+        (_HostInputFactory, None, None, False, True),  # async with the host-token join
+        (_HostInputFactory, SimpleNamespace(method="mtp"), None, False, False),
+        (_HostInputFactory, None, "0", False, False),
+        (PlainModel, SimpleNamespace(method="mtp"), "0", False, True),
+        # Model Runner V2's join also covers verify steps.
+        (_HostInputFactory, SimpleNamespace(method="mtp"), None, True, True),
+        (_HostInputFactory, SimpleNamespace(method="mtp"), "0", True, False),
     ],
 )
 def test_platform_async_scheduling_choice(
-    monkeypatch, model_cls, spec, env, expect_async
+    monkeypatch, model_cls, spec, env, v2, expect_async
 ):
     platform_mod = pytest.importorskip("vllm_neuron.vllm.platform")
     registry = pytest.importorskip("vllm_neuron.model.registry")
@@ -307,6 +310,7 @@ def test_platform_async_scheduling_choice(
         model_config=SimpleNamespace(architectures=["FakeArch"]),
         scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=spec,
+        use_v2_model_runner=v2,  # the cached runner decision
     )
     platform_mod.NeuronPlatform._configure_host_input_models(cfg)
     assert cfg.scheduler_config.async_scheduling is expect_async
