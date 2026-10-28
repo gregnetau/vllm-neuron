@@ -327,6 +327,12 @@ state-pool pages kept inside the pool. Re-validated on device:
 
 ### MTP at the 64k serving configuration (2026-10-28)
 
+The measurements in this section predate the compact QSA decode: their plain-decode baseline is the
+masked full-context decode. Since then plain decode is about 2x faster at 30-60k context with
+3 requests, while MTP verify rows keep the masked path, so MTP's position relative to plain
+decode at long context is worse than measured here. A compact context for verify rows is in
+the open work.
+
 `serve.sh` with MAX_MODEL_LEN=65536, PREFILL_BUCKETS="1024, 4096", DECODE_CTX_BUCKETS="4096,
 16384, 32768", DECODE_INTERLEAVE=1, VLLM_NEURON_MAX_KV_CONCURRENT=8, max_num_seqs 8, against
 the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).

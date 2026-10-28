@@ -218,7 +218,13 @@ Short context, 8,192-token configuration with batch buckets 1 and 4:
 | 2 | 27 | 44 |
 
 65,536-token configuration (`serve.sh` with `VLLM_NEURON_MAX_KV_CONCURRENT=8`, decode context
-buckets 4,096 / 16,384 / 32,768, `DECODE_INTERLEAVE=1`); greedy unless noted:
+buckets 4,096 / 16,384 / 32,768, `DECODE_INTERLEAVE=1`); greedy unless noted.
+
+> Measured before the compact QSA decode (above), so the "No MTP" column is the earlier
+> masked full-context decode. Plain decode is now faster at long context (for example B=3 at
+> 30-60k: about 50 ms instead of 75-105 ms), while MTP verify steps still use the masked path.
+> At long context MTP therefore trails plain decode by more than this table shows.
+
 
 | Batch, context | No MTP | 1 draft token | 2 draft tokens |
 |---|---|---|---|
