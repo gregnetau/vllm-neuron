@@ -58,6 +58,8 @@ def _vllm_config(
     decode_steps=0,
     retention=None,
     cache_dtype="auto",
+    block=BLOCK,
+    max_model_len=MAX_MODEL_LEN,
 ):
     from vllm.config import (
         CacheConfig,
@@ -73,7 +75,7 @@ def _vllm_config(
         model=str(tmp_path),
         skip_tokenizer_init=True,
         dtype="float32",
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
     )
     parallel_config = ParallelConfig()
     speculative_config = None
@@ -88,7 +90,7 @@ def _vllm_config(
         model_config=model_config,
         parallel_config=parallel_config,
         cache_config=CacheConfig(
-            block_size=BLOCK,
+            block_size=block,
             cache_dtype=cache_dtype,
             enable_prefix_caching=apc,
             # None: vLLM retains a state checkpoint at every block boundary (decode
@@ -100,7 +102,7 @@ def _vllm_config(
         scheduler_config=SchedulerConfig(
             max_num_seqs=MAX_REQS,
             max_num_batched_tokens=CHUNK,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=max_model_len,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
             async_scheduling=async_scheduling,
@@ -169,7 +171,8 @@ class _OracleDraft(spec._OracleDraft):
                 pos = int(positions[r * width])
                 accepted = int((raw_sampled_token_ids[r] >= 0).sum())
                 next_pos = pos + accepted
-            reqs = req_by_block.get(int(table[r, pos // BLOCK]), set())
+            block = self.runner.block_sizes[attn]
+            reqs = req_by_block.get(int(table[r, pos // block]), set())
             if len(reqs) != 1:
                 continue
             (req,) = reqs
@@ -242,7 +245,13 @@ class _Engine(spec._Engine):
 
             runner._kv_clearer = hybrid_state.KVBlockClearer(
                 list(caches.values()),
-                runner._ckpt_block_size // BLOCK,
+                runner.request_state.kernel_ratios[
+                    next(
+                        g
+                        for g in range(len(runner.block_sizes))
+                        if g not in runner._state_groups
+                    )
+                ],
                 runner.device,
                 zero_fn=zero,
             )
@@ -302,8 +311,27 @@ class _Engine(spec._Engine):
         self.decode_tables = []  # (slots of the rows, GDN table, slot mappings) per step
         build_kwargs = runner._build_forward_adapter_kwargs
 
+        # (scheduler count and held attention blocks per row, input, attention table)
+        self.attn_tables = []
+
         def record_kwargs(model_input, **kw):
             kwargs = build_kwargs(model_input, **kw)
+            md_attn = kwargs["attn_metadata"][f"layers.{spec.ATTN_LAYERS[0]}.self_attn"]
+            rs = runner.request_state
+            attn = _attn_group(runner)
+            self.attn_tables.append(
+                (
+                    [
+                        (
+                            int(rs.scheduler_num_computed_tokens[s]),
+                            rs.num_blocks(attn, s),
+                        )
+                        for s in model_input.idx_mapping_np.astype(int).tolist()
+                    ],
+                    model_input,
+                    md_attn["block_table_tensor"].clone(),
+                )
+            )
             if not model_input.is_prefill and runner._state_groups:
                 md = kwargs["attn_metadata"]
                 self.decode_tables.append(
@@ -859,3 +887,81 @@ def test_prefix_caching_fp8_kv_batched_decode_matches_no_apc(
     assert hits["b"] == (128 if not spec_k else 64) and hits["c"] == 0, hits
     assert hits["d"] >= 64, hits
     _check_prefix_caching(engine, models, hf=False)
+
+
+@pytest.fixture(scope="module")
+def models_kv1(checkpoint):
+    """The models with one KV head (as Qwen3.8-27B per rank at TP=4)."""
+    import test_v2_runner_inputs as base
+
+    saved = dict(base.TINY_DENSE), dict(base.TINY_MOE)
+    base.TINY_DENSE["num_key_value_heads"] = 1
+    base.TINY_MOE["num_key_value_heads"] = 1
+    try:
+        torch.manual_seed(3)
+        return spec._build_models(moe=checkpoint == "moe")
+    finally:
+        for table, values in zip((base.TINY_DENSE, base.TINY_MOE), saved):
+            table.clear()
+            table.update(values)
+
+
+@pytest.mark.parametrize("draft", ["oracle", "mtp"])
+def test_prefix_caching_27b_geometry_with_mtp_matches_no_apc(
+    tmp_path, checkpoint, models_kv1, draft
+):
+    """Qwen3.8-27B FP8's geometry with MTP, cold (no hits): FP8 KV with one KV head, a
+    128-token prefix-cache block split into 16 kernel blocks of 8, prefill chunks of one
+    block, prompts of two chunks and part of a third (block boundaries crossed during
+    prefill, then verify steps), batched async verify steps. Greedy outputs equal the
+    run without prefix caching; the attention tables keep only the kernel blocks a step
+    can touch."""
+    models = models_kv1
+    hf_model, model, mtp = models
+    assert model.model.layers[3].self_attn.num_key_value_heads_per_rank == 1
+    lengths = {"p0": 287, "p1": 322, "p2": 300, "p3": 383}
+    prompts = {r: _rand(21 + i, n) for i, (r, n) in enumerate(lengths.items())}
+    expected = {r: spec._hf_greedy(hf_model, p, 40) for r, p in prompts.items()}
+    outputs = {}
+    for apc in (False, True):
+        vllm_config = _vllm_config(
+            tmp_path,
+            checkpoint,
+            apc=apc,
+            spec_k=K,
+            async_scheduling=True,
+            cache_dtype="fp8",
+            block=8,
+            max_model_len=512,
+        )
+        if draft == "oracle":
+            engine = _Engine(
+                vllm_config,
+                model,
+                lambda runner: _OracleDraft(runner, expected, _corrupt()),
+                oracle=True,
+            )
+        else:
+            engine = _Engine(vllm_config, model, mtp)
+        engine.run({0: [(r, p, 40) for r, p in prompts.items()]}, max_steps=3000)
+        outputs[apc] = dict(engine.outputs)
+    runner = engine.runner
+    assert runner._ckpt_block_size == 128
+    assert _hits(engine) == dict.fromkeys(lengths, 0)
+    attn = _attn_group(runner)
+    assert runner.request_state.kernel_ratios[attn] == 16
+    # The FP8 cache makes HF a loose reference (the oracle drafts follow it).
+    assert outputs[True] == outputs[False]
+    # Verify rows hold valid kernel blocks only up to the tokens the step and the MTP
+    # head's draft steps can reach (the rest of the last manager block is -1).
+    trimmed = 0
+    for counts, model_input, table in engine.attn_tables:
+        if model_input.is_prefill:
+            continue
+        drafts = model_input.num_draft_by_row
+        for row, (n, held) in enumerate(counts):
+            reach = n + 1 + int(drafts[row]) + 2 * K
+            valid = int((table[row] >= 0).sum())
+            assert valid == min(held, -(-reach // 8)), (n, valid, held)
+            trimmed += valid < held
+    assert trimmed
