@@ -306,9 +306,10 @@ async def cmd_chaos(a):
                 errors.append(r["error"])
             return
         u = r.get("usage") or {}
+        # finish is choice 0's and completion_tokens sums all n choices: a choice-0 "length"
+        # finish only guarantees mt tokens in total (another choice may stop early).
         if r["finish"] not in ("stop", "length", "abort") or (
-            r["finish"] == "length"
-            and u.get("completion_tokens", 0) < mt * kw.get("n", 1)
+            r["finish"] == "length" and u.get("completion_tokens", 0) < mt
         ):
             stats["bad"] += 1
             errors.append(f"bad finish {r['finish']} usage={u} mt={mt}")
