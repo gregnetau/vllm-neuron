@@ -11,6 +11,8 @@
 #   MODEL=... MTP_TOKENS=2 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #   # Model Runner V2 (opt-in; the same knobs, async scheduling also with MTP):
 #   MODEL=... RUNNER=v2 examples/vllm_neuron/models/qwen4_exp/serve.sh
+#   # Prefix caching (V2 only; GDN and PLE state checkpoints at block boundaries):
+#   MODEL=... RUNNER=v2 PREFIX_CACHING=1 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #
 # Knobs:
 #   MAX_MODEL_LEN (default 65536), MAX_NUM_SEQS (8), PREFILL_BUCKETS ("1024, 4096": short prompts
@@ -60,6 +62,14 @@ if [[ -n "${DECODE_INTERLEAVE:-}" ]]; then  # decode steps between the chunks of
   NEURON_CONFIG="${NEURON_CONFIG}, \"decode_steps_between_prefill_chunks\": ${DECODE_INTERLEAVE}"
 fi
 
+PREFIX_ARGS=(--no-enable-prefix-caching)
+if [[ "${PREFIX_CACHING:-0}" == 1 ]]; then
+  if [[ "${RUNNER:-v1}" != v2 ]]; then
+    echo "PREFIX_CACHING=1 needs RUNNER=v2 for Qwen3.8-Flash-Next" >&2; exit 1
+  fi
+  PREFIX_ARGS=(--enable-prefix-caching)
+fi
+
 SPEC_ARGS=()
 if [[ -n "${MTP_TOKENS:-}" ]]; then
   SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${MTP_TOKENS}}")
@@ -73,6 +83,6 @@ exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-num-batched-tokens "${LARGEST_PREFILL}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.82}" \
-  --no-enable-prefix-caching \
+  "${PREFIX_ARGS[@]}" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --additional-config "{\"neuron_config\": {${NEURON_CONFIG}}}"

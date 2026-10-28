@@ -556,8 +556,8 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
 - **Model Runner V2 is opt-in** (`VLLM_USE_V2_MODEL_RUNNER=1`): hybrid state and MTP run on V2
-  only when forced, also with prefix caching and `DECODE_CTX_BUCKETS`; the MoE checkpoint and
-  prefix caching on V2 are validated on CPU only.
+  only when forced, also with prefix caching and `DECODE_CTX_BUCKETS`; prefix caching on V2 is
+  validated on CPU only.
 - **`logprobs` requests fail with MTP**: with on-device rejection sampling the runner returns
   no log-probabilities for the speculative tokens, and vLLM's endpoint fails (HTTP 500). Serve
   without `MTP_TOKENS` when `logprobs` are needed.
