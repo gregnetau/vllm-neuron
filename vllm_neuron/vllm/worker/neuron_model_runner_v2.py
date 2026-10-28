@@ -46,6 +46,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     get_kv_connector,
 )
 
+from . import hybrid_state
 from .neuron_forward_adapter import (
     NeuronForwardAdapter,
     build_attention_metadata,
@@ -57,6 +58,7 @@ from .neuron_input_build import (
     build_kernel_block_rows,
     build_prefill_linear_idx,
     build_slot_mapping,
+    build_state_pool_rows,
     build_swa_kernel_block_rows,
     compute_swa_num_blocks,
     gather_block_rows_raw,
@@ -275,6 +277,11 @@ class NeuronModelRunnerV2:
         self.max_num_batched_tokens = min(
             scheduler_config.max_num_batched_tokens, self.max_model_len
         )
+        # Hybrid models (interfaces.HasRecurrentState, e.g. Qwen3.5 / Qwen3.8 dense) keep
+        # their recurrent state in a dedicated pool per layer, one page set per stable
+        # request slot (see hybrid_state and docs/design/hybrid-state-gdn.md). Read from
+        # the registered class: the model is not loaded yet.
+        self._has_state_layers = self._model_has_recurrent_state()
         self.neuron_config = self._build_neuron_config()
         self.num_batched_tokens_buckets = list(
             self.neuron_config.num_batched_tokens_buckets
@@ -284,6 +291,16 @@ class NeuronModelRunnerV2:
         self.decode_row_capacity = max(self.num_seqs_buckets)
         segment_buckets = self.neuron_config.kv_segment_size_buckets
         self.kv_segment_size = segment_buckets[0] if segment_buckets else 0
+        if self._has_state_layers:
+            self._validate_recurrent_state_config()
+        # Recurrent-state pools, published by initialize_kv_cache: the real page of each
+        # state layer (its MambaSpec carries a one-attention-page placeholder), the state
+        # KV groups, pool pages per slot, the bound pools, and the attention-block clearer.
+        self._state_real_pages: dict = {}
+        self._state_groups: frozenset[int] = frozenset()
+        self._state_pool_slot_pages = 1
+        self.state_caches: dict[str, list[torch.Tensor]] = {}
+        self._kv_clearer: hybrid_state.KVBlockClearer | None = None
 
         # Placeholder geometry only: vLLM applies the backend block-size default after constructing
         # the worker's model runner. initialize_kv_cache replaces this from the validated per-group
@@ -669,7 +686,12 @@ class NeuronModelRunnerV2:
 
             self._spmd_rank_tensors = stamp_spmd_rank_tensors(self.device)
 
-            hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+            # neuron_config.hlo2tensorizer_options replaces the default ("" disables the
+            # modular flow: whole-graph compilation). Mirrors V1.
+            override = self.neuron_config.hlo2tensorizer_options
+            hlo2tensorizer_opts = (
+                "--modular-flow-mac-threshold=10" if override is None else override
+            )
             from libtorch_neuronx_lite.compile.platform import get_platform_target
 
             has_fp8 = self.vllm_config.cache_config.cache_dtype in (
@@ -683,14 +705,27 @@ class NeuronModelRunnerV2:
             if not has_fp8:
                 has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
             if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-                hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+                hlo2tensorizer_opts = f"{hlo2tensorizer_opts} --experimental-unsafe-fp8e4m3fn-as-fp8e4m3".strip()
             self.compile_options["compiler_args"] = [
                 "--auto-cast=none",
                 "--verbose=35",
                 f"-O{self.vllm_config.optimization_level.value}",
-                f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
                 "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
             ]
+            if hlo2tensorizer_opts:
+                self.compile_options["compiler_args"].insert(
+                    -1, f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}"
+                )
+            # A model can declare NATIVE_COMPILER_MODEL_TYPE to replace the --model-type
+            # torch-neuronx adds on the native route (neuronx-cc keeps the last one).
+            # "transformer" makes hlo2penguin split the graph per layer and remat.
+            native_model_type = None
+            if envs.is_native_backend() and not self._is_cpu_mode():
+                native_model_type = self._model_cls_option("NATIVE_COMPILER_MODEL_TYPE")
+            if native_model_type:
+                self.compile_options["compiler_args"].append(
+                    f"--model-type={native_model_type}"
+                )
             logger.info(
                 "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
                 self.vllm_config.optimization_level.value,
@@ -740,11 +775,36 @@ class NeuronModelRunnerV2:
             raise
 
     def state_pool_bytes(self) -> int:
-        """HBM of dedicated recurrent-state pools: none, V2 serves no recurrent-state models."""
-        return 0
+        """Return the HBM per rank of the dedicated recurrent-state pools.
+
+        The worker calls this before KV-cache initialization and keeps the pools
+        out of the KV budget.
+
+        Returns:
+            Pool bytes per rank, or zero for models without recurrent state.
+        """
+        if not self._has_state_layers:
+            return 0
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        total = 0
+        for name, spec in self.get_kv_cache_spec().items():
+            if isinstance(spec, MambaSpec):
+                n_pages = hybrid_state.state_pool_pages(
+                    spec, self.max_num_reqs, dedicated=True
+                )
+                page = hybrid_state.state_page(name, spec, self._state_real_pages)[1]
+                total += n_pages * page
+        return total
 
     def warm_up_hybrid_graphs(self) -> None:
-        """No recurrent-state helper graphs on V2 (see the V1 runner)."""
+        """Compile the KV-block clearing graph of a recurrent-state model.
+
+        Run after model warmup: a graph executed on device earlier would precede
+        the parallel-trace forks. A no-op for other models.
+        """
+        if self._kv_clearer is not None:
+            self._kv_clearer.warm_up()
 
     def get_kv_cache_spec(self) -> dict:
         """Build per-layer KV-cache specifications.
@@ -752,13 +812,16 @@ class NeuronModelRunnerV2:
         Support homogeneous full attention and sliding-window layers with a
         context-parallel degree of one. Windowed layers produce
         ``SlidingWindowSpec`` so the hybrid KV cache manager groups them
-        separately from full-attention layers.
+        separately from full-attention layers. Recurrent-state layers
+        (``KVSpec.state_layers``) produce ``MambaSpec`` placeholders for their
+        dedicated pools and record the real pages.
 
         Returns:
             A mapping from model layer name to its KV cache spec.
 
         Raises:
-            RuntimeError: If the model has not been loaded.
+            RuntimeError: If the model has not been loaded, or declares state
+                layers without implementing ``HasRecurrentState``.
         """
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
@@ -771,7 +834,8 @@ class NeuronModelRunnerV2:
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
         specs: dict = {}
-        for layer in self.model.get_kv_spec().layers:
+        model_kv_spec = self.model.get_kv_spec()
+        for layer in model_kv_spec.layers:
             if getattr(layer, "sliding_window_size", None) is not None:
                 # SlidingWindowSpec (not FullAttentionSpec) so the hybrid KV
                 # cache manager creates a separate group whose blocks outside
@@ -793,7 +857,115 @@ class NeuronModelRunnerV2:
                 sliding_window=None,
                 attention_chunk_size=getattr(layer, "chunk_size", None),
             )
+        state_layers = getattr(model_kv_spec, "state_layers", None) or []
+        if state_layers:
+            if not self._has_state_layers:
+                raise RuntimeError(
+                    "the model declares recurrent-state layers, but its registered "
+                    "class does not implement interfaces.HasRecurrentState"
+                )
+            # Dedicated pools only (the policy and _validate_recurrent_state_config
+            # keep prefix caching, spec decode and the shared pool on V1). The
+            # MambaSpecs carry a placeholder of one attention page, so vLLM keeps the
+            # attention block at --block-size and no kernel-block split is needed.
+            state_specs, self._state_real_pages = hybrid_state.build_state_cache_specs(
+                state_layers,
+                specs,
+                kernel_block=block_size,
+                max_model_len=self.max_model_len,
+                prefix_caching=False,
+                dedicated=True,
+                num_spec_blocks=0,
+                placeholder_pages=1,
+            )
+            specs.update(state_specs)
         return specs
+
+    def _model_cls_option(self, name: str, default=None):
+        """Return a class attribute declared by the registered model class.
+
+        Models declare compile and kernel options on the class
+        (``registry.get_model_cls``, which covers out-of-tree models too), so
+        they can be read before the model is loaded. Mirrors V1.
+
+        Args:
+            name: Attribute name, for example ``NATIVE_COMPILER_MODEL_TYPE``.
+            default: Value when the class or attribute is absent.
+
+        Returns:
+            The declared value, or ``default``.
+        """
+        from vllm_neuron.model.registry import get_model_cls
+
+        model_cls = get_model_cls(self.vllm_config.model_config.architectures)
+        return getattr(model_cls, name, default)
+
+    def _model_has_recurrent_state(self) -> bool:
+        """Return whether the registered model class implements ``HasRecurrentState``."""
+        from vllm_neuron.model.interfaces import HasRecurrentState
+        from vllm_neuron.model.registry import get_model_cls
+
+        model_cls = get_model_cls(self.vllm_config.model_config.architectures)
+        return model_cls is not None and issubclass(model_cls, HasRecurrentState)
+
+    def _validate_recurrent_state_config(self) -> None:
+        """Reject recurrent-state configurations that V2 does not serve correctly.
+
+        The policy routes them to V1, but ``VLLM_USE_V2_MODEL_RUNNER=1`` forces
+        V2 with only a warning, so fail here before any compilation.
+
+        Raises:
+            NotImplementedError: For prefix caching, speculative decoding, or
+                ``VLLM_NEURON_SHARED_STATE_POOL``.
+            ValueError: For a prefill bucket the segmented kernel cannot run.
+        """
+        from vllm_neuron.utils.bucket_utils import segmented_prefill_supports_q_len
+
+        route = "; unset VLLM_USE_V2_MODEL_RUNNER to use the V1 runner"
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError(
+                "The V2 runner does not support prefix caching for models with "
+                "recurrent state; pass --no-enable-prefix-caching" + route
+            )
+        if getattr(self.vllm_config, "speculative_config", None) is not None:
+            raise NotImplementedError(
+                "The V2 runner does not support speculative decoding (MTP) for "
+                "models with recurrent state" + route
+            )
+        if envs.VLLM_NEURON_SHARED_STATE_POOL:
+            raise NotImplementedError(
+                "The V2 runner keeps recurrent state only in dedicated pools; "
+                "VLLM_NEURON_SHARED_STATE_POOL=1 is not supported" + route
+            )
+        if len(self.neuron_config.kv_segment_size_buckets or ()) > 1:
+            logger.warning(
+                "The V2 runner uses only kv_segment_size_buckets[0]=%d; the other "
+                "segment sizes %s compile prefill graphs that are never used.",
+                self.kv_segment_size,
+                self.neuron_config.kv_segment_size_buckets[1:],
+            )
+        if not self.kv_segment_size:
+            # Prefill is single-shot here (the model refuses chunked prefill without
+            # segmented attention), so every prefill starts from zero state.
+            return
+        # Every prefill uses kv_segment_size_buckets[0]. The worker compiles a Q bucket
+        # that is not a multiple of 128 without segmentation, so such a bucket would
+        # dispatch a graph that was never compiled, and a GDN chunk after the first
+        # needs segmented attention to see its cached prefix.
+        unsupported = [
+            b
+            for b in self.neuron_config.num_batched_tokens_buckets
+            if not segmented_prefill_supports_q_len(b)
+        ]
+        if unsupported:
+            raise ValueError(
+                "The V2 runner runs every prefill of a model with recurrent state "
+                f"with segmented attention (kv_segment_size={self.kv_segment_size}), "
+                f"which needs prefill buckets that are multiples of 128; got "
+                f"num_batched_tokens_buckets={self.neuron_config.num_batched_tokens_buckets}"
+                f" (unsupported: {unsupported}). Set num_batched_tokens_buckets in "
+                "neuron_config to multiples of 128" + route
+            )
 
     def _build_neuron_config(self):
         """Build the Neuron model configuration and resolve graph buckets.
@@ -844,8 +1016,14 @@ class NeuronModelRunnerV2:
         # user's. That auto-routing was the #1904 regression.
         cache_dtype = getattr(self.vllm_config.cache_config, "cache_dtype", None)
         kv_is_fp8 = isinstance(cache_dtype, str) and cache_dtype.startswith("fp8")
-        non_packed_fp8_kv = kv_is_fp8 and not neuron_cfg_dict.get(
-            "fp8_packed_kv", False
+        # A model whose segmented prefill reads the unpacked FP8 K cache itself (e.g.
+        # with a vendored kernel) declares it on its class; it keeps segmented prefill.
+        non_packed_fp8_kv = (
+            kv_is_fp8
+            and not neuron_cfg_dict.get("fp8_packed_kv", False)
+            and not self._model_cls_option(
+                "SEGMENTED_PREFILL_READS_UNPACKED_FP8_KV", False
+            )
         )
 
         if user_set_segment_buckets:
@@ -941,9 +1119,13 @@ class NeuronModelRunnerV2:
 
         Supports ``FullAttentionSpec`` and ``SlidingWindowSpec`` groups, and
         ``UniformTypeKVCacheSpecs`` that hold per-layer specs of those types.
-        Dense, non-speculative KV transfer is supported. Speculative decoding,
-        chunked attention, hybrid/Mamba caches, and FP8-packed configurations
-        route to MRv1.
+        Dense, non-speculative KV transfer is supported. Recurrent-state layers
+        (``MambaSpec`` groups of a ``HasRecurrentState`` model, mode ``none``, no
+        speculative blocks) get dedicated pools: the shared buffer is bound only as
+        attention KV, and each state layer gets two zeroed float32 halves of
+        ``1 + max_num_reqs`` pages, bound with ``bind_state_cache``. Speculative
+        decoding, chunked attention, Mamba ``align`` mode (prefix caching), and
+        FP8-packed configurations route to MRv1.
 
         Args:
             kv_cache_config: Grouped full-attention KV-cache configuration.
@@ -955,9 +1137,12 @@ class NeuronModelRunnerV2:
 
         from vllm.v1.kv_cache_interface import (
             FullAttentionSpec,
+            MambaSpec,
             SlidingWindowSpec,
             UniformTypeKVCacheSpecs,
         )
+
+        from vllm_neuron.model.state_cache import state_half_elems
 
         if self._kv_cache_config is not None:
             raise RuntimeError(
@@ -971,6 +1156,10 @@ class NeuronModelRunnerV2:
                 "V2 standalone runner does not support the packed FP8 KV layout (fp8_packed_kv); "
                 "such configs must route to V1"
             )
+        if self._has_state_layers and not self._state_real_pages:
+            # The real state pages are recorded when the specs are built; the engine
+            # core normally asks for them first.
+            self.get_kv_cache_spec()
 
         # --- preflight validation (host-only; ENTIRELY before any allocation) ---
         # Resolve each group into per-layer specs. Reject unsupported spec types
@@ -980,6 +1169,7 @@ class NeuronModelRunnerV2:
         group_layers: list[str] = []
         resolved_block_sizes: list[int] = []
         group_sliding_windows: list[int | None] = []
+        state_groups: set[int] = set()
         for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
             group_spec = group.kv_cache_spec
             # A UniformTypeKVCacheSpecs group (the DI/KV-transfer path) carries
@@ -1011,12 +1201,15 @@ class NeuronModelRunnerV2:
                         f"layer {name!r} appears in more than one KV cache group"
                     )
                 layer_spec = layer_specs[name]
-                if not isinstance(layer_spec, (FullAttentionSpec, SlidingWindowSpec)):
+                if isinstance(layer_spec, MambaSpec):
+                    self._check_state_layer_spec(name, layer_spec, group_spec)
+                    state_groups.add(group_idx)
+                elif not isinstance(layer_spec, (FullAttentionSpec, SlidingWindowSpec)):
                     raise NotImplementedError(
-                        "V2 standalone runner supports only FullAttentionSpec and "
-                        "SlidingWindowSpec KV layers, directly or through "
-                        f"UniformTypeKVCacheSpecs; got {type(layer_spec).__name__} "
-                        f"for layer {name!r}"
+                        "V2 standalone runner supports only FullAttentionSpec, "
+                        "SlidingWindowSpec and recurrent-state MambaSpec KV layers, "
+                        "directly or through UniformTypeKVCacheSpecs; got "
+                        f"{type(layer_spec).__name__} for layer {name!r}"
                     )
                 if getattr(layer_spec, "attention_chunk_size", None) is not None:
                     raise NotImplementedError(
@@ -1072,7 +1265,11 @@ class NeuronModelRunnerV2:
             pooled_layers.extend(names)
         if len(pooled_layers) != len(set(pooled_layers)):
             raise ValueError("a layer appears in more than one KV cache tensor")
-        model_layers = {layer.name for layer in self.model.get_kv_spec().layers}
+        model_kv_spec = self.model.get_kv_spec()
+        model_layers = {layer.name for layer in model_kv_spec.layers}
+        model_layers |= {
+            layer.name for layer in getattr(model_kv_spec, "state_layers", None) or []
+        }
         group_set = set(group_layers)
         pooled_set = set(pooled_layers)
         if not (group_set == pooled_set == model_layers):
@@ -1102,6 +1299,8 @@ class NeuronModelRunnerV2:
         # num_kv_heads/head_size split) would otherwise produce distinct slice
         # objects and silently break native slot-sized KV lowering. Reject here --
         # in the host-only preflight, BEFORE any state mutation or allocation.
+        # Recurrent-state layers are not bound to the shared buffer (dedicated pools),
+        # so only the attention co-tenants need a common view.
         for names in cotenants.values():
             signatures = {
                 name: (
@@ -1111,6 +1310,7 @@ class NeuronModelRunnerV2:
                     spec_by_layer[name].head_size,
                 )
                 for name in names
+                if not isinstance(spec_by_layer[name], MambaSpec)
             }
             if len(set(signatures.values())) > 1:
                 raise ValueError(
@@ -1118,6 +1318,24 @@ class NeuronModelRunnerV2:
                     "(dtype, num_kv_heads, block_size, head_size) so they can reuse "
                     f"exact K/V view objects; got mismatched signatures {signatures}"
                 )
+
+        # Dedicated recurrent-state pools: the real page of each state layer (its spec
+        # carries a placeholder page) and the page count, validated before allocation.
+        state_layer_pages: dict[int, dict] = {}
+        state_pool_pages: dict[int, int] = {}
+        for group_idx in sorted(state_groups):
+            group = kv_cache_config.kv_cache_groups[group_idx]
+            state_pool_pages[group_idx] = hybrid_state.state_pool_pages(
+                group.kv_cache_spec, self.max_num_reqs, dedicated=True
+            )
+            pages = {}
+            for name in group.layer_names:
+                layout, page_bytes = hybrid_state.state_page(
+                    name, spec_by_layer[name], self._state_real_pages
+                )
+                state_half_elems(layout, page_bytes)  # validates fit
+                pages[name] = (layout, page_bytes)
+            state_layer_pages[group_idx] = pages
 
         # This is the first authoritative block geometry the worker receives. The constructor ran
         # before the executor applied Neuron's backend default, so configure the host block rows from
@@ -1145,6 +1363,13 @@ class NeuronModelRunnerV2:
                 f"every KVCacheTensor must share one backing allocation; got sizes {sizes}"
             )
         backing = torch.zeros(sizes.pop(), dtype=torch.int8, device=self.device)
+        state_caches: dict[str, list[torch.Tensor]] = {}
+        for group_idx, pages in state_layer_pages.items():
+            state_caches.update(
+                hybrid_state.allocate_state_pool(
+                    pages, state_pool_pages[group_idx], self.device
+                )
+            )
         raw_by_layer: dict[str, torch.Tensor] = {}
         for start, names in cotenants.items():
             span = spec_by_layer[names[0]].page_size_bytes * num_blocks
@@ -1196,7 +1421,9 @@ class NeuronModelRunnerV2:
         # itself, so it wants the whole tensor, not the [k, v] model-binding view (mirrors MRv1's
         # _kv_cache_full_tensors / get_kv_cache_view_for_connector_registration).
         kv_cache_full_tensors: dict[str, torch.Tensor] = {}
-        for group in kv_cache_config.kv_cache_groups:
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            if group_idx in state_groups:
+                continue
             for name in group.layer_names:
                 spec = spec_by_layer[name]
                 kv_shape = (
@@ -1214,14 +1441,110 @@ class NeuronModelRunnerV2:
 
         # --- bind + publish (last) ---
         self.model.bind_kv_cache(kv_caches)
+        kv_clearer = None
+        if state_caches:
+            self.model.bind_state_cache(state_caches)
+            kv_clearer = self._build_kv_block_clearer(kv_caches)
+            if kv_clearer is not None:
+                self.model.set_runner_clears_kv_blocks(True)
         self._kv_cache_config = kv_cache_config
         self.kv_caches = kv_caches
+        self.state_caches = state_caches
+        self._state_groups = frozenset(state_groups)
+        # Pool pages per slot: 1 + num_speculative_blocks (zero, checked above).
+        self._state_pool_slot_pages = 1
+        self._kv_clearer = kv_clearer
+        if state_caches:
+            pool_bytes = sum(
+                state_pool_pages[g] * page_bytes
+                for g, pages in state_layer_pages.items()
+                for _, page_bytes in pages.values()
+            )
+            logger.info(
+                "Recurrent-state pools: %d layers in KV groups %s, %d pages per layer "
+                "(%d per slot), %.2f GiB per rank; attention block sizes %s; "
+                "runner clears new KV blocks: %s",
+                len(state_caches),
+                sorted(state_groups),
+                max(state_pool_pages.values()),
+                self._state_pool_slot_pages,
+                pool_bytes / (1024**3),
+                [
+                    size
+                    for g, size in enumerate(self.block_sizes)
+                    if g not in state_groups
+                ],
+                kv_clearer is not None,
+            )
         # Compose the KV connector AFTER publish (DI). No-op when no KV-transfer group is
         # present; otherwise ActiveKVConnector registers the full (2, ...) views. Reused verbatim from
         # upstream MRv2 -- the connector is device-neutral and set_host_xfer_buffer_ops self-neuters on
         # Neuron (device-to-device transfer).
         self.kv_connector = get_kv_connector(self.vllm_config, kv_cache_full_tensors)
         return kv_caches
+
+    def _check_state_layer_spec(self, name: str, layer_spec, group_spec) -> None:
+        """Validate one recurrent-state layer's MambaSpec against what V2 serves.
+
+        Args:
+            name: Layer name.
+            layer_spec: The layer's ``MambaSpec``.
+            group_spec: Its KV cache group's spec.
+
+        Raises:
+            NotImplementedError: For a mode or layout V2 does not support.
+            ValueError: For a layer whose real page was not recorded.
+        """
+        if group_spec is not layer_spec:
+            raise NotImplementedError(
+                f"recurrent-state layer {name!r} must have its own MambaSpec KV group"
+            )
+        if layer_spec.mamba_cache_mode != "none":
+            raise NotImplementedError(
+                f"V2 runner supports only Mamba cache mode 'none' (dedicated state "
+                f"pools); got {layer_spec.mamba_cache_mode!r} for layer {name!r} "
+                "(prefix caching routes to V1)"
+            )
+        if layer_spec.num_speculative_blocks:
+            raise NotImplementedError(
+                "V2 runner does not support speculative state blocks "
+                f"(num_speculative_blocks={layer_spec.num_speculative_blocks}) for "
+                f"layer {name!r}"
+            )
+        if name not in self._state_real_pages:
+            raise ValueError(
+                f"MambaSpec layer {name!r} is not a recurrent-state layer of the model"
+            )
+
+    def _build_kv_block_clearer(
+        self, kv_caches: dict
+    ) -> hybrid_state.KVBlockClearer | None:
+        """Return the clearer of newly allocated attention blocks, or None.
+
+        Block ids are global across KV groups. With dedicated pools the shared
+        buffer never holds float32 state, so clearing is defensive, kept for
+        parity with V1 (where the same model was validated). The model then
+        skips its own in-graph clearing. CPU runs keep the model's clearing,
+        as V1 does.
+
+        Args:
+            kv_caches: ``{layer_name: [k_cache, v_cache]}`` of the attention layers.
+
+        Returns:
+            The clearer, or None on CPU or for a model without the hook.
+        """
+        if (
+            not hasattr(self.model, "set_runner_clears_kv_blocks")
+            or self.device.type == "cpu"
+        ):
+            return None
+        caches: dict[int, torch.Tensor] = {}
+        for entry in kv_caches.values():
+            for cache in entry:
+                caches.setdefault(id(cache), cache)
+        # One manager block per kernel block: the state specs' one-page placeholder
+        # keeps the attention block at --block-size.
+        return hybrid_state.KVBlockClearer(list(caches.values()), 1, self.device)
 
     # ------------------------------------------------------------------
     # Execute and sample: async two-phase loop.
@@ -1280,13 +1603,16 @@ class NeuronModelRunnerV2:
             Arguments accepted by :class:`NeuronForwardAdapter`.
         """
         max_query_len = model_input.padded_num_tokens if model_input.is_prefill else 1
+        # Recurrent-state models read cached_seq_len on every prefill (zero: start from
+        # zero state), segmented or not. Gated so other models' graphs are unchanged.
+        state_prefill = self._has_state_layers and model_input.is_prefill
         cached_seq_len = (
             torch.tensor(
                 [[model_input.cached_seq_len]],
                 dtype=torch.int32,
                 device=model_input.positions.device,
             )
-            if model_input.kv_segment_size
+            if model_input.kv_segment_size or state_prefill
             else None
         )
         attn_metadata = build_attention_metadata(
@@ -1299,6 +1625,7 @@ class NeuronModelRunnerV2:
             kv_segment_size=model_input.kv_segment_size,
             slot_mappings=model_input.slot_mappings,
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
+            always_cached_seq_len=state_prefill,
         )
         rs = self.request_state
 
@@ -1387,6 +1714,13 @@ class NeuronModelRunnerV2:
         self.reap_quarantined()
         with record_function_or_nullcontext("neuron_model_runner: update_states"):
             self.update_states(scheduler_output)
+        if self._kv_clearer is not None:
+            # vLLM lists newly allocated blocks for models with Mamba layers (prefix-cache
+            # hits and blocks an async KV load will write are left out). Clear them before
+            # this step's forward reads them; NRT runs the submissions in order.
+            self._kv_clearer.clear(
+                getattr(scheduler_output, "new_block_ids_to_zero", None)
+            )
 
         if scheduler_output.total_num_scheduled_tokens == 0:
             # A KV-only DI step still drains the connector's finished sends/receives. The no-op
@@ -2573,7 +2907,17 @@ class NeuronModelRunnerV2:
         slot_mappings_flat: list[np.ndarray] = []
         for g in range(len(self.block_sizes)):
             swa_width = self._swa_num_blocks[g]
-            if swa_width is not None and not is_prefill:
+            if g in self._state_groups:
+                # Recurrent-state group: the dedicated-pool pages of each row's slot.
+                rows = build_state_pool_rows(
+                    idx_mapping_np,
+                    padded_num_reqs,
+                    self._state_pool_slot_pages,
+                    rs.block_table(g).shape[1],
+                    output_device=device,
+                )
+                offsets = None
+            elif swa_width is not None and not is_prefill:
                 rows, offsets = build_swa_kernel_block_rows(
                     rs,
                     g,
@@ -2671,7 +3015,11 @@ class NeuronModelRunnerV2:
         # dummies pass 0.
         cached_seq_len = (
             int(num_computed[0])
-            if (is_prefill and kv_segment_size and num_active)
+            if (
+                is_prefill
+                and (kv_segment_size or self._has_state_layers)
+                and num_active
+            )
             else 0
         )
         # APC-without-segmentation guard: a prefix-cache hit (num_computed>0) on SINGLE-SHOT prefill
