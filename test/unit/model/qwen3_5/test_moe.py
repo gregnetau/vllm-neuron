@@ -701,3 +701,47 @@ def test_moe_model_traces_on_meta():
     with torch.no_grad():
         out = model.model.layers[0].mlp(meta(2, 64), is_prefill=False, ln_w=meta(64))
     assert out.shape == (2, 64)
+
+
+@pytest.mark.parametrize("num_experts", [8, 64], ids=["all_expert", "selective"])
+@pytest.mark.parametrize("path", ["tkg", "blockwise"])
+def test_moe_verify_bucket_padded_rows_do_not_leak(num_experts, path):
+    """A Model Runner V2 verify step runs B * (1 + k) tokens through the decode path
+    (8 rows x 3 = 24 here; above MAX_TKG_TOKENS, e.g. 64 x 3, the blockwise kernel), with
+    no token mask. Padded rows can carry non-finite hidden states (they read the null
+    block; the backbone zeroes them after each layer, not inside it): the real rows'
+    outputs must stay exact and finite whatever the padded rows route to."""
+    mod = _install_stubs_with_moe_ops()
+    mod_moe = sys.modules["vllm_neuron.model.qwen3_5.moe"]
+    from vllm_neuron.model.qwen3_5.config import Qwen3_5Config
+
+    hf_cfg = _tiny_hf_config(num_experts=num_experts)
+    cfg = Qwen3_5Config.from_configs(hf_cfg.to_dict())
+    m, hf_block = _moe_block(mod, cfg)
+    blk = _load_block(mod, m, hf_block, 0, 1)
+    rows, width, real_rows = 8, 3, 5
+    torch.manual_seed(4)
+    x = torch.randn(rows * width, cfg.hidden_size)
+    n_real = real_rows * width
+    x[n_real : n_real + width] = float("nan")
+    x[n_real + width : n_real + 2 * width] = float("inf")
+    x[n_real + 2 * width :] = 1e30
+    ln_w = torch.rand(cfg.hidden_size) + 0.5
+    with torch.no_grad():
+        ref = hf_block(_norm(x[:n_real], ln_w, cfg.rms_norm_eps).unsqueeze(0))[0]
+    limit = mod_moe.MAX_TKG_TOKENS
+    if path == "blockwise":
+        mod_moe.MAX_TKG_TOKENS = 16
+    try:
+        if path == "tkg":
+            selective = (
+                x.shape[0] * cfg.num_experts_per_tok / num_experts
+                < mod_moe.SELECTIVE_LOADING_THRESHOLD
+            )
+            assert selective == (num_experts == 64)
+        with torch.no_grad():
+            out = blk(x, is_prefill=False, ln_w=ln_w)
+    finally:
+        mod_moe.MAX_TKG_TOKENS = limit
+    assert torch.isfinite(out[:n_real]).all()
+    torch.testing.assert_close(out[:n_real], ref, rtol=1e-4, atol=1e-5)

@@ -39,8 +39,8 @@ device per-request table (`req_states.draft_tokens`, read by
 hybrid model resumes from the state block given by a per-slot accepted count
 (`model_states/mamba_hybrid.py`, `num_accepted_tokens_gpu`).
 
-Scope: MTP (`speculative_config.method == "mtp"`, Qwen3.5 / Qwen3.8 dense, the
-`Qwen3_5MTP` head) first. The draft-model contract is the one EAGLE3 and the MTP proposer of
+Scope: MTP (`speculative_config.method == "mtp"`, Qwen3.5 / Qwen3.8 dense and the sparse
+MoE Qwen3.5-35B-A3B, the `Qwen3_5MTP` / `Qwen3_5MoeMTP` head) first. The draft-model contract is the one EAGLE3 and the MTP proposer of
 upstream PR #78 share (`forward(...) -> (tokens [B, 1 + k], drafts [B, k], logits)`), so
 EAGLE3 is a target-output parser and a hidden-state width away (see [EAGLE3](#eagle3)).
 
@@ -51,7 +51,9 @@ Speculative decoding stays on V1 unless both hold:
 - `VLLM_USE_V2_MODEL_RUNNER=1`, and
 - the method and the target architecture are in `V2_SPEC_DECODE_METHODS`
   (`vllm/worker/v2_spec_decode.py`; initially `mtp` for `Qwen3_5ForCausalLM` /
-  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense).
+  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense, and the MoE
+  `Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration`, the same Neuron class
+  with the sparse MoE FFN; see [Sparse MoE targets](#sparse-moe-targets)).
 
 `get_neuron_model_runner_v2_policy` keeps `default_enabled=False` for every speculative
 configuration (V1 stays the default until device parity runs pass), and
@@ -332,6 +334,30 @@ need in-graph window trimming, since the host count is an upper bound.
 | `nn/rejection_sampler.py` | `rejection_sample_fixed` (shares `_accept_prefix` with the packed sampler) |
 | `vllm/worker/neuron_worker.py` | count `draft_model` weights in the KV budget |
 
+## Sparse MoE targets
+
+Qwen3.5-35B-A3B (`qwen3_5_moe`) is the Qwen3.5 class with `Qwen3_5SparseMoeBlock`
+(`model/qwen3_5/moe.py`) in every decoder layer, the MTP layer's included, so the verify graph,
+the state handling and the drafter are the dense model's. What differs is the FFN's dispatch on
+the token count of a step, which a verify step raises to `B * (1 + k)`:
+
+| Verify bucket (k = 2) | Tokens | Routed experts |
+|---|---|---|
+| `B` = 1, 4, 8 | 3, 12, 24 | fused `moe_block_tkg`, selected experts' weights only |
+| `B` = 16, 32 | 48, 96 | fused `moe_block_tkg`, every local expert (`T * top_k >= E`) |
+| `B` = 64 | 192 | blockwise `moe_cte` (more than `MAX_TKG_TOKENS` = 128) |
+
+The decode path has no token mask: padding tokens of a row and padded rows go through the
+router and the experts like real tokens, and their outputs are discarded (padded rows are also
+zeroed after every layer). That is exact for the real tokens because every token selects
+exactly `top_k` experts, also with a non-finite hidden state (the router scatters its top-k
+values), so the blockwise mapping's static block count (`T * top_k` slots) never overflows, and
+both kernels compute each token's output from its own row only. Prefill masks padding (slot
+`<= 0`) out of the expert blocks as on V1. The MTP head's experts load from per-expert
+checkpoint tensors into the same device layout, sharded the same way (TP on the intermediate
+dimension, or `--enable-expert-parallel`), and the head runs the same dispatch on its own
+token counts (`B * (1 + k)`, then `B` per recurrent draft step).
+
 ## Tests (CPU)
 
 - `test/unit/nn/test_rejection_sampler.py`: the fixed layout against the packed sampler,
@@ -345,10 +371,14 @@ need in-graph window trimming, since the host count is an upper bound.
   arriving while others decode (held back or interleaved), partial acceptance (oracle
   draft), trimmed drafts and drafting stopped near `max_model_len`, all drafts rejected,
   logprobs, the pool pages and `state_in`, and the real MTP head, whose in-graph drafts
-  equal a from-scratch run of the head over each committed sequence. With `SPEC_DYNAMO=1`
+  equal a from-scratch run of the head over each committed sequence. Every case runs for
+  a dense and a sparse MoE checkpoint (MoE ops on their PyTorch fallbacks). With `SPEC_DYNAMO=1`
   the adapter runs through `torch.compile(backend="eager", fullgraph=True)`; the run must
   compile one graph per bucket and nothing per step (`TORCH_LOGS=recompiles`).
-- `test/unit/worker/test_v2_policy_recurrent_state.py`: the policy matrix.
+- `test/unit/worker/test_v2_policy_recurrent_state.py`: the policy matrix, also with vLLM's
+  real `ModelConfig` and MTP `SpeculativeConfig` of the Qwen3.5-35B-A3B checkpoint config.
+- `test/unit/model/qwen3_5/test_moe.py::test_moe_verify_bucket_padded_rows_do_not_leak`:
+  non-finite padded verify rows through both decode dispatch paths of the MoE block.
 
 ## Not done yet
 
@@ -371,6 +401,9 @@ VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.5-2B TP=2 MTP_TOKENS=2 MAX_NUM_SEQ
 # Qwen3.8-27B, TP=4 (add FP8_SCALES=... KV_CACHE_DTYPE=fp8 BLOCK_SIZE=128 for FP8)
 VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.8-27B TP=4 MTP_TOKENS=2 MAX_NUM_SEQS=4 \
     SEQS_BUCKETS="1, 4" examples/vllm_neuron/models/qwen3_5/serve.sh
+# Qwen3.5-35B-A3B (sparse MoE, BF16; about 17.1 GiB of weights per rank with the draft)
+VLLM_USE_V2_MODEL_RUNNER=1 MODEL=<ckpt>/Qwen3.5-35B-A3B TP=4 MTP_TOKENS=2 MAX_NUM_SEQS=4 \
+    SEQS_BUCKETS="1, 4" GPU_MEM_UTIL=0.9 examples/vllm_neuron/models/qwen3_5/serve.sh
 # Repeat each with ASYNC_SCHEDULING=0, and with DECODE_INTERLEAVE=1.
 ```
 

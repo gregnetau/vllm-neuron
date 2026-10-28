@@ -201,3 +201,61 @@ def test_real_model_config_of_the_qwen3_8_checkpoint(tmp_path):
     assert policy.get_neuron_model_runner_v2_policy(cfg) == (
         policy.NeuronModelRunnerPolicy(False, ())
     )
+
+
+MOE_QWEN = "Qwen3_5MoeForConditionalGeneration"
+MOE_CONFIG_JSON = CONFIG_JSON.with_name("qwen3_5_35b_a3b_config.json")
+
+
+def _moe_model_config(tmp_path):
+    from vllm.config import ModelConfig
+
+    shutil.copy(MOE_CONFIG_JSON, tmp_path / "config.json")
+    return ModelConfig(
+        model=str(tmp_path), skip_tokenizer_init=True, max_model_len=2048
+    )
+
+
+def test_real_model_config_of_the_qwen3_5_moe_checkpoint(tmp_path, monkeypatch):
+    # Qwen3.5-35B-A3B: vLLM's own class is hybrid, multimodal and MoE. The Neuron class is
+    # the dense one (HasRecurrentState, ServesTextOnly) with the MoE FFN, so the same
+    # gates pass and MoE (single data-parallel rank) only keeps V1 the default.
+    model_config = _moe_model_config(tmp_path)
+    assert model_config.architectures == [MOE_QWEN]
+    assert model_config.is_hybrid and model_config.multimodal_config is not None
+    assert model_config.is_moe
+    assert policy._has_recurrent_state(model_config)
+    assert policy._serves_text_only(model_config)
+    cfg = _vllm_config(arch=MOE_QWEN)
+    cfg.model_config = model_config
+    assert policy.get_neuron_model_runner_v2_policy(cfg) == (
+        policy.NeuronModelRunnerPolicy(False, ())
+    )
+    assert _decide(monkeypatch, cfg, forced=True) == (True, None)
+
+
+def test_mtp_on_the_qwen3_5_moe_checkpoint(tmp_path, monkeypatch):
+    # vLLM's MTP config for the checkpoint selects the Qwen3_5MoeMTP draft, which the
+    # plugin registers; V2 serves mtp for the MoE target when forced.
+    from vllm.config import ParallelConfig, SpeculativeConfig
+
+    from vllm_neuron.model.registry import get_model_cls
+
+    model_config = _moe_model_config(tmp_path)
+    parallel_config = ParallelConfig()
+    spec = SpeculativeConfig(
+        method="mtp",
+        num_speculative_tokens=2,
+        target_model_config=model_config,
+        target_parallel_config=parallel_config,
+    )
+    assert spec.draft_model_config.architecture == "Qwen3_5MoeMTP"
+    assert get_model_cls(["Qwen3_5MoeMTP"]) is get_model_cls(["Qwen3_5MTP"])
+    cfg = _vllm_config(arch=MOE_QWEN, spec=spec)
+    cfg.model_config = model_config
+    cfg.parallel_config = parallel_config
+    assert policy.get_neuron_model_runner_v2_policy(cfg) == (
+        policy.NeuronModelRunnerPolicy(False, ())
+    )
+    assert _decide(monkeypatch, cfg, forced=False) == (False, None)
+    assert _decide(monkeypatch, cfg, forced=True) == (True, None)

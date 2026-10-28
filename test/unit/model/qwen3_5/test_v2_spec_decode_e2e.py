@@ -13,6 +13,9 @@ rejected) or an oracle that proposes the HF greedy continuation with deliberate 
 steps accept all, some or none of their drafts. Greedy outputs must equal the HF model's
 greedy continuation in every configuration.
 
+Every test runs for the dense model and for the sparse MoE one (``qwen3_5_moe``: every MLP,
+also the MTP head's, is a Qwen3_5SparseMoeBlock on the plugin's MoE ops' PyTorch fallbacks).
+
 Scenarios: requests arriving together, a long chunked prefill arriving while others decode
 (held back, or interleaved with decode steps), partial acceptance, and a request that runs to
 max_model_len (drafts trimmed by the scheduler near the end).
@@ -67,15 +70,37 @@ _TINY_QWEN3_5 = {
     },
 }
 
+# The sparse MoE checkpoint: same shapes, every MLP replaced by routed experts.
+_TINY_QWEN3_5_MOE = {
+    **{k: v for k, v in _TINY_QWEN3_5.items() if k != "intermediate_size"},
+    "architectures": ["Qwen3_5MoeForCausalLM"],
+    "model_type": "qwen3_5_moe_text",
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 48,
+}
+CHECKPOINTS = {"dense": _TINY_QWEN3_5, "moe": _TINY_QWEN3_5_MOE}
+
 
 # ---------------------------------------------------------------- models (stubbed NKI)
 
 
-def _restore_stubbed_modules_now():
+def _restore_stubbed_modules_now(before):
     """Undo test_model_smoke's sys.modules stubs (as the conftest fixture does at
     teardown), keeping the models built against them. The runner and the schedulers
-    import vLLM lazily and need the real modules back."""
+    import vLLM lazily and need the real modules back. ``before``: sys.modules names
+    before the stubs; qwen3_5 modules imported against the stubs since (moe.py, imported
+    by model.py) are dropped too, so later imports and Dynamo's module guards see the
+    real ones."""
     import conftest
+
+    for name in [
+        n
+        for n in sys.modules
+        if n not in before and n.startswith("vllm_neuron.model.qwen3_5")
+    ]:
+        del sys.modules[name]
 
     for name, prev in conftest._REPLACED.items():
         if prev is conftest._MISSING:
@@ -139,19 +164,21 @@ class _GreedyTarget(torch.nn.Module):
         return logits.argmax(dim=-1).to(torch.int32), hidden, logits
 
 
-def _build_models():
+def _build_models(moe=False):
     """HF reference, Neuron target and MTP head (same random weights), built against
     test_model_smoke's stubs, which are then removed."""
+    before = set(sys.modules)
     import test_model_smoke as smoke
     import test_v2_runner_inputs as base
     from conftest import ROOT, _load
 
-    hf_model, model = base._hf_and_model()
+    hf_model, model = base._hf_and_model(moe)
     for i in ATTN_LAYERS:
         _torch_attention(model.model.layers[i].self_attn)
     mtp_mod = _load("vllm_neuron.model.qwen3_5.mtp", ROOT / "model/qwen3_5/mtp.py")
     hf_cfg = dict(hf_model.config.to_dict(), mtp_num_hidden_layers=1)
     mtp = mtp_mod.Qwen3_5MTP.from_configs(hf_cfg, NUM_LAYERS, None)
+    assert mtp.model.layers[0].is_moe == moe
     mtp.num_speculative_tokens = K  # set by load_draft_model when serving
     torch.manual_seed(11)
     with torch.no_grad():
@@ -166,7 +193,7 @@ def _build_models():
     mtp._materialize_buffers()
     _torch_attention(mtp.model.layers[0].self_attn)
     del smoke
-    _restore_stubbed_modules_now()
+    _restore_stubbed_modules_now(before)
     return hf_model, model, mtp
 
 
@@ -270,7 +297,7 @@ class _FullMetadataSpeculator(torch.nn.Module):
 # ---------------------------------------------------------------- engine harness
 
 
-def _vllm_config(tmp_path, *, async_scheduling, decode_steps):
+def _vllm_config(tmp_path, checkpoint, *, async_scheduling, decode_steps):
     from vllm.config import (
         CacheConfig,
         ModelConfig,
@@ -280,7 +307,7 @@ def _vllm_config(tmp_path, *, async_scheduling, decode_steps):
         VllmConfig,
     )
 
-    (tmp_path / "config.json").write_text(json.dumps(_TINY_QWEN3_5))
+    (tmp_path / "config.json").write_text(json.dumps(CHECKPOINTS[checkpoint]))
     model_config = ModelConfig(
         model=str(tmp_path),
         skip_tokenizer_init=True,
@@ -469,10 +496,15 @@ class _Engine:
         raise AssertionError("engine did not finish")
 
 
+@pytest.fixture(scope="module", params=list(CHECKPOINTS))
+def checkpoint(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def models():
+def models(checkpoint):
     torch.manual_seed(3)
-    return _build_models()
+    return _build_models(moe=checkpoint == "moe")
 
 
 def _prompts(seed, lengths):
@@ -528,7 +560,7 @@ def _arrivals(prompts):
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("decode_steps", [0, 1], ids=["holdback", "interleave"])
 def test_oracle_drafts_partial_acceptance_match_hf(
-    tmp_path, models, scenario, async_scheduling, decode_steps
+    tmp_path, checkpoint, models, scenario, async_scheduling, decode_steps
 ):
     _, model, _ = models
     prompts, expected = scenario
@@ -542,7 +574,10 @@ def test_oracle_drafts_partial_acceptance_match_hf(
             corrupt |= {("b", p, 0), ("b", p, 1)}
 
     vllm_config = _vllm_config(
-        tmp_path, async_scheduling=async_scheduling, decode_steps=decode_steps
+        tmp_path,
+        checkpoint,
+        async_scheduling=async_scheduling,
+        decode_steps=decode_steps,
     )
     engine = _Engine(
         vllm_config,
@@ -578,11 +613,13 @@ def test_oracle_drafts_partial_acceptance_match_hf(
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
-def test_real_mtp_head_matches_hf(tmp_path, models, scenario, async_scheduling):
+def test_real_mtp_head_matches_hf(
+    tmp_path, checkpoint, models, scenario, async_scheduling
+):
     _, model, mtp = models
     prompts, expected = scenario
     vllm_config = _vllm_config(
-        tmp_path, async_scheduling=async_scheduling, decode_steps=1
+        tmp_path, checkpoint, async_scheduling=async_scheduling, decode_steps=1
     )
     engine = _Engine(vllm_config, model, mtp)
     engine.run(_arrivals(prompts))
@@ -642,11 +679,13 @@ def _reference_mtp_drafts(mtp, hf_model, tokens):
     return drafts[0].tolist()
 
 
-def test_all_drafts_rejected_and_logprobs(tmp_path, models):
+def test_all_drafts_rejected_and_logprobs(tmp_path, checkpoint, models):
     hf_model, model, _ = models
     prompts = dict(zip(["x", "y"], _prompts(9, [17, 25])))
     expected = {r: _hf_greedy(hf_model, p, 9) for r, p in prompts.items()}
-    vllm_config = _vllm_config(tmp_path, async_scheduling=True, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=True, decode_steps=0
+    )
     engine = _Engine(
         vllm_config,
         model,
@@ -679,11 +718,13 @@ def _logprob_rows(lists):
     ]
 
 
-def test_runner_state_after_scenario(tmp_path, models, scenario):
+def test_runner_state_after_scenario(tmp_path, checkpoint, models, scenario):
     """Pool pages are 1 + k per slot and state_in follows the accepted count."""
     _, model, _ = models
     prompts, expected = scenario
-    vllm_config = _vllm_config(tmp_path, async_scheduling=False, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=False, decode_steps=0
+    )
     engine = _Engine(
         vllm_config,
         model,
@@ -723,13 +764,25 @@ def test_runner_state_after_scenario(tmp_path, models, scenario):
     assert sorted({int(a[slot]) for _, a, _ in seen}) == [1, 3]
 
 
-def test_policy_and_runner_gate_spec_decode(tmp_path, monkeypatch):
+def test_policy_and_runner_gate_spec_decode(tmp_path, checkpoint, models):
     from vllm_neuron.vllm import model_runner_v2_policy as policy
 
-    vllm_config = _vllm_config(tmp_path, async_scheduling=True, decode_steps=0)
+    vllm_config = _vllm_config(
+        tmp_path, checkpoint, async_scheduling=True, decode_steps=0
+    )
     result = policy.get_neuron_model_runner_v2_policy(vllm_config)
     assert result.default_enabled is False  # V1 stays the default
     assert not any("speculative" in f for f in result.unsupported_features)
+    # vLLM's MTP draft config for the checkpoint, as load_draft_model resolves it: the
+    # MoE target's head is Qwen3_5MoeMTP, built with the MoE FFN from that config.
+    draft_config = vllm_config.speculative_config.draft_model_config
+    assert draft_config.architecture == (
+        "Qwen3_5MoeMTP" if checkpoint == "moe" else "Qwen3_5MTP"
+    )
+    mtp = models[2]
+    with torch.device("meta"):
+        draft = type(mtp).from_configs(draft_config.hf_config, NUM_LAYERS)
+    assert type(draft.model.layers[0].mlp) is type(mtp.model.layers[0].mlp)
     vllm_config.speculative_config.method = "eagle3"
     result = policy.get_neuron_model_runner_v2_policy(vllm_config)
     assert any("eagle3" in f for f in result.unsupported_features)

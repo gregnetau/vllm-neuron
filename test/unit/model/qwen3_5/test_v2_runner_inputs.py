@@ -171,34 +171,66 @@ def _build_steps(prompts, plan):
     return runner, steps
 
 
-def _hf_and_model():
-    """Phase B: the HF reference and the Neuron model with the same random weights."""
-    import test_model_smoke as smoke
-    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+# Shapes shared by the dense and the sparse MoE (qwen3_5_moe) tiny models.
+_TINY = {
+    "hidden_size": 64,
+    "num_hidden_layers": 8,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "vocab_size": 128,
+    "dtype": "float32",
+    "rope_parameters": {
+        "rope_type": "default",
+        "rope_theta": 10000.0,
+        "partial_rotary_factor": 0.25,
+        "mrope_section": [1, 1, 2],
+        "mrope_interleaved": True,
+    },
+}
+TINY_DENSE = dict(_TINY, intermediate_size=96)
+# 8 experts, top 2: a verify bucket of 4 rows x (1 + k) tokens reads every expert
+# (moe_block_tkg's all-expert mode), a single decode row only the selected ones.
+TINY_MOE = dict(
+    _TINY,
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=32,
+    shared_expert_intermediate_size=48,
+)
 
-    mod = smoke._install_stubs()
-    hf_cfg = Qwen3_5TextConfig(
-        hidden_size=64,
-        num_hidden_layers=8,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=32,
-        intermediate_size=96,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        linear_key_head_dim=16,
-        linear_value_head_dim=16,
-        vocab_size=128,
-        dtype="float32",
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 10000.0,
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [1, 1, 2],
-            "mrope_interleaved": True,
-        },
-    )
-    hf_model = smoke.hf.Qwen3_5ForCausalLM(hf_cfg).eval()
+
+def _hf_and_model(moe=False):
+    """Phase B: the HF reference and the Neuron model with the same random weights.
+    ``moe``: Qwen3_5MoeForCausalLM, with the plugin's MoE ops on their PyTorch
+    fallbacks (test_moe)."""
+    import test_model_smoke as smoke
+
+    if moe:
+        import test_moe
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+            Qwen3_5MoeTextConfig,
+        )
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeForCausalLM,
+        )
+
+        mod = test_moe._install_stubs_with_moe_ops()
+        hf_cfg = Qwen3_5MoeTextConfig(**TINY_MOE)
+        hf_cls = Qwen3_5MoeForCausalLM
+    else:
+        from transformers.models.qwen3_5.configuration_qwen3_5 import (
+            Qwen3_5TextConfig,
+        )
+
+        mod = smoke._install_stubs()
+        hf_cfg = Qwen3_5TextConfig(**TINY_DENSE)
+        hf_cls = smoke.hf.Qwen3_5ForCausalLM
+    hf_model = hf_cls(hf_cfg).eval()
     with torch.no_grad():
         for n, p in hf_model.named_parameters():
             if "A_log" in n:
@@ -218,6 +250,7 @@ def _hf_and_model():
         for k, v in hf_model.state_dict().items()
     }
     model = mod.Qwen3_5ForCausalLM.from_configs(hf_cfg.to_dict(), None)
+    assert model.config.is_moe == moe
     wl = sys.modules["vllm_neuron.utils.weight_loader"]
     params = dict(model.named_parameters())
     for name, keys in model._weight_mappings().items():
@@ -261,7 +294,8 @@ def _torch_attention(attn):
     attn.forward_decode = forward_decode
 
 
-def test_v2_inputs_match_hf_through_interleaved_chunked_prefills():
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_v2_inputs_match_hf_through_interleaved_chunked_prefills(moe):
     torch.manual_seed(3)
     prompts = {
         "a": torch.randint(1, 128, (50,)).tolist(),
@@ -277,7 +311,7 @@ def test_v2_inputs_match_hf_through_interleaved_chunked_prefills():
         {"b": 1, "a": 1},  # other row order
     ]
     runner, steps = _build_steps(prompts, plan)
-    hf_model, model = _hf_and_model()
+    hf_model, model = _hf_and_model(moe)
     model.bind_kv_cache(runner.kv_caches)
     model.bind_state_cache(runner.state_caches)
     for halves in runner.state_caches.values():  # recycled pages hold stale state
