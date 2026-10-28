@@ -93,7 +93,6 @@ def test_hybrid_defaults_to_v1_and_is_honored_when_forced(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, feature",
     [
-        ({"apc": True}, "prefix caching for a recurrent-state model"),
         ({"spec": SimpleNamespace(method="eagle3")}, "speculative method 'eagle3'"),
         (
             {"spec": SimpleNamespace(method="mtp", rejection_sample_method="strict")},
@@ -126,6 +125,18 @@ def test_hybrid_features_that_need_v1(monkeypatch, kwargs, feature):
 
 def test_mtp_defaults_to_v1_and_is_honored_when_forced(monkeypatch):
     cfg = _vllm_config(spec=SimpleNamespace(method="mtp"))
+    assert policy.get_neuron_model_runner_v2_policy(cfg) == (
+        policy.NeuronModelRunnerPolicy(False, ())
+    )
+    assert _decide(monkeypatch, cfg, forced=False) == (False, None)
+    assert _decide(monkeypatch, cfg, forced=True) == (True, None)
+
+
+@pytest.mark.parametrize("spec", [None, SimpleNamespace(method="mtp")])
+def test_hybrid_prefix_caching_is_honored_when_forced(monkeypatch, spec):
+    # V2 serves prefix caching (Mamba align mode) for recurrent-state models, with
+    # and without MTP (V1 rejects MTP with prefix caching); V1 stays the default.
+    cfg = _vllm_config(apc=True, spec=spec)
     assert policy.get_neuron_model_runner_v2_policy(cfg) == (
         policy.NeuronModelRunnerPolicy(False, ())
     )
