@@ -444,7 +444,17 @@ def test_qwen4_exp_prefix_caching_on_v2_matches_hf(
     assert vllm_config.cache_config.mamba_cache_mode == "align"
     draft_model = (lambda runner: _Oracle(runner, expected)) if draft else None
     engine = _Engine(vllm_config, model, draft_model)
-    assert engine.runner._ckpt is not None
+    runner = engine.runner
+    assert runner._ckpt is not None
+    # vLLM groups layers of equal specs, as many as the attention layers per group: the
+    # GDN and PLE state layers must look alike to it (one placeholder shape), else every
+    # layer gets its own group and each attention layer's KV view spans the whole pool.
+    spec = model.get_kv_spec()
+    n_attn, n_state = len(spec.layers), len(spec.state_layers)
+    groups = runner._kv_cache_config.kv_cache_groups
+    assert len(groups) == 1 + -(-n_state // n_attn), [
+        len(g.layer_names) for g in groups
+    ]
     engine.run(
         {
             0: [("p", prompts["p"], 12)],

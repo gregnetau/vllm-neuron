@@ -1119,13 +1119,11 @@ class NeuronModelRunnerV2:
                 # The split blocks need no 256-token enlarged block (V1's kernel
                 # constraint); real pages of the served models are larger anyway.
                 align_pages=1 if prefix_caching else None,
+                # The dedicated pool's page is the checkpoint page (a raw page copy), so
+                # vLLM needs only the page size; one placeholder shape for every state
+                # layer keeps vLLM's KV groups as large as without prefix caching.
+                uniform_shapes=prefix_caching,
             )
-            if prefix_caching:
-                # The dedicated pool's page is the checkpoint page (a raw page copy).
-                real_pages = {
-                    name: hybrid_state.state_page(name, spec, {})
-                    for name, spec in state_specs.items()
-                }
             self._state_real_pages = real_pages
             specs.update(state_specs)
         return specs
