@@ -3828,11 +3828,18 @@ class NeuronModelRunnerV2:
         many tokens gets its attention block tables trimmed to it, so the model can
         pick a cheaper path from the static shape (a sparse attention that selects
         every block below that context runs its dense kernels). Every prefill graph
-        that fits is then compiled in both variants. Mirrors V1.
+        that fits is then compiled in both variants. Mirrors V1, except that V2 builds no
+        dense variant with speculative decoding (see below).
         """
         model = getattr(self.model, "_orig_mod", self.model)
         ctx = getattr(model, "prefill_dense_context", None)
         if not ctx or int(ctx) >= self.max_model_len:
+            return None
+        if self.num_speculative_tokens:
+            # The drafter runs in the prefill graph on V2, and neuronx-cc 2.28 fails the
+            # Qwen3.8-Flash-Next dense prefill graph with the MTP head inside it
+            # ([NCC_INLA001] in lower_act, generateInstLoadActFuncSet). Without the
+            # variant short prompts take the model's full-table prefill path.
             return None
         return int(ctx)
 
