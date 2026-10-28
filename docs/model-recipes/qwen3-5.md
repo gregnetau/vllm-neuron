@@ -7,7 +7,7 @@ FP8, performance and known limitations. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.5, Qwen3.8, Qwen3.8-27B, Gated DeltaNet, hybrid,
 linear attention, FP8, long context, MTP, model recipe, model card, LLM serving, Trn2,
 Trainium -->
-<!-- meta: date_updated: 2026-10-20 -->
+<!-- meta: date_updated: 2026-10-28 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -167,7 +167,9 @@ runner reports those groups with a placeholder page of one 256-token attention b
 real page is kept for the dedicated pool), so each such block costs 256 tokens of KV instead of
 an attention block enlarged to the state page (2048 tokens with FP8 KV). Prefix caching keeps
 the state in the shared pool (state checkpoints are cached blocks), where the compiler's double
-count limits the pool to about 360k tokens (`KV_CAP_FRACTION=0.35`, `GPU_MEM_UTIL=0.9`).
+count limits the pool to about 360k tokens (`KV_CAP_FRACTION=0.35`, `GPU_MEM_UTIL=0.9`). With
+FP8 weights and FP8 KV the graphs compile with prefix caching only at `KV_CAP_FRACTION` up to
+about 0.22 (`NCC_EVRF009` above it).
 `VLLM_NEURON_SHARED_STATE_POOL=1` selects the shared pool without prefix caching.
 
 When parallel compilation fails after the pool size or KV dtype changes, the compile cache may
@@ -244,7 +246,10 @@ attention KV blocks and a checkpoint of every GDN layer's state at each block bo
 Mamba cache mode `align`; see [the design note](../design/hybrid-state-gdn.md#prefix-caching)).
 Prefills are scheduled in 1024-token chunks, so `PREFILL_BUCKET` must be at least 1024. A
 request reuses the longest cached prefix that ends on a block boundary, below the prompt
-length. Prefix caching is not combined with MTP.
+length. V1 rejects prefix caching together with MTP (`MTP_TOKENS`). With FP8 weights and FP8
+KV, V1 compiles prefix caching only at `KV_CAP_FRACTION` up to about 0.22: the shared pool
+buffers are bound both as KV and as state, and neuronx-cc counts them twice toward its 24 GB
+graph I/O limit (`NCC_EVRF009`).
 
 Measured with the previous (PyTorch) prefill attention:
 
@@ -434,6 +439,29 @@ prefill kernel matches a float32 reference with cosine similarity >= 0.99996 (BF
 and long-context retrieval is correct up to 240k tokens (see [Performance](#performance)). For
 the task-level evaluation see [Aider Polyglot](#aider-polyglot).
 
+### GSM8K
+
+GSM8K (test split, chat API, thinking disabled) on Model Runner V1 with FP8 weights, FP8 KV
+and MTP 2 in the throughput configuration (`MAX_MODEL_LEN=65536`, `MAX_NUM_SEQS=8`):
+
+| Run | Questions | Accuracy |
+|---|---|---|
+| Concurrency 1 | first 500 | 96.6% |
+| Concurrency 8, same questions | first 500 | 96.4% (3 questions flip between the runs) |
+| Concurrency 8 | all 1,319 | 95.9% |
+
+Concurrent batching is within noise of single-stream serving: on the same 500 questions the
+two runs differ in 3 answers.
+
+FP8 graphs differ in numerics, so greedy outputs are not a strict reference for each other:
+at high-entropy positions (two candidate tokens with nearly equal logits) the FP8 prefill,
+decode and MTP verify graphs can each pick a different token for the same context, and all of
+them can be within the error of FP8. When a greedy parity test (for example concurrent
+against sequential requests) diverges from an FP8 reference, teacher-force both continuations
+through the Hugging Face BF16 model on CPU at the divergent position before calling it
+corruption: a divergence where BF16 also rates both tokens as near-equal is FP8 noise, a
+token BF16 gives near-zero probability is a bug.
+
 ## Aider Polyglot
 
 [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark) (225 Exercism exercises in
@@ -540,9 +568,19 @@ the 3 prompts over `max_model_len`. Mean logged generation throughput was 159 to
 - **The native compile route is slower than the XLA route** (see [Compilation](#compilation));
   `serve.sh` uses the XLA route.
 - **Model Runner V2 is not supported.** Hybrid models and speculative decoding run on V1.
-- **`logprobs` requests fail with MTP**: with on-device rejection sampling the runner returns
-  no log-probabilities for the speculative tokens, and vLLM's endpoint fails (HTTP 500). Serve
-  without `MTP_TOKENS` when `logprobs` are needed.
+- **MTP with synchronous scheduling (`ASYNC_SCHEDULING=0`) can corrupt outputs near
+  `max_model_len`** on V1: requests that run into `max_model_len` next to other requests may
+  emit wrong tokens in their last steps. This predates the fixes in this recipe and is not
+  fixed; keep asynchronous scheduling (the default) or use Model Runner V2.
+- **With MTP and asynchronous scheduling, hybrid requests near `max_model_len` end early** on
+  V1: the scheduler caps a request's `max_tokens` so that every step stays a full verify step,
+  so a request finishes with `finish_reason` `length` up to `4 * (1 + k)` tokens (12 for
+  `MTP_TOKENS=2`) before `max_model_len`.
+- **Prefix caching on V1** with FP8 weights and FP8 KV compiles only at `KV_CAP_FRACTION` up to
+  about 0.22 (`NCC_EVRF009`: the shared pool buffers bound as KV and as state count twice
+  toward the 24 GB graph I/O limit), and V1 rejects prefix caching together with MTP.
+- **Per-request `seed`** is accepted but not reproducible: on-device sampling does not use the
+  request's generator.
 - **MTP supports at most 2 draft tokens**. With 3 draft tokens the verify pass produced
   invalid indices; this is not resolved.
 - **Device profiles of prefill graphs are incomplete**: the runtime drops profiler
@@ -591,6 +629,9 @@ Done:
   routes.
 - `logprobs` (raw logits, full vocabulary) and `all_greedy` on-device sampling, with a
   logit-validation test against Hugging Face (`test/integration/model/qwen3_5/test_model.py`).
+- `logprobs` with MTP and with asynchronous scheduling.
+- Stress testing of concurrent, aborted and near-`max_model_len` requests with MTP and
+  asynchronous scheduling, with the fixes it found; GSM8K 95.9% (FP8, MTP 2, concurrency 8).
 
 Next:
 
