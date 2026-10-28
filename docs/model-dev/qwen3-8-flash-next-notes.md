@@ -313,8 +313,6 @@ Full 48-layer FP8 model on trn2.48xlarge unless noted.
   - At 65,536 context, a cap of 8 gives 1.73x the generated tokens per second of the default
     cap of 3.
 - **FP8 KV.** 1.67x KV tokens, but fails logit validation (unit scales).
-- **Not covered:**
-  - MTP beyond 8k context and 4 concurrent requests.
 
 ### On the 2026-10-27 qwen3_5-upstream base
 
@@ -327,6 +325,52 @@ state-pool pages kept inside the pool. Re-validated on device:
 - seeded requests are reproducible;
 - a passkey at 40,842 prompt tokens is retrieved.
 
+### MTP at the 64k serving configuration (2026-10-28)
+
+`serve.sh` with MAX_MODEL_LEN=65536, PREFILL_BUCKETS="1024, 4096", DECODE_CTX_BUCKETS="4096,
+16384, 32768", DECODE_INTERLEAVE=1, VLLM_NEURON_MAX_KV_CONCURRENT=8, max_num_seqs 8, against
+the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).
+
+- **Memory.**
+  - The KV cache drops from 256,094 tokens to 164,840 with 1 draft token (0.85). The draft
+    weights take about 1 GiB per core and the recurrent-state pools grow from 0.16 to 0.45 GiB.
+  - With 2 draft tokens, 0.85 fails during warm-up (HBM full while loading the batch-8,
+    32,768-context graphs) and 0.83 fails at the first long prefill (`nrt_tensor_allocate`
+    status 4). 0.82 runs every test, with 109,061 KV tokens.
+- **Graphs.** Warm-up covers the batch {1, 8} x context {4,096, 16,384, 32,768, 65,536} verify
+  graphs at 1 + k tokens per request, the plain decode graphs and the draft graphs. No graph
+  compiled while serving B=1-8 at 1k-60k context.
+- **Correctness.**
+  - Nine greedy requests (1k-60k prompts, 800-4,000 generated tokens, staggered starts, up to 8
+    running at once, fewer with MTP's smaller KV cache) with top-2 logprobs, with 1 and 2 draft
+    tokens and without MTP. No errors.
+  - Every first divergence from plain decode is at a top-2 logprob gap of 0-0.25, except one at
+    0.5: the first token of a 15k prompt with 2 draft tokens, an exact tie on the MTP server.
+    The greedy token always equals the top-1 logprob.
+  - With 2 draft tokens, the first-token logprobs of prompts over 1,024 tokens differ from
+    plain decode by up to 0.25, reproducibly and also for a single request (1 draft token: up
+    to 0.04; plain decode at gpu_memory_utilization 0.82 and 0.85: identical). The cause is not
+    known. On the 3,532-token HF golden prompt both agree with HF: greedy 8 of 8, and a maximum
+    top-20 logprob error against HF FP32 of 0.62-1.03 per token with 2 draft tokens, 0.56-1.78
+    without MTP and 0.58-0.96 for HF BF16.
+  - Preemption: five 30k prompts with 3,500 tokens each (1 draft token) and three 33k prompts
+    with 4,000 tokens each (2 draft tokens) each preempt one request. All complete, the outputs
+    stay coherent, and they diverge from plain decode only at near-ties (top-2 gap at most
+    0.375).
+  - Retrieval: the needle in each of the nine prompts (9 of 9 with 1 and with 2 draft tokens),
+    natural-text needles at 15k/30k/60k and three depths, sent three at a time (9 of 9 with 1
+    and with 2), and passkeys at 14k-58k (9 of 9 with 2).
+- **Speed.** See the recipe's performance table. MTP is faster only at batch 1: 1.4-1.8x with
+  2 draft tokens (1.2-1.6x with model-card sampling), 1.1-1.35x with 1.
+  - A batch of 2 already runs the batch-8 graphs. A verify step there costs 2.3-3.2x a plain
+    step (B=3 at 20/30/40k: 105 ms plain, 242 ms with 1 draft token, 332 ms with 2; B=8 at 8k:
+    63 ms plain, 182 ms with 2). At batch 1 the verify step costs 1.4-1.7x a plain step.
+  - Plain decode with async scheduling off: 50 ms (B=1, 30k), 111 ms (B=3, 20-40k), 70 ms
+    (B=8, 8k), against 52, 105 and 63 with it on.
+  - End to end, the nine-request mix takes 677 s without MTP, 1,031 s with 1 draft token and
+    1,214 s with 2; the five 30k prompts take 489 s and 724 s (1 draft token), the three 33k
+    prompts 570 s and 867 s (2 draft tokens).
+
 ## Open work
 
 - **QSA verify rows.** MTP verify steps still mask the full context; a compact context of the
@@ -335,8 +379,11 @@ state-pool pages kept inside the pool. Re-validated on device:
   passes per query block).
 - **Serving defaults.**
   - Per-replica concurrency of 8 (used in Aider run 2) as the recommended Aider configuration.
-  - MTP for the long single-request tail, once validated beyond 8k context and 4 concurrent
-    requests.
+  - MTP stays off: at the 64k configuration it helps only at batch 1 and shrinks the KV cache
+    by 36-57%.
+    Next steps: profile the batch-8 verify graph at long context, and try a batch-2 or
+    batch-4 graph (`SEQS_BUCKETS`) or turning drafting off above batch 1 (vLLM's
+    `num_speculative_tokens_per_batch_size`).
   - FP8 KV needs calibrated scales before it can be a default.
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.
