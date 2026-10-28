@@ -13,6 +13,8 @@
 #   MODEL=... RUNNER=v2 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #   # Prefix caching (V2 only; GDN and PLE state checkpoints at block boundaries):
 #   MODEL=... RUNNER=v2 PREFIX_CACHING=1 examples/vllm_neuron/models/qwen4_exp/serve.sh
+#   # FP8 KV cache (unit scales, about 1.67x the KV tokens; less accurate, see the recipe):
+#   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #
 # Knobs:
 #   MAX_MODEL_LEN (default 65536), MAX_NUM_SEQS (8), PREFILL_BUCKETS ("1024, 4096": short prompts
@@ -83,6 +85,7 @@ exec vllm serve "${MODEL}" "${SPEC_ARGS[@]}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-num-batched-tokens "${LARGEST_PREFILL}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.82}" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-auto}" \
   "${PREFIX_ARGS[@]}" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --additional-config "{\"neuron_config\": {${NEURON_CONFIG}}}"
