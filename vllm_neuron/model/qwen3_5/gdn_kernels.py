@@ -971,9 +971,7 @@ def gdn_decode_batched_kernel(
     assert D == 128 and W == D and C % D == 0 and R % D == 0
     assert CONV0 % R + (K - 1) * NCB <= R, "conv rows must not straddle the page halves"
 
-    _, n_prgs, prg_id = get_verified_program_sharding_info(
-        "gdn_decode_batched", (0, 1)
-    )
+    _, n_prgs, prg_id = get_verified_program_sharding_info("gdn_decode_batched", (0, 1))
     hp = Hv // n_prgs
     hkp = Hk // n_prgs
     assert hp == hkp * rep
@@ -994,7 +992,8 @@ def gdn_decode_batched_kernel(
     # ---- constants
     ones = _sb((128, 128))
     nisa.memset(ones, 1.0)
-    w_raw = _sb((128, NCBl, K), conv_w.dtype)  # local blocks q | k (Hk blocks apart) | v
+    # local blocks q | k (Hk blocks apart) | v
+    w_raw = _sb((128, NCBl, K), conv_w.dtype)
     nisa.dma_copy(
         dst=w_raw[:, 0 : 2 * hkp, :],
         src=conv_w.ap(
@@ -1143,7 +1142,8 @@ def gdn_decode_batched_kernel(
                     dge_mode=nisa.dge_mode.hwdge,
                     oob_mode=oob_mode.skip,
                 )
-            ncs = _sb((128, K - 1, NCBl))  # the next token's conv state (channel layout)
+            # the next token's conv state (channel layout)
+            ncs = _sb((128, K - 1, NCBl))
             for j in range(K - 1):
                 src = xc
                 if j < K - 2:

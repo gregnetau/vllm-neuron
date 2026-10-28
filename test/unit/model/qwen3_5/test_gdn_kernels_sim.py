@@ -22,7 +22,8 @@ D, KC, EPS = 128, 4, 1e-6
 CONFIGS = {
     "2b_tp2": (8, 8, 1024),  # Qwen3.5-2B: 16 / 16 heads, TP=2
     "35b_tp4": (4, 8, 1024),  # Qwen3.5-35B-A3B: 16 / 32 heads, TP=4
-    "27b_tp4": (4, 12, 1024),  # Qwen3.8-27B: 16 / 48 heads, TP=4 (heads straddle halves)
+    # Qwen3.8-27B: 16 / 48 heads, TP=4 (heads straddle halves)
+    "27b_tp4": (4, 12, 1024),
 }
 
 
@@ -43,7 +44,7 @@ def GK():
 def _inputs(Hk, Hv, R, T, n_pages, seed):
     g = torch.Generator().manual_seed(seed)
     C = 2 * Hk * D + Hv * D
-    rn = lambda *s, sc=1.0: torch.randn(*s, generator=g) * sc  # noqa: E731
+    rn = lambda *s, sc=1.0: torch.randn(*s, generator=g) * sc
     return {
         "mixed": rn(T, C).bfloat16(),
         "z": rn(T, Hv * D).bfloat16(),
@@ -304,4 +305,3 @@ def test_model_batched_decode_matches_torch_path(monkeypatch, S):
     written = set(bt[: B - 1, :S].flatten().tolist())
     for p in set(range(n_pages)) - written:
         assert torch.equal(a1[p], sa0[p]) and torch.equal(b1[p], sb0[p]), p
-

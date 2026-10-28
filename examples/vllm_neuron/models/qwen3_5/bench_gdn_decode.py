@@ -20,7 +20,8 @@ import time
 
 import torch
 
-torch._dynamo.config.recompile_limit = 1024  # one compiled run() per (config, B, S, impl)
+# one compiled run() per (config, B, S, impl)
+torch._dynamo.config.recompile_limit = 1024
 torch._dynamo.config.accumulated_recompile_limit = 4096
 from torch import nn
 
@@ -37,7 +38,7 @@ def _layer(Hk, Hv, n_pages, seed=0):
     g = G.__new__(G)
     nn.Module.__init__(g)
     gen = torch.Generator().manual_seed(seed)
-    rn = lambda *s, sc=1.0: torch.randn(*s, generator=gen) * sc  # noqa: E731
+    rn = lambda *s, sc=1.0: torch.randn(*s, generator=gen) * sc
     g.Hk, g.Hv, g.Dk, g.Dv, g.K = Hk, Hv, D, D, KC
     g.key_dim, g.value_dim = Hk * D, Hv * D
     g.conv_dim = 2 * g.key_dim + g.value_dim
@@ -202,6 +203,7 @@ def check(cfg, B, S, impls, dev):
                 # the torch path writes zeros to the null page; the kernel must not
                 stray.append(p)
         finite = bool(torch.isfinite(out).all())
+
         # time: chain of n layers on the same state pages, each layer's z = f(previous out)
         def chain(n, g=g, path=path):
             def run(m, z, b, a, bt_, si):
@@ -209,6 +211,7 @@ def check(cfg, B, S, impls, dev):
                     o = path(g, m, z, b, a, bt_, si)
                     z = (z.float() + 1e-3 * o.float()).to(z.dtype)
                 return z
+
             return _compile(run)
 
         def timed(fc, reps=20):
