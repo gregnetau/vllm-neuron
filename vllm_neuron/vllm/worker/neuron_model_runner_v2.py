@@ -3906,6 +3906,16 @@ class NeuronModelRunnerV2:
         # always uses the full table (KV writes span every scheduled slot and the prefill graph is
         # compiled for the full shape). Slot mappings are per group: each group owns its block table,
         # so KV writes must resolve slots through their own group's (untrimmed) rows.
+        # Prefix caching splits each attention manager block into kernel blocks, so a
+        # row holds valid kernel blocks up to the end of its last manager block (up to
+        # block - 1 tokens past its context). Keep only those the step can touch (its
+        # tokens and the MTP head's draft steps, from the scheduler's count, an upper
+        # bound of the device's), so the tables look like those of unsplit groups.
+        valid_kernel_blocks = None
+        if self._prefix_caching:
+            kernel_block = self._kernel_block_size or 1
+            reach = num_computed + query_lens + 2 * self.num_speculative_tokens
+            valid_kernel_blocks = -(-reach // kernel_block)
         block_tables = []
         swa_kv_pos_offsets: list[torch.Tensor | None] = []
         slot_mappings_flat: list[np.ndarray] = []
@@ -3953,6 +3963,9 @@ class NeuronModelRunnerV2:
                     idx_mapping_np,
                     padded_num_reqs,
                     num_columns=num_columns,
+                    valid_blocks=valid_kernel_blocks
+                    if rs.kernel_ratios[g] > 1
+                    else None,
                     output_device=device,
                 )
                 offsets = None
