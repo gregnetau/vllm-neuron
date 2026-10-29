@@ -303,6 +303,34 @@ Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2
   timeout (run 3: 2), and the long tail of the last exercises varies from run to run.
 - **22 preemptions** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`, no server errors.
 
+### Run 4 on Model Runner V2 with prefix caching (2026-10-29)
+
+Run 3's configuration with `PREFIX_CACHING=1` (512-token blocks, 188k KV tokens per replica
+against 200k):
+
+| Metric | Value |
+|---|---|
+| pass_rate_1 / pass_rate_2 | 48.9 / 84.9 (110 / 191) |
+| percent_cases_well_formed | 99.1 |
+| error_outputs | 21 (19 exhausted context windows, no Aider-side timeouts) |
+| user_asks | 135 |
+| prompt / completion tokens | 3,245,110 / 6,288,167 |
+| wall time | 4.7 h (about 370 tok/s average) |
+
+- **Pass rate within run-to-run variance** (191 against 194-196).
+- **Exhausted context windows are the long thinking responses.** Without `max_tokens` a
+  response that reaches `max_model_len` ends with `finish_reason=length`, which Aider counts as
+  an exhausted context window (the one inspected: about 22k output tokens). Slower runs hit
+  Aider's 3,600 s timeout first: timeouts plus exhausted windows are 21, 19, 9 and 19 in runs
+  1-4.
+- **Hits equal misses.** Checked after the run on its replicas, greedy at batch 1 on 10 Aider
+  transcripts of 3k-39k tokens: a repeated request (full hit) and a follow-up with a new tail
+  (hit on the shared blocks) against the same request uncached. Every divergence within 300
+  tokens is at an exact top-2 tie (gap 0.000; the BF16 logit step there is 0.125, and two
+  uncached runs on two replicas differ by one step). Preemption with hits on the preempted
+  request's own blocks matches HF on CPU (`test_preemption_with_prefix_caching_matches_hf`).
+- **175 preemptions** (hit rate 10-18% per replica), no server errors.
+
 ## Device validation (2026-10-26)
 
 Full 48-layer FP8 model on trn2.48xlarge unless noted.
@@ -454,7 +482,8 @@ Validation (CPU): `test/unit/model/qwen4_exp/test_v2_runner.py` runs the tiny mo
 QSA, real n-gram rows from the HF table) through the V2 runner and schedulers against HF:
 plain and MTP (oracle drafts with partial acceptance, and the real head), sync and async,
 chunked prefills, prefix caching (hits on GDN/PLE checkpoints and cached QSA keys), FP8 KV
-with and without prefix caching. `test/unit/model/qwen3_5/test_v2_host_inputs.py` checks the
+with and without prefix caching, preemption with prefix caching (readmission with a hit on
+the request's own blocks). `test/unit/model/qwen3_5/test_v2_host_inputs.py` checks the
 host-built rows against the graph's and the host copy against the device state.
 
 Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
@@ -477,7 +506,8 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   - Where a B=8 step goes on the host: input preparation 1.2 ms (overlapped with the previous
     step), the join's wait for the previous step 52 ms, host inputs 0.9 ms and the forward call
     3.2 ms (2.5 with `VLLM_NEURON_SKIP_GUARD_EVAL=1`, which gains 0.7 ms per step).
-- **Aider Polyglot** (run 3 above): 86.7% after 2 tries in 5.5 h on 7 replicas.
+- **Aider Polyglot** (runs 3 and 4 above): 86.7% after 2 tries in 5.5 h on 7 replicas; with
+  prefix caching 84.9% in 4.7 h.
 - **Preemption** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`: 22 preemptions during the Aider run,
   no errors.
 - **Prefix caching:** greedy outputs equal the server without it for 4 questions on a shared
@@ -487,10 +517,18 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **MTP** (2 draft tokens, async scheduling): greedy outputs equal plain decode up to exact
   BF16 ties (top-2 gap 0.000); 84% of drafts accepted (2.68 tokens per step, V1: 2.25-2.46);
   B=1 27-34 ms/token (V1: 27). KV cache 107k tokens at `GPU_MEM_UTIL=0.82` (V1: 109k).
+  Same benchmark as the speed comparison (greedy, `ignore_eos`, tokens counted from `usage`),
+  MTP against plain V2: inter-token 19.2 ms against 35.5 at B=1 (1.85x), 67.1 against 55.5 at
+  B=8 (21% slower), 111 against 116 at B=4 with 30k prompts; time to first token 6.1 / 13.8 /
+  70.4 s against 5.7 / 12.9 / 57.5 (the prefill graphs carry the drafter), so the 30k batch
+  takes longer overall (146 s against 117).
 - **FP8 KV cache**: the logit test gives the BF16-KV pattern (2 of 4 prompts, errors of the same
   size). Prefix caching, FP8 KV and MTP together (1024-token blocks, 146k KV tokens): misses
   and hits give the same greedy output, sequential and concurrent, equal to the BF16 server's
   answers; needles at 12k-45k 3 of 3; 24 mixed requests 8 at a time without errors.
+  Two-hour soak of that server (2026-10-29): 18 rounds of 16 sampled requests (prompts of
+  500-24k words, 8 at a time), each followed by the hit/miss consistency check: all
+  consistent, no errors, 12 preemptions, prefix-cache hit rate 35%.
 
 ## Open work
 

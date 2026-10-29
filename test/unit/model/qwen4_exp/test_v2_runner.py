@@ -310,6 +310,7 @@ class _Engine:
             init_none_hash(hash_fn)
             self.block_hasher = get_request_block_hasher(hash_block_size, hash_fn)
         self.admitted = {}  # req_id -> cached tokens at admission
+        self.preempted, self.resumed = set(), {}  # resumed: cached tokens at readmission
         cls = NeuronAsyncScheduler if self.async_scheduling else NeuronScheduler
         self.scheduler = cls(
             vllm_config=vllm_config,
@@ -362,6 +363,9 @@ class _Engine:
                 so = self.scheduler.schedule()
                 for r in so.scheduled_new_reqs:
                     self.admitted.setdefault(r.req_id, r.num_computed_tokens)
+                    if r.req_id in self.preempted:
+                        self.resumed[r.req_id] = r.num_computed_tokens
+                self.preempted |= so.preempted_req_ids or set()
                 out = self.runner.execute_model(so)
                 if so.total_num_scheduled_tokens > 0:
                     out = self.runner.sample_tokens(None)
@@ -370,7 +374,10 @@ class _Engine:
                     continue
             if self.queue:
                 self._process(*self.queue.popleft())
-        raise AssertionError("engine did not finish")
+        raise AssertionError(
+            f"engine did not finish: preempted {self.preempted}, resumed {self.resumed}, "
+            f"outputs { {r: len(o) for r, o in self.outputs.items()} }"
+        )
 
 
 # (request id, prompt length, max_tokens, arrival step): "long" prefills in two chunks
@@ -575,3 +582,46 @@ def test_clear_on_free_with_block_reuse_matches_hf(tmp_path, plugin_mtp, scenari
         assert prompts[r] + engine.outputs[r] == expected[r], r
     cleared = {b for call in engine.cleared for b in call if b}
     assert cleared, "no block was cleared"
+
+
+@pytest.mark.parametrize(
+    "draft,async_scheduling",
+    [(None, False), (None, True), ("oracle", True)],
+    ids=["plain-sync", "plain-async", "oracle-async"],
+)
+def test_preemption_with_prefix_caching_matches_hf(
+    tmp_path, monkeypatch, plugin_mtp, draft, async_scheduling
+):
+    """Prefix caching on a KV cache too small for the requests' growth: three requests
+    fit at admission, then cross block boundaries while decoding, so the scheduler
+    preempts and later readmits some of them; without MTP a readmission hits its own
+    cached blocks (prompt and generated tokens), so its GDN/PLE state resumes from a
+    checkpoint. Greedy outputs equal HF's."""
+    # Admit all three (the scheduler otherwise caps them at the worst case, max_model_len).
+    monkeypatch.setenv("VLLM_NEURON_MAX_KV_CONCURRENT", "3")
+    hf, hf_cfg = _hf_model()
+    model = _model(plugin_mtp, hf, hf_cfg)
+    g = torch.Generator().manual_seed(13)
+    lengths = {"x": 50, "y": 55, "z": 45}
+    prompts = {
+        r: torch.randint(2, hf_cfg.vocab_size, (n,), generator=g).tolist()
+        for r, n in lengths.items()
+    }
+    expected = {r: _hf_greedy(hf, p, 180) for r, p in prompts.items()}
+    vllm_config = _vllm_config(
+        tmp_path,
+        hf_cfg,
+        spec=draft is not None,
+        async_scheduling=async_scheduling,
+        apc=True,
+    )
+    draft_model = (lambda runner: _Oracle(runner, expected)) if draft else None
+    # 28 blocks of 64 tokens over the five groups: x is preempted late and readmitted with
+    # a hit on its own blocks.
+    engine = _Engine(vllm_config, model, draft_model, num_blocks=28)
+    engine.run({0: [(r, p, 180) for r, p in prompts.items()]}, max_steps=4000)
+    for r, prompt in prompts.items():
+        assert prompt + engine.outputs[r] == expected[r], r
+    assert engine.preempted, "no request was preempted"
+    if draft is None:
+        assert any(engine.resumed.values()), engine.resumed  # a readmission hit
