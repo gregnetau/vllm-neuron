@@ -293,6 +293,20 @@ def test_initialize_binds_attention_kv_and_dedicated_state_pools():
     assert runner._kv_clearer is None and model.runner_clears is None
 
 
+def test_device_without_prefix_caching_clears_no_kv_blocks():
+    """On a device without prefix caching the shared buffer holds only attention K/V,
+    so neither the runner nor the model clears new blocks: no clearing graph between
+    the steps (each one made the runtime switch NEFFs), and the model's in-graph
+    clearing off."""
+    runner = _runner()
+    runner.device = torch.device("meta")  # any non-CPU device
+    runner.request_state.device = runner.device
+    config = _kv_cache_config(runner.get_kv_cache_spec())
+    runner.initialize_kv_cache(config)
+    assert runner._kv_clearer is None
+    assert runner.model.runner_clears is True
+
+
 def test_initialize_rebuilds_real_pages_when_specs_were_not_requested():
     runner = _runner()
     config = _kv_cache_config(runner.get_kv_cache_spec())

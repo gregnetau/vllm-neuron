@@ -1913,7 +1913,24 @@ class NeuronModelRunnerV2:
         checkpointer = None
         if state_caches:
             self.model.bind_state_cache(state_caches)
-            kv_clearer = self._build_kv_block_clearer(kv_caches, max(kernel_ratios))
+            if ckpt_block:
+                # The state checkpoints are vLLM blocks of the shared buffer: a freed
+                # checkpoint block reused for attention holds float32 state.
+                kv_clearer = self._build_kv_block_clearer(kv_caches, max(kernel_ratios))
+            elif self.device.type != "cpu" and hasattr(
+                self.model, "set_runner_clears_kv_blocks"
+            ):
+                # Without prefix caching the shared buffer holds only attention K/V (the
+                # state is in the dedicated pools), allocated zeroed: a reused block holds
+                # finite stale K/V, which attention masks out. Neither the runner nor the
+                # model clears new blocks: a clearing graph between the steps made the
+                # runtime switch NEFFs twice per clear, every few decode steps with
+                # --block-size blocks (Qwen3.8-Flash-Next B=8: 15.4 -> 12.0 ms/step).
+                self.model.set_runner_clears_kv_blocks(True)
+                if self.draft_model is not None and hasattr(
+                    self.draft_model, "set_runner_clears_kv_blocks"
+                ):
+                    self.draft_model.set_runner_clears_kv_blocks(True)
             if ckpt_block:
                 checkpointer = self._build_state_checkpointer(
                     kv_cache_config,
@@ -2106,11 +2123,11 @@ class NeuronModelRunnerV2:
     ) -> hybrid_state.KVBlockClearer | None:
         """Return the clearer of newly allocated attention blocks, or None.
 
-        Block ids are global across KV groups. Without prefix caching the shared
-        buffer never holds float32 state, so clearing is defensive, kept for
-        parity with V1 (where the same model was validated); with it, the state
-        checkpoints are blocks of the shared buffer. The model then skips its own
-        in-graph clearing. CPU runs keep the model's clearing, as V1 does.
+        Used with prefix caching only: block ids are global across KV groups, and the
+        state checkpoints are blocks of the shared buffer, so a block reused for
+        attention can hold float32 state, which reads as NaN/Inf. The model then skips
+        its own in-graph clearing. Without prefix caching nothing clears new blocks
+        (``initialize_kv_cache``). CPU runs keep the model's clearing, as V1 does.
 
         Args:
             kv_caches: ``{layer_name: [k_cache, v_cache]}`` of the attention layers.
