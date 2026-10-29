@@ -522,3 +522,20 @@ def test_qwen4_exp_fp8_kv_prefix_caching_matches_no_apc(tmp_path, plugin_mtp, dr
     assert admitted[False]["q"] == 0
     if draft is None:
         assert admitted[True]["q"] == 256, admitted
+
+
+def test_compiler_args_policy(plugin_mtp):
+    """The dense prefill graph with the MTP head inside it compiles at -O2 (neuronx-cc 2.28
+    fails it at -O1 with NCC_INLA001); every other graph keeps the base arguments."""
+    _, hf_cfg = _hf_model()
+    plugin, _ = plugin_mtp
+    model = plugin.Qwen4ExpForCausalLM.from_configs(hf_cfg, None)
+    base = ["--auto-cast=none", "-O1", "--logical-nc-config=2"]
+    assert model.compiler_args_for("prefill_dense_spec", None, base) == [
+        "--auto-cast=none",
+        "-O2",
+        "--logical-nc-config=2",
+    ]
+    for graph_type in (None, "prefill_dense", "decode"):
+        assert model.compiler_args_for(graph_type, None, base) == base
+    assert base == ["--auto-cast=none", "-O1", "--logical-nc-config=2"]

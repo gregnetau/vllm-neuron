@@ -458,3 +458,21 @@ def test_dense_prefill_variant_and_side_cache_ratio(tmp_path, models):
         assert dense == (cached + CHUNK <= dense_ctx), (cached, dense)
         assert width == (dense_ctx if dense else max_model_len) // BLOCK
     assert {dense for _, dense, _ in seen} == {False, True}
+    # With MTP (the drafter in the prefill graph) the variant has its own graph type, for
+    # the model's per-graph compiler arguments.
+    spec_config = _vllm_config(
+        tmp_path,
+        spec=True,
+        async_scheduling=True,
+        decode_steps=0,
+        max_model_len=max_model_len,
+    )
+    model.prefill_dense_context = dense_ctx
+    try:
+        spec_runner = _Engine(spec_config, model, models[2]).runner
+        assert spec_runner.prefill_ctx_variants(512, CHUNK) == [False, True]
+        assert spec_runner.prefill_graph_type(True) == "prefill_dense_spec"
+        assert spec_runner.prefill_graph_type(False) is None
+        assert runner.prefill_graph_type(True) == "prefill_dense"
+    finally:
+        del model.prefill_dense_context

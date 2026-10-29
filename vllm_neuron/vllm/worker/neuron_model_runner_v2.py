@@ -3045,11 +3045,13 @@ class NeuronModelRunnerV2:
         self._validate_prefill_compile_target(bucket_size, kv_segment_size)
         for dense_ctx in self.prefill_ctx_variants(kv_segment_size, bucket_size):
             compile_start = time.perf_counter()
-            self._warmup(
-                self._build_prefill_synthetic_inputs(
-                    bucket_size, kv_segment_size, dense_ctx=dense_ctx
+            args = self.resolve_graph_compiler_args(self.prefill_graph_type(dense_ctx))
+            with scoped_compiler_args(args):
+                self._warmup(
+                    self._build_prefill_synthetic_inputs(
+                        bucket_size, kv_segment_size, dense_ctx=dense_ctx
+                    )
                 )
-            )
             compile_elapsed = time.perf_counter() - compile_start
             bucket_name = f"prefill_s{bucket_size}"
             if kv_segment_size > 0:
@@ -3095,7 +3097,9 @@ class NeuronModelRunnerV2:
                 device=device,
                 dense_ctx=dense_ctx,
             )
-            self._capture_model_input(model_input)
+            args = self.resolve_graph_compiler_args(self.prefill_graph_type(dense_ctx))
+            with scoped_compiler_args(args):
+                self._capture_model_input(model_input)
         logger.debug(
             "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
             bucket_size,
@@ -4160,6 +4164,15 @@ class NeuronModelRunnerV2:
         ctx = self._prefill_dense_context()
         fits = ctx is not None and kv_segment_size <= ctx and bucket_size <= ctx
         return [False, True] if fits else [False]
+
+    def prefill_graph_type(self, dense_ctx: bool) -> str | None:
+        """The graph type of a prefill graph for the model's per-graph compiler arguments
+        (``compiler_args_for``): ``"prefill_dense"`` for the dense-context variant,
+        ``"prefill_dense_spec"`` when the drafter runs in it (speculative decoding), else
+        None (the base arguments)."""
+        if not dense_ctx:
+            return None
+        return "prefill_dense_spec" if self.num_speculative_tokens else "prefill_dense"
 
     def _use_prefill_dense(self, padded_ctx_len: int, kv_segment_size: int) -> bool:
         """Whether a prefill step runs the dense variant: its cached prefix plus padded

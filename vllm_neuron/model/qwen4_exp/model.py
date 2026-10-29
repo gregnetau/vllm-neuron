@@ -1360,6 +1360,21 @@ class Qwen4ExpForCausalLM(nn.Module):
             return sampled_tokens, mtp_hidden, gathered_logits
         return sampled_tokens, gathered_logits
 
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Per-graph neuronx-cc arguments (see ``qwen3_vl``'s ``compiler_args_for``).
+
+        The dense-context prefill graph with the MTP head inside it (Model Runner V2's
+        ``prefill_dense_spec``) fails at the default ``-O1`` with neuronx-cc 2.28
+        ([NCC_INLA001] in lower_act, ``LowerPWPImpl::generateInstLoadActFuncSet``), and
+        compiles at ``-O2``. Every other graph keeps the base arguments.
+        """
+        from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
+
+        base = list(base or [])
+        if graph_type == "prefill_dense_spec":
+            return with_optimization_level(base, 2)
+        return base
+
     def set_mtp_hidden_output(self, value: bool) -> None:
         """Return the pre-mixer residual with the samples (speculative method ``mtp``)."""
         self._mtp_hidden_output = value
