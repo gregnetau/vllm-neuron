@@ -283,22 +283,32 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 - thinking mode at the template's default `reasoning_effort=xhigh`, model-card sampling
   (temperature 1.0, top_p 0.95, top_k 20);
 - Aider 0.86.3.dev (5dc9490);
-- served by 8 replicas at 64k context.
+- served by replicas at 64k context (8 on Model Runner V1, 7 on V2).
 
-| | Run 1 (2026-10-22) | Run 2 (2026-10-27) |
-|---|---|---|
-| Serving | 3 concurrent requests per replica (default cap), 24 threads | 8 per replica (`VLLM_NEURON_MAX_KV_CONCURRENT=8`), 64 threads |
-| Pass rate, 1 try / 2 tries | 48.9% / 86.2% (194 of 225) | 47.1% / **87.1%** (196 of 225) |
-| Well-formed responses | 99.6% | 100% |
-| Error outputs | 24 (15 Aider-side 3,600 s request timeouts) | 19 (13 timeouts) |
-| Exhausted context windows | 6 | 6 |
-| Tokens (prompt / completion) | 3.0M / 5.47M | 2.8M / 5.67M |
-| Wall time, average generation rate | 12.5 h, ~120 tok/s | 8.8 h, ~180 tok/s |
+| | Run 1 (2026-10-22) | Run 2 (2026-10-27) | Run 3, Model Runner V2 (2026-10-28) | Run 4, V2 + prefix caching (2026-10-29) |
+|---|---|---|---|---|
+| Serving | 3 concurrent requests per replica (default cap), 24 threads | 8 per replica (`VLLM_NEURON_MAX_KV_CONCURRENT=8`), 64 threads | 7 replicas (`RUNNER=v2`), 8 per replica, 56 threads | as run 3, `PREFIX_CACHING=1` |
+| Pass rate, 1 try / 2 tries | 48.9% / 86.2% (194 of 225) | 47.1% / **87.1%** (196 of 225) | **50.2%** / 86.7% (195 of 225) | 48.9% / 84.9% (191 of 225) |
+| Well-formed responses | 99.6% | 100% | 100% | 99.1% |
+| Error outputs | 24 (15 Aider-side 3,600 s request timeouts) | 19 (13 timeouts) | 9 (2 timeouts) | 21 (no timeouts) |
+| Exhausted context windows | 6 | 6 | 7 | 19 |
+| Tokens (prompt / completion) | 3.0M / 5.47M | 2.8M / 5.67M | 2.6M / 5.93M | 3.2M / 6.29M |
+| Wall time, average generation rate | 12.5 h, ~120 tok/s | 8.8 h, ~180 tok/s | 5.5 h, ~300 tok/s | **4.7 h, ~370 tok/s** |
 
-- **Errors.** The timeouts are very long thinking responses, which Aider abandons after its
-  3,600 s request timeout.
+- **Errors.** The timeouts and most exhausted context windows are the same thing: very long
+  thinking responses (about 20 a run), which either reach Aider's 3,600 s request timeout or,
+  decoded faster, `max_model_len` (Aider counts `finish_reason=length` as an exhausted context
+  window): 21, 19, 9 and 19 in runs 1-4.
 - **Run 2's code.** It used the final branch (MTP not enabled). No preemption occurred at 8
   requests per replica.
+- **Run 3** ran on Model Runner V2 (MTP and prefix caching not enabled), with one replica fewer.
+  Its shorter wall time is not a faster decode (V2 and V1 decode at the same speed on a fixed
+  workload, see the development notes): run 2 lost 13 requests to Aider's 3,600 s timeout, run 3
+  two. 22 preemptions, no server errors.
+- **Run 4** added prefix caching: hit rate 10-18% per replica, 175 preemptions (run 3: 22; the
+  KV cache holds 188k tokens in 512-token blocks, against 200k), no server errors. The pass rate
+  is within run-to-run variance; hits give the same outputs as misses (see the development
+  notes).
 
 ## Known limitations
 
@@ -311,9 +321,8 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 - **MTP** is faster than plain decode only at batch 1 in the 65,536-token configuration, and it
   reduces the KV cache by 36% (1 draft token) or 57% (2 draft tokens, which also need
   `gpu_memory_utilization` 0.82). It supports at most 2 draft tokens; on V1 no prefix caching and no
-  async scheduling (V2 keeps async scheduling; with MTP it builds no dense prefill variant). Its
-  verify step uses the GDN decode kernel for up to 16 requests; larger batches use a slower torch
-  path.
+  async scheduling (V2 keeps async scheduling). Its verify step uses the GDN decode kernel for up to
+  16 requests; larger batches use a slower torch path.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** uses unit scales and reduces accuracy (see [FP8](#fp8)).

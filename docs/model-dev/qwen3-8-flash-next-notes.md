@@ -3,7 +3,7 @@
 <!-- meta: description: Design decisions, hardware and compiler constraints, measurements,
 validation method and open work from porting Qwen3.8-Flash-Next (qwen4_exp) to vLLM Neuron on
 Trn2. -->
-<!-- meta: date_updated: 2026-10-26 -->
+<!-- meta: date_updated: 2026-10-28 -->
 
 These notes record how the Qwen3.8-Flash-Next port was built and validated: the decisions, the
 Trn2 and compiler constraints found on the way, the measurements behind them, and the open work.
@@ -282,6 +282,55 @@ Same configuration on the final branch, but with 8 concurrent requests per repli
 - **No preemption occurred.** The pass rate matches run 1 within run-to-run variance.
 - **The long tail remains.** The last few exercises run near batch 1 for up to an hour each.
 
+### Run 3 on Model Runner V2 (2026-10-28)
+
+Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2` branch), with
+7 replicas (one TP=8 range was kept for validation) and 56 Aider threads:
+
+| Metric | Value |
+|---|---|
+| pass_rate_1 / pass_rate_2 | 50.2 / 86.7 (113 / 195) |
+| percent_cases_well_formed | 100.0 |
+| error_outputs | 9 (2 Aider-side 3,600 s request timeouts, 7 exhausted context windows) |
+| user_asks | 132 |
+| prompt / completion tokens | 2,629,036 / 5,931,550 |
+| wall time | 5.5 h (about 300 tok/s average) |
+
+- **Same quality as V1.** pass_rate_2 is within run-to-run variance of runs 1 and 2.
+- **Shorter, but not from faster steps.** About 52 tok/s per replica averaged over the run,
+  against about 22 in run 2, while V2 and V1 decode at the same speed on a fixed workload
+  (see [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s
+  timeout (run 3: 2), and the long tail of the last exercises varies from run to run.
+- **22 preemptions** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`, no server errors.
+
+### Run 4 on Model Runner V2 with prefix caching (2026-10-29)
+
+Run 3's configuration with `PREFIX_CACHING=1` (512-token blocks, 188k KV tokens per replica
+against 200k):
+
+| Metric | Value |
+|---|---|
+| pass_rate_1 / pass_rate_2 | 48.9 / 84.9 (110 / 191) |
+| percent_cases_well_formed | 99.1 |
+| error_outputs | 21 (19 exhausted context windows, no Aider-side timeouts) |
+| user_asks | 135 |
+| prompt / completion tokens | 3,245,110 / 6,288,167 |
+| wall time | 4.7 h (about 370 tok/s average) |
+
+- **Pass rate within run-to-run variance** (191 against 194-196).
+- **Exhausted context windows are the long thinking responses.** Without `max_tokens` a
+  response that reaches `max_model_len` ends with `finish_reason=length`, which Aider counts as
+  an exhausted context window (the one inspected: about 22k output tokens). Slower runs hit
+  Aider's 3,600 s timeout first: timeouts plus exhausted windows are 21, 19, 9 and 19 in runs
+  1-4.
+- **Hits equal misses.** Checked after the run on its replicas, greedy at batch 1 on 10 Aider
+  transcripts of 3k-39k tokens: a repeated request (full hit) and a follow-up with a new tail
+  (hit on the shared blocks) against the same request uncached. Every divergence within 300
+  tokens is at an exact top-2 tie (gap 0.000; the BF16 logit step there is 0.125, and two
+  uncached runs on two replicas differ by one step). Preemption with hits on the preempted
+  request's own blocks matches HF on CPU (`test_preemption_with_prefix_caching_matches_hf`).
+- **175 preemptions** (hit rate 10-18% per replica), no server errors.
+
 ## Device validation (2026-10-26)
 
 Full 48-layer FP8 model on trn2.48xlarge unless noted.
@@ -386,40 +435,100 @@ the same configuration without MTP (async scheduling on, GPU_MEM_UTIL 0.85).
 
 ## Model runner
 
-The port runs on Model Runner V1. The model declares recurrent state (`HasRecurrentState`), so
-the platform routes it to V1, and every runner-side feature below exists only in the V1 runner
-(`vllm_neuron/vllm/worker/neuron_model_runner.py`).
+V1 (`neuron_model_runner.py`) is the default. Model Runner V2 (`neuron_model_runner_v2.py`)
+serves the model with `VLLM_USE_V2_MODEL_RUNNER=1` (`serve.sh` `RUNNER=v2`), with async
+scheduling also with MTP, decode context-length buckets, preemption, and prefix caching
+(`PREFIX_CACHING=1`, V2 only). It builds on V2's support for recurrent-state models and MTP
+(the Qwen3.5 work, the generic commits of the `qwen3_5-mrv2` branch).
 
-Moving the model to Model Runner V2 needs, on top of V2 support for recurrent-state models
-(the Qwen3.5 work):
-- **Host inputs (`HasHostInputs`).**
-  - Call `build_host_inputs` on every real step with the padded rows' input ids, request rows,
-    positions and token history.
-  - Zero-fill the declared inputs in every warmup, dummy, capture and jump-forward graph.
-  - V2 keeps tokens on the device, so the async host-token join needs an equivalent: apply the
-    previous step's sampled tokens on the host on every rank before building the n-gram rows.
-  - See docs/design/host-inputs.md.
-- **Dense prefill variants (`prefill_dense_context`).** Compile prefill graphs with attention
-  block tables trimmed to that many tokens, use them when the cached context plus the chunk
-  fits, and warm the MTP draft for each variant.
-- **QSA side caches (`kv_side_bytes_per_token_per_attn_layer`).** Shrink the KV budget by the
-  side-cache ratio. The model allocates the side caches itself, addressed by the attention
-  layer's block table.
-- **State pools.** A separate recurrent-state layer for the PLE conv (`layers.1.ple`) in the
-  dedicated pool.
-- **MTP.** `mtp_hidden_size` sizes the draft's 10,240-wide target hidden state.
-- **Preemption.** Under `VLLM_NEURON_MAX_KV_CONCURRENT`, discard the samples of recompute chunks
-  that end before the request's last token, and tell prefill from decode by
-  `max(num_prompt_tokens, num_tokens - 1)`. The scheduler side is runner-independent.
-- **Per-step device-tensor caches.** Sampling parameters, block-table clones and state-pool
-  table pairs: an optimisation, not required for correctness.
+What V2 needed for this model:
+- **Host inputs.** V2 builds `input_ids` and positions in the graph, so the runner keeps a host
+  copy of every slot's tokens and computed count, advanced as the graphs commit them, and
+  joins on the earlier steps' sampled tokens (and, for verify rows, the device draft table)
+  before it builds the n-gram rows. See [Host inputs](../design/host-inputs.md#model-runner-v2).
+- **Dense prefill variants, QSA side caches.** As on V1 (`prefill_ctx_variants`,
+  `kv_side_cache_ratio`). With MTP the drafter runs inside the prefill graph, and neuronx-cc
+  2.28 fails the dense prefill graph with the MTP head in it at `-O1` (`NCC_INLA001` in
+  `lower_act`); it compiles at `-O2`, which the model's `compiler_args_for` asks for that one
+  graph (`prefill_dense_spec`).
+- **PLE state, MTP head.** Nothing new: the PLE conv state is one more recurrent-state layer, and
+  `Qwen4ExpMTP` has V2's fused draft forward (`mtp_hidden_size` is not needed: the hidden
+  state stays in the graph).
+- **Preemption.** Nothing new: V2 readmits a preempted request with its whole history.
+- **Prefix caching.** Two fixes for state layers of different sizes (36 GDN layers, one PLE
+  layer): one state page for every layer in align mode (vLLM needs one block size), and one
+  placeholder shape in the specs (vLLM groups layers by spec equality, and otherwise made 49
+  one-layer groups, so every attention layer's KV view, and the QSA side caches sized from it,
+  spanned the whole pool). Blocks are 512 tokens with BF16 KV (FP8 KV: twice that).
 
-The model code is runner-independent. It reads per-layer metadata dicts keyed by layer name:
-`block_table_tensor`, `slot_mapping`, `cached_seq_len`, `max_query_len`,
-`decode_token_threshold`, `block_size`, `max_blocks_per_seq`, `kv_segment_size` and, with
-MTP, `state_in`. A V2 forward adapter must provide the same. The unit tests in test/unit/worker
-(`test_host_inputs.py`, `test_runner_step_caches.py`, `test_runner_model_hooks.py`,
-`test_scheduler_preemption.py`) describe the expected runner behaviour.
+Found on device:
+- **KV-block clearing overflowed the runtime queue.** V2 keeps 32-token attention blocks, so a
+  45k-token prompt allocated about 1,400 blocks in one step, cleared 8 per graph call; the
+  runtime refused the next submission (`Execution Queue Full`). The clearer now also uses
+  256-block calls and waits every 32 calls.
+- **KV-block clearing slowed every step.** Clearing new blocks before the forward, every few
+  decode steps with 32-token blocks, made the runtime switch NEFFs twice per clear (an 8-layer
+  runtime trace: 414 executions and 354 model switches where V1 had 309 and 126; device time of
+  the decode graph itself within 2.5% of V1's). Not clearing is wrong: stale K/V in reused
+  blocks changed the logit test's second prompt (K5 0.0201 to 0.061-0.069). Without prefix
+  caching V2 now clears a request's blocks when it is removed (one call per finished or
+  preempted request), which restores the numbers exactly and V1's step time.
+- **Compile cache.** `parallel_compile` compiles every captured HLO without a NEFF in the
+  cache directory, also one left by an earlier failed run; delete such entries.
+- **`vllm serve` and the checkout.** The `vllm` launcher runs the venv's Python; a checkout
+  added with a `.pth` in another venv is not on its path. Put it on `PYTHONPATH`.
+
+Validation (CPU): `test/unit/model/qwen4_exp/test_v2_runner.py` runs the tiny model (sparse
+QSA, real n-gram rows from the HF table) through the V2 runner and schedulers against HF:
+plain and MTP (oracle drafts with partial acceptance, and the real head), sync and async,
+chunked prefills, prefix caching (hits on GDN/PLE checkpoints and cached QSA keys), FP8 KV
+with and without prefix caching, preemption with prefix caching (readmission with a hit on
+the request's own blocks). `test/unit/model/qwen3_5/test_v2_host_inputs.py` checks the
+host-built rows against the graph's and the host copy against the device state.
+
+Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
+- **Logit test** (`test/integration/model/qwen4_exp/test_model.py`, goldens recomputed this
+  day): V2 and V1 give the same result, 2 of 4 prompts within the two-way tolerances at batch 1
+  and batch 4 (prompt 1 diverges at token 4 on a 0.375 near-tie on both runners; prompt 4
+  exceeds K5 by 0.003-0.006). The `qwen4_exp-upstream` branch (V1, before any V2 work) gives
+  the same numbers to four decimals, so this is the goldens against the tolerances, not a
+  regression: the earlier passing runs used goldens computed elsewhere. The 4-layer BF16
+  truncation passes (three-way).
+- **Serving** (64k configuration, `RUNNER=v2`): needles at 3k-45k tokens 6 of 6, three at a
+  time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
+  19 minutes.
+- **Speed against V1** (same commit, same knobs, one freshly started replica each, greedy,
+  `ignore_eos`): equal. Inter-token time 35.5 ms against 35.2 at B=1 (8k prompt), 55.5 ms
+  against 55.6 at B=8 (4k prompts), 116 ms against 115 at B=4 (30k prompts, decode interleaved
+  with the others' prefill chunks); time to first token equal.
+  - Before KV blocks were cleared at free time, V2 steps were about 8% slower (37.3 / 59.9 /
+    125 ms) and the first token of a B=8 batch took longer: see "KV-block clearing" above.
+  - Where a B=8 step goes on the host: input preparation 1.2 ms (overlapped with the previous
+    step), the join's wait for the previous step 52 ms, host inputs 0.9 ms and the forward call
+    3.2 ms (2.5 with `VLLM_NEURON_SKIP_GUARD_EVAL=1`, which gains 0.7 ms per step).
+- **Aider Polyglot** (runs 3 and 4 above): 86.7% after 2 tries in 5.5 h on 7 replicas; with
+  prefix caching 84.9% in 4.7 h.
+- **Preemption** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`: 22 preemptions during the Aider run,
+  no errors.
+- **Prefix caching:** greedy outputs equal the server without it for 4 questions on a shared
+  12k-token prefix, sequential and concurrent, and for a turn continuing an answer; hit rate
+  84%; time to first token 9.8 s cold, 1.1 s cached; 16 mixed requests 8 at a time without
+  errors.
+- **MTP** (2 draft tokens, async scheduling): greedy outputs equal plain decode up to exact
+  BF16 ties (top-2 gap 0.000); 84% of drafts accepted (2.68 tokens per step, V1: 2.25-2.46);
+  B=1 27-34 ms/token (V1: 27). KV cache 107k tokens at `GPU_MEM_UTIL=0.82` (V1: 109k).
+  Same benchmark as the speed comparison (greedy, `ignore_eos`, tokens counted from `usage`),
+  MTP against plain V2: inter-token 19.2 ms against 35.5 at B=1 (1.85x), 67.1 against 55.5 at
+  B=8 (21% slower), 111 against 116 at B=4 with 30k prompts; time to first token 6.1 / 13.8 /
+  70.4 s against 5.7 / 12.9 / 57.5 (the prefill graphs carry the drafter), so the 30k batch
+  takes longer overall (146 s against 117).
+- **FP8 KV cache**: the logit test gives the BF16-KV pattern (2 of 4 prompts, errors of the same
+  size). Prefix caching, FP8 KV and MTP together (1024-token blocks, 146k KV tokens): misses
+  and hits give the same greedy output, sequential and concurrent, equal to the BF16 server's
+  answers; needles at 12k-45k 3 of 3; 24 mixed requests 8 at a time without errors.
+  Two-hour soak of that server (2026-10-29): 18 rounds of 16 sampled requests (prompts of
+  500-24k words, 8 at a time), each followed by the hit/miss consistency check: all
+  consistent, no errors, 12 preemptions, prefix-cache hit rate 35%.
 
 ## Open work
 
@@ -437,8 +546,11 @@ MTP, `state_in`. A V2 forward adapter must provide the same. The unit tests in t
   - FP8 KV needs calibrated scales before it can be a default.
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.
-- **Prefix caching.** Recurrent state in the shared pool, with align-mode checkpoints for the GDN
-  and PLE state.
+- **Prefix caching on V1.** V2 serves it (align-mode checkpoints of the GDN and PLE state).
+- **Dense prefill with MTP on V2.** The compiler error above at `-O1` (worked around with
+  `-O2` for that graph; repro: the captured HLO and command).
+- **Device profiles of the full model.** The runtime cannot allocate its profiler buffers next
+  to the 48-layer model and KV cache (HBM full); profile truncations, as above.
 - **Smaller costs:**
   - batch the GDN decode kernel's per-request instruction chains (~5 ms/step at B=8);
   - fix the gated-residual group RMSNorm layout (~2 ms/step at B=1);
