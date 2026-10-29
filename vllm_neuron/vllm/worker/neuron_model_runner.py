@@ -3012,10 +3012,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.warm_up_mamba_align()
 
     def warm_up_kv_block_clearing(self) -> None:
-        """Compile the KV-clearing graph (clears the null block). Called after model warmup:
-        executing on device earlier would precede the parallel-trace forks."""
+        """Compile the KV-clearing graphs, small and large chunks (they clear the null block).
+        Called after model warmup: executing on device earlier would precede the
+        parallel-trace forks."""
         if getattr(self, "_kv_clear_groups", None):
-            self._clear_kv_blocks([0])
+            self._kv_clearer.warm_up()
 
     def _clear_kv_blocks(self, manager_blocks: list[int]) -> None:
         self._kv_clearer.clear_blocks(manager_blocks)

@@ -322,7 +322,9 @@ Logit validation against Hugging Face Transformers (FP32 reference,
   reduces the KV cache by 36% (1 draft token) or 57% (2 draft tokens, which also need
   `gpu_memory_utilization` 0.82). It supports at most 2 draft tokens; on V1 no prefix caching and no
   async scheduling (V2 keeps async scheduling). Its verify step uses the GDN decode kernel for up to
-  16 requests; larger batches use a slower torch path.
+  16 requests; larger batches use a slower torch path. With MTP on V2, leave the compiler
+  optimization level at its default: the model compiles the dense prefill graph with the MTP
+  head at `-O2` (neuronx-cc 2.28 fails it at `-O1`), and an explicit level overrides that.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** uses unit scales and reduces accuracy (see [FP8](#fp8)).
