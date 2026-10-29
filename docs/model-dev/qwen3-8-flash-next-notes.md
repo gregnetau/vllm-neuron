@@ -487,12 +487,13 @@ the request's own blocks). `test/unit/model/qwen3_5/test_v2_host_inputs.py` chec
 host-built rows against the graph's and the host copy against the device state.
 
 Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
-- **Logit test** (`test/integration/model/qwen4_exp/test_model.py`, goldens recomputed this
-  day): V2 and V1 give the same result, 2 of 4 prompts within the two-way tolerances at batch 1
-  and batch 4 (prompt 1 diverges at token 4 on a 0.375 near-tie on both runners; prompt 4
-  exceeds K5 by 0.003-0.006). The `qwen4_exp-upstream` branch (V1, before any V2 work) gives
-  the same numbers to four decimals, so this is the goldens against the tolerances, not a
-  regression: the earlier passing runs used goldens computed elsewhere. The 4-layer BF16
+- **Logit test** (`test/integration/model/qwen4_exp/test_model.py`): passes on V2 and V1 at
+  batch 1 and batch 4 (2026-10-29), no divergent token. Its references now hold the FP8
+  experts the model serves (`_round_experts_to_fp8`, the loader's own per-channel
+  quantization, bit-identical to the served weights). Against the BF16-expert references, V2,
+  V1 and the `qwen4_exp-upstream` branch (before any V2 work) all failed 2 of 4 prompts with the
+  same numbers to four decimals (prompt 1 diverging at token 4 on a 0.375 near-tie): the test
+  measured the FP8 quantization against bounds meant for BF16 compute. The 4-layer BF16
   truncation passes (three-way).
 - **Serving** (64k configuration, `RUNNER=v2`): needles at 3k-45k tokens 6 of 6, three at a
   time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
@@ -522,8 +523,13 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   B=8 (21% slower), 111 against 116 at B=4 with 30k prompts; time to first token 6.1 / 13.8 /
   70.4 s against 5.7 / 12.9 / 57.5 (the prefill graphs carry the drafter), so the 30k batch
   takes longer overall (146 s against 117).
-- **FP8 KV cache**: the logit test gives the BF16-KV pattern (2 of 4 prompts, errors of the same
-  size). Prefix caching, FP8 KV and MTP together (1024-token blocks, 146k KV tokens): misses
+- **FP8 KV cache**: the logit test (FP8-expert references) passes at batch 4 and fails 2 of 4
+  prompts at batch 1, without a divergent token (prompt 4: all-K error 0.136 against the 0.09
+  bound, BF16 KV 0.091). Unit scales lose nothing to calibration: in the HF model (5 prompts of
+  2k-4k tokens: code, prose, Chinese), per-layer K amax is at most 15.8 and V amax at most 34.8,
+  inside the +-240 FP8 range, and the FP8 round trip errs by 2.65% with unit scales and with
+  per-layer amax/240 scales alike (the e4m3 mantissa); finer scales (per head or token) would be
+  needed to do better. Prefix caching, FP8 KV and MTP together (1024-token blocks, 146k KV tokens): misses
   and hits give the same greedy output, sequential and concurrent, equal to the BF16 server's
   answers; needles at 12k-45k 3 of 3; 24 mixed requests 8 at a time without errors.
   Two-hour soak of that server (2026-10-29): 18 rounds of 16 sampled requests (prompts of
@@ -543,7 +549,8 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
     Next steps: profile the batch-8 verify graph at long context, and turn drafting off above
     batch 2 (vLLM's `num_speculative_tokens_per_batch_size`) with a batch-2 graph, which makes
     1 draft token 1.2x faster at batch 2.
-  - FP8 KV needs calibrated scales before it can be a default.
+  - FP8 KV stays opt-in: its error is the e4m3 rounding, which per-layer scales do not reduce
+    (see above); per-head or per-token scales would.
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.
 - **Prefix caching on V1.** V2 serves it (align-mode checkpoints of the GDN and PLE state).

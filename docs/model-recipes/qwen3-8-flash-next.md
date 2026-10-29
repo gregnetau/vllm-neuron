@@ -49,7 +49,7 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | | Image / video | ❌ |
 | **Quantization** | FP8 routed experts (per-channel weights, BF16 activations) | ✅ |
 | | Full BF16 (48 layers) | ❌ does not fit 8 NeuronCores |
-| | FP8 KV cache | ⚠️ works, 1.67x KV tokens; fails logit validation (see [FP8](#fp8)) |
+| | FP8 KV cache | ⚠️ works, 1.67x KV tokens; fails logit validation at batch 1 (see [FP8](#fp8)) |
 | **Attention** | QSA sparse attention (exact selection; decode reads only the selected tokens) | ✅ |
 | **Parallelism** | TP=8 (KV heads replicated, experts split across the TP ranks) | ✅ |
 | | Data parallel (independent replicas behind a proxy) | ✅ |
@@ -139,9 +139,10 @@ BF16.
 
 - Decode uses a sparse MoE kernel that loads only the local experts some token selected.
 - **FP8 KV cache** (`--kv-cache-dtype fp8`). It holds 1.67x the tokens (427k per replica at
-  65,536, default cap 6), and the QSA indexer side cache stays BF16. It uses unit scales and
-  fails logit validation: the maximum L2 error is up to 2.0x HF BF16's, against 1.31x with BF16
-  KV. Greedy output on the 3,532-token prompt is still 8/8. BF16 KV is the default.
+  65,536, default cap 6), and the QSA indexer side cache stays BF16. It uses unit scales (K/V
+  values stay within +-35, and calibrated per-layer scales give the same rounding error). The
+  logit test passes at batch 4 and fails 2 of 4 prompts at batch 1, without a divergent token.
+  Greedy output on the 3,532-token prompt is still 8/8. BF16 KV is the default.
 - Prefill dequantizes the experts to BF16 inside the graph before the blockwise kernel.
 
 ### MTP speculative decoding
@@ -258,13 +259,14 @@ buckets 4,096 / 16,384 / 32,768, `DECODE_INTERLEAVE=1`); greedy unless noted.
 ## Accuracy
 
 Logit validation against Hugging Face Transformers (FP32 reference,
-`test/integration/model/qwen4_exp/test_model.py`):
+`test/integration/model/qwen4_exp/test_model.py`; for the FP8 model the references hold the same
+FP8 expert weights, so the bounds measure the compute, not the quantization):
 
 - **Short prompts.** The full 48-layer FP8 model passes: every prompt's L2 error stays within
   1.5x of HF's own BF16 CPU run, with a per-token ratio of about 1.0x on average.
 - **3,532-token prompt (QSA sparse, 65,536-token serving configuration).** Greedy 8/8 against
   HF.
-- **Batch 4.** The 48-layer FP8 model also passes at batch 4. The truncated 4- and 8-layer
+- **Batch 4.** The 48-layer FP8 model also passes at batch 4, on Model Runner V1 and V2. The truncated 4- and 8-layer
   models pass in BF16 and FP8 at batch 1, and at batch 4 except 4-layer FP8, which is 1% over
   the threshold.
 - **Long-context retrieval** (full model, serving configuration, thinking off): passkey and
@@ -327,5 +329,5 @@ Logit validation against Hugging Face Transformers (FP32 reference,
   head at `-O2` (neuronx-cc 2.28 fails it at `-O1`), and an explicit level overrides that.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
-- **FP8 KV cache** uses unit scales and reduces accuracy (see [FP8](#fp8)).
+- **FP8 KV cache** reduces accuracy (the e4m3 rounding; see [FP8](#fp8)).
 - **Text only.** The vision tower is not loaded.
