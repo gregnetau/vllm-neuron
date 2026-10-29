@@ -315,9 +315,8 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 - **MTP** is faster than plain decode only at batch 1 in the 65,536-token configuration, and it
   reduces the KV cache by 36% (1 draft token) or 57% (2 draft tokens, which also need
   `gpu_memory_utilization` 0.82). It supports at most 2 draft tokens; on V1 no prefix caching and no
-  async scheduling (V2 keeps async scheduling; with MTP it builds no dense prefill variant). Its
-  verify step uses the GDN decode kernel for up to 16 requests; larger batches use a slower torch
-  path.
+  async scheduling (V2 keeps async scheduling). Its verify step uses the GDN decode kernel for up to
+  16 requests; larger batches use a slower torch path.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** uses unit scales and reduces accuracy (see [FP8](#fp8)).

@@ -419,9 +419,10 @@ What V2 needed for this model:
   joins on the earlier steps' sampled tokens (and, for verify rows, the device draft table)
   before it builds the n-gram rows. See [Host inputs](../design/host-inputs.md#model-runner-v2).
 - **Dense prefill variants, QSA side caches.** As on V1 (`prefill_ctx_variants`,
-  `kv_side_cache_ratio`). With MTP V2 builds no dense variant: the drafter runs inside the
-  prefill graph, and neuronx-cc 2.28 fails the dense prefill graph with the MTP head in it
-  (`NCC_INLA001` in `lower_act`).
+  `kv_side_cache_ratio`). With MTP the drafter runs inside the prefill graph, and neuronx-cc
+  2.28 fails the dense prefill graph with the MTP head in it at `-O1` (`NCC_INLA001` in
+  `lower_act`); it compiles at `-O2`, which the model's `compiler_args_for` asks for that one
+  graph (`prefill_dense_spec`).
 - **PLE state, MTP head.** Nothing new: the PLE conv state is one more recurrent-state layer, and
   `Qwen4ExpMTP` has V2's fused draft forward (`mtp_hidden_size` is not needed: the hidden
   state stays in the graph).
@@ -453,7 +454,10 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **Logit test** (`test/integration/model/qwen4_exp/test_model.py`, goldens recomputed this
   day): V2 and V1 give the same result, 2 of 4 prompts within the two-way tolerances at batch 1
   and batch 4 (prompt 1 diverges at token 4 on a 0.375 near-tie on both runners; prompt 4
-  exceeds K5 by 0.003-0.006). The 4-layer BF16 truncation passes (three-way).
+  exceeds K5 by 0.003-0.006). The `qwen4_exp-upstream` branch (V1, before any V2 work) gives
+  the same numbers to four decimals, so this is the goldens against the tolerances, not a
+  regression: the earlier passing runs used goldens computed elsewhere. The 4-layer BF16
+  truncation passes (three-way).
 - **Serving** (64k configuration, `RUNNER=v2`): needles at 3k-45k tokens 6 of 6, three at a
   time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
   19 minutes.
@@ -498,8 +502,8 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **FP8 prefill MoE without in-graph dequantization.** The blockwise kernel's per-channel FP8
   path fails with NCC_IGCA108 because scale buffers are allocated inside its dynamic loop.
 - **Prefix caching on V1.** V2 serves it (align-mode checkpoints of the GDN and PLE state).
-- **Dense prefill with MTP on V2.** The compiler error above; short prompts take the masked
-  QSA prefill instead.
+- **Dense prefill with MTP on V2.** The compiler error above at `-O1` (worked around with
+  `-O2` for that graph; repro: the captured HLO and command).
 - **V2 step time.** About 8% slower than V1 at B=1 and B=8, mostly on the device: profile the
   adapter graph (in-graph input building and state commit) against V1's decode graph.
 - **Smaller costs:**
