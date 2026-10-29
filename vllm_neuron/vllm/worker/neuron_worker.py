@@ -1870,10 +1870,13 @@ class NeuronWorker(WorkerBase):
                 model_input = self.model_runner._build_prefill_synthetic_inputs(
                     bucket_size, kv_seg_size, device=device, dense_ctx=dense_ctx
                 )
+                # The runner names the graph for the model's per-graph compiler args.
+                graph_type_of = getattr(self.model_runner, "prefill_graph_type", None)
                 jobs.append(
                     self._build_trace_job(
                         model_input,
                         native_compile_only=native_compile_only,
+                        graph_type=graph_type_of(dense_ctx) if graph_type_of else None,
                     )
                 )
         return jobs

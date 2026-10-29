@@ -116,8 +116,6 @@ if TYPE_CHECKING:
     VLLM_NEURON_MAX_KV_CONCURRENT: Optional[int] = None
     # Serving forwards evaluate only the guards that tell the compiled graphs apart
     VLLM_NEURON_SKIP_GUARD_EVAL: bool = False
-    # Model Runner V2: build the dense prefill variant also with speculative decoding
-    VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -578,13 +576,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # take, which fail_on_recompile already demands.
     "VLLM_NEURON_SKIP_GUARD_EVAL": lambda: bool(
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_GUARD_EVAL"))
-    ),
-    # 1: Model Runner V2 also builds a model's dense prefill variant (prefill_dense_context)
-    # with speculative decoding, whose drafter runs inside the prefill graph. Off by default:
-    # neuronx-cc 2.28 fails the Qwen3.8-Flash-Next variant with its MTP head (NCC_INLA001).
-    # For retesting newer compilers.
-    "VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC": lambda: bool(
-        maybe_convert_bool(os.getenv("VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC"))
     ),
 }
 
