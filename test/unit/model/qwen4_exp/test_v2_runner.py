@@ -218,7 +218,9 @@ class _Engine:
     """The engine core's loop (batch queue of depth 2 with async scheduling) around one
     V2 runner and a Neuron scheduler."""
 
-    def __init__(self, vllm_config, model, draft):
+    def __init__(
+        self, vllm_config, model, draft, *, num_blocks=120, clear_on_free=False
+    ):
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
@@ -259,9 +261,26 @@ class _Engine:
             page = max(s.page_size_bytes for s in specs.values())
             num_attn = max(len(g.layer_names) for g in groups)
         config = get_kv_cache_config_from_groups(
-            vllm_config, groups, 120 * page * num_attn
+            vllm_config, groups, num_blocks * page * num_attn
         )
         runner.initialize_kv_cache(config)
+        if clear_on_free:
+            # The device path without prefix caching: the runner zeroes the blocks of
+            # removed requests and the model does not clear new blocks itself.
+            from vllm_neuron.vllm.worker import hybrid_state
+
+            caches = {id(c): c for kv in runner.kv_caches.values() for c in kv}
+            self.cleared = []
+
+            def zero(caches, kernel_blocks):
+                self.cleared.append(kernel_blocks.tolist())
+                return hybrid_state.zero_kv_blocks(caches, kernel_blocks)
+
+            runner._kv_clearer = hybrid_state.KVBlockClearer(
+                list(caches.values()), 1, runner.device, zero_fn=zero
+            )
+            runner._clear_on_free, runner._freed_kv_blocks = True, []
+            model.set_runner_clears_kv_blocks(True)
         speculator = runner._build_speculator()
         if speculator is not None and isinstance(runner.draft_model, _Oracle):
             speculator = _Speculator(speculator)
@@ -539,3 +558,20 @@ def test_compiler_args_policy(plugin_mtp):
     for graph_type in (None, "prefill_dense", "decode"):
         assert model.compiler_args_for(graph_type, None, base) == base
     assert base == ["--auto-cast=none", "-O1", "--logical-nc-config=2"]
+
+
+def test_clear_on_free_with_block_reuse_matches_hf(tmp_path, plugin_mtp, scenario):
+    """The device clearing path without prefix caching on a small KV cache: later
+    requests get blocks freed by earlier ones, which only the runner's clear at free time
+    zeroes (the model does not clear new blocks). Greedy outputs equal HF's."""
+    hf, hf_cfg, prompts, expected = scenario
+    model = _model(plugin_mtp, hf, hf_cfg)
+    vllm_config = _vllm_config(tmp_path, hf_cfg, spec=False, async_scheduling=True)
+    engine = _Engine(vllm_config, model, None, num_blocks=24, clear_on_free=True)
+    order = ["c", "a", "b", "long"]  # one after the other: every request reuses blocks
+    arrivals = {12 * i: [(r, prompts[r], SCENARIO[r][1])] for i, r in enumerate(order)}
+    engine.run(arrivals, max_steps=2000)
+    for r in order:
+        assert prompts[r] + engine.outputs[r] == expected[r], r
+    cleared = {b for call in engine.cleared for b in call if b}
+    assert cleared, "no block was cleared"
