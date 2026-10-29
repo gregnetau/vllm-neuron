@@ -169,9 +169,17 @@ class _GreedyTarget(torch.nn.Module):
 
 def _build_models(moe=False):
     """HF reference, Neuron target and MTP head (same random weights), built against
-    test_model_smoke's stubs, which are then removed."""
+    test_model_smoke's stubs, which are then removed, also when building fails: a
+    module-scoped fixture that left the stubs in place would break every later test of
+    the worker that imports the stubbed modules (a stub ``vllm_neuron.functional``)."""
     before = set(sys.modules)
-    import test_model_smoke as smoke
+    try:
+        return _build_models_against_stubs(moe)
+    finally:
+        _restore_stubbed_modules_now(before)
+
+
+def _build_models_against_stubs(moe):
     import test_v2_runner_inputs as base
     from conftest import ROOT, _load
 
@@ -195,8 +203,6 @@ def _build_models(moe=False):
         )
     mtp._materialize_buffers()
     _torch_attention(mtp.model.layers[0].self_attn)
-    del smoke
-    _restore_stubbed_modules_now(before)
     return hf_model, model, mtp
 
 
