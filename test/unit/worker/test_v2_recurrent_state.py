@@ -549,6 +549,31 @@ def test_execute_model_clears_new_blocks_before_a_zero_token_return():
     assert calls == [[7, 9]]
 
 
+def test_clear_on_free_clears_removed_requests_blocks_not_new_ones():
+    """Without prefix caching the attention blocks of finished requests are cleared
+    before the next forward (vLLM may hand them out in that step); newly allocated
+    blocks are not cleared again (every free block stays zeroed), and the state groups'
+    placeholder blocks are never written, so they are left out."""
+    runner = _initialized_runner()
+    calls = []
+    runner._kv_clearer = SimpleNamespace(clear=lambda ids: calls.append(list(ids)))
+    runner._clear_on_free, runner._freed_kv_blocks = True, []
+    a = _new_req(runner, "a", 300, state_block=10, attn_blocks=range(20, 30))
+    b = _new_req(runner, "b", 40, state_block=11, attn_blocks=range(40, 42))
+    _admit(runner, a, b)
+    runner._clear_kv_blocks(_step(zero=[20, 21, 40]))
+    assert calls == [[]]
+    runner.update_states(_step(finished=["a"]))
+    runner._clear_kv_blocks(_step(zero=[5]))
+    assert calls[-1] == list(range(20, 30))
+    runner._clear_kv_blocks(_step())
+    assert calls[-1] == []
+    # Prefix caching: the blocks vLLM newly allocated (freed ones may be cache hits).
+    runner._clear_on_free = False
+    runner._clear_kv_blocks(_step(zero=[7, 9]))
+    assert calls[-1] == [7, 9]
+
+
 def test_warm_up_hybrid_graphs():
     runner = _runner()
     runner.warm_up_hybrid_graphs()  # no clearer: no-op

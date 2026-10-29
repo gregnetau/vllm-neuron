@@ -359,6 +359,10 @@ class NeuronModelRunnerV2:
     # committed counts of a step without speculative decoding (ones). Class-level
     # defaults: off.
     _prefix_caching: bool = False
+    # KV-block clearing at free time (no prefix caching): the attention blocks of the
+    # requests removed since the last forward, cleared before it (_clear_kv_blocks).
+    _clear_on_free: bool = False
+    _freed_kv_blocks: list | None = None
     _kernel_block_size: int | None = None
     _ckpt_block_size: int = 0
     _ckpt: hybrid_state.StateCheckpointer | None = None
@@ -1940,6 +1944,15 @@ class NeuronModelRunnerV2:
         # Pool pages per slot: 1 + num_speculative_blocks (checked above).
         self._state_pool_slot_pages = state_pages_per_slot
         self._kv_clearer = kv_clearer
+        # Without prefix caching a block is freed only with its request (finished,
+        # preempted, readmitted), which the runner removes in the same step vLLM may hand
+        # the block to another request: clearing the removed requests' blocks then keeps
+        # every free block zeroed, with one clearing call per removal instead of one per
+        # newly allocated block (with --block-size blocks, every few decode steps, each
+        # a NEFF switch). With prefix caching freed blocks stay cached (they hold valid
+        # KV or state checkpoints), so new blocks are cleared at allocation.
+        self._clear_on_free = kv_clearer is not None and not ckpt_block
+        self._freed_kv_blocks = []
         if checkpointer is not None:
             self._ckpt = checkpointer
             self._ckpt_block_size = ckpt_block
@@ -2344,13 +2357,7 @@ class NeuronModelRunnerV2:
         self.reap_quarantined()
         with record_function_or_nullcontext("neuron_model_runner: update_states"):
             self.update_states(scheduler_output)
-        if self._kv_clearer is not None:
-            # vLLM lists newly allocated blocks for models with Mamba layers (prefix-cache
-            # hits and blocks an async KV load will write are left out). Clear them before
-            # this step's forward reads them; NRT runs the submissions in order.
-            self._kv_clearer.clear(
-                getattr(scheduler_output, "new_block_ids_to_zero", None)
-            )
+        self._clear_kv_blocks(scheduler_output)
 
         if scheduler_output.total_num_scheduled_tokens == 0:
             # A KV-only DI step still drains the connector's finished sends/receives. The no-op
@@ -4413,6 +4420,27 @@ class NeuronModelRunnerV2:
                 new_block_ids=new_block_ids[i],
             )
 
+    def _clear_kv_blocks(self, scheduler_output) -> None:
+        """Zero KV blocks before this step's forward reads them (NRT runs the
+        submissions in order, so also after any in-flight graph that still writes them).
+
+        New blocks must read as zeros: stale K/V from an earlier request changes the
+        attention output (the decode kernels read whole blocks). Without prefix caching
+        the blocks of the requests removed since the last forward are cleared (every free
+        block stays zeroed); with it vLLM's newly allocated blocks
+        (``new_block_ids_to_zero``: prefix-cache hits and blocks an async KV load will
+        write are left out).
+        """
+        if self._kv_clearer is None:
+            return
+        if self._clear_on_free:
+            blocks, self._freed_kv_blocks = self._freed_kv_blocks, []
+            self._kv_clearer.clear(blocks)
+        else:
+            self._kv_clearer.clear(
+                getattr(scheduler_output, "new_block_ids_to_zero", None)
+            )
+
     def _remove_and_quarantine(self, req_id: str) -> None:
         """Free ``req_id``'s slot through the quarantine ledger (no-op if it holds no slot).
 
@@ -4421,7 +4449,14 @@ class NeuronModelRunnerV2:
         else leaves it free. Routing every removal here is what makes the async recycle safe -- a bare
         ``remove_request`` would immediately re-expose an in-flight slot.
         """
-        slot = self.request_state.remove_request(req_id)
+        rs = self.request_state
+        if self._clear_on_free and req_id in rs.req_id_to_index:
+            slot = rs.req_id_to_index[req_id]
+            for g in range(len(self.block_sizes)):
+                if g not in self._state_groups:
+                    n = rs.num_blocks(g, slot)
+                    self._freed_kv_blocks.extend(rs.block_table(g)[slot, :n].tolist())
+        slot = rs.remove_request(req_id)
         if slot is not None:
             self.release_or_quarantine_slot(slot)
 
