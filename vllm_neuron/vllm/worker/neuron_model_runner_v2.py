@@ -4148,11 +4148,15 @@ class NeuronModelRunnerV2:
         ctx = getattr(model, "prefill_dense_context", None)
         if not ctx or int(ctx) >= self.max_model_len:
             return None
-        if self.num_speculative_tokens:
+        if (
+            self.num_speculative_tokens
+            and not envs.VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC
+        ):
             # The drafter runs in the prefill graph on V2, and neuronx-cc 2.28 fails the
             # Qwen3.8-Flash-Next dense prefill graph with the MTP head inside it
             # ([NCC_INLA001] in lower_act, generateInstLoadActFuncSet). Without the
             # variant short prompts take the model's full-table prefill path.
+            # VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC=1 builds it anyway.
             return None
         return int(ctx)
 

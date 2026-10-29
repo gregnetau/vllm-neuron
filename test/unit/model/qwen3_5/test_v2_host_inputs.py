@@ -397,7 +397,7 @@ def test_synthetic_inputs_zero_fill_host_inputs(tmp_path, models, spec):
     assert all(t.device.type == "meta" for t in meta.host_inputs.values())
 
 
-def test_dense_prefill_variant_and_side_cache_ratio(tmp_path, models):
+def test_dense_prefill_variant_and_side_cache_ratio(tmp_path, monkeypatch, models):
     """``prefill_dense_context``: prefill chunks whose cached prefix plus padded chunk fit
     it run with the attention block tables trimmed to it (the dense graph variant), the
     others with the whole table; warmup builds both. ``kv_side_cache_ratio`` follows
@@ -471,5 +471,7 @@ def test_dense_prefill_variant_and_side_cache_ratio(tmp_path, models):
         spec_runner = _Engine(spec_config, model, models[2]).runner
         assert spec_runner.prefill_ctx_variants(512, CHUNK) == [False]
         assert not spec_runner._use_prefill_dense(CHUNK, 512)
+        monkeypatch.setenv("VLLM_NEURON_V2_DENSE_PREFILL_WITH_SPEC", "1")
+        assert spec_runner.prefill_ctx_variants(512, CHUNK) == [False, True]
     finally:
         del model.prefill_dense_context
