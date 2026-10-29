@@ -7,8 +7,9 @@ along the FP32 greedy sequence).
 
 The reference is the Hugging Face text tower (Qwen4ExpForCausalLM) on CPU, optionally truncated
 to the first ``QWEN4_EXP_NUM_LAYERS`` decoder layers (the final hyper-connection mixer and
-lm_head are kept). The references come from the shared golden cache
-(``VLLM_NEURON_GOLDEN_CACHE_DIR``) and are computed on a cache miss. Computing them needs about
+lm_head are kept); with ``QWEN4_EXP_QUANTIZATION=fp8`` its routed experts hold the FP8
+weights the Neuron model serves (``_round_experts_to_fp8``). The references come from the
+shared golden cache (``VLLM_NEURON_GOLDEN_CACHE_DIR``) and are computed on a cache miss. Computing them needs about
 650 GB of host RAM for the full 48-layer FP32 reference, and roughly 200 GB for the truncated
 runs, because of the 102 GB n-gram table, so pre-populating the cache on a large host is
 recommended. The cache key includes the model path string and the rendered prompts, so use the
@@ -109,7 +110,8 @@ def _text_config(model_checkpoint):
 
 
 def _golden_variant():
-    return "text_tower" if NUM_LAYERS == 48 else f"text_tower_L{NUM_LAYERS}"
+    variant = "text_tower" if NUM_LAYERS == 48 else f"text_tower_L{NUM_LAYERS}"
+    return f"{variant}_fp8_experts" if QUANTIZATION == "fp8" else variant
 
 
 def _render_prompts(tokenizer):
@@ -129,7 +131,27 @@ def _load_text_model(model_checkpoint, dtype, config=None):
     model = Qwen4ExpForCausalLM.from_pretrained(
         model_checkpoint, config=config or _text_config(model_checkpoint), dtype=dtype
     )
+    if QUANTIZATION == "fp8":
+        _round_experts_to_fp8(model)
     return model.eval()
+
+
+@torch.no_grad()
+def _round_experts_to_fp8(model):
+    """Replace the routed-expert weights with their FP8 values as served: the Neuron model
+    quantizes them at load (weight-only, one scale per output channel, from the BF16
+    checkpoint) and dequantizes in the kernels, so the references hold the same weights and
+    the comparison keeps the BF16 bounds. HF layouts: gate_up_proj [E, 2I, H] and down_proj
+    [E, H, I], the input dim last (the dim the Neuron loader reduces over)."""
+    from vllm_neuron.model.qwen4_exp.moe import fp8_quantize_per_channel
+
+    for name, module in model.named_modules():
+        if not name.endswith("mlp.experts"):
+            continue
+        for w in (module.gate_up_proj, module.down_proj):
+            for e in range(w.shape[0]):  # one expert at a time: the FP32 model is ~650 GB
+                q, scale = fp8_quantize_per_channel(w[e], 1)
+                w[e] = (q.float() * scale[:, None]).to(w.dtype)
 
 
 @pytest.mark.integration
