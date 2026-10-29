@@ -244,6 +244,30 @@ def test_kv_block_clearer_chunks_and_pads_with_null_block():
     ]
 
 
+def test_v1_warm_up_compiles_both_clearing_graphs():
+    """V1's warm-up compiles the large-chunk graph too: a long prompt's first clear must
+    not compile in the request path."""
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+    sizes = []
+
+    def zero_fn(c, blocks):
+        sizes.append(len(blocks))
+        return hybrid_state.zero_kv_blocks(c, blocks)
+
+    caches = [torch.ones(4, 1, 2, 4)]
+    runner = SimpleNamespace(
+        _kv_clear_groups=[0],
+        _kv_clearer=hybrid_state.KVBlockClearer(
+            caches, 1, torch.device("cpu"), zero_fn=zero_fn
+        ),
+    )
+    NeuronModelRunner.warm_up_kv_block_clearing(runner)
+    assert sizes == [hybrid_state.KV_CLEAR_CHUNK, hybrid_state.KV_CLEAR_CHUNK_LARGE]
+
+
 def test_kv_block_clearer_large_chunks_and_bounded_inflight(monkeypatch):
     """A long prompt's thousands of blocks take large chunks (small ones for the tail),
     and the clearer waits for its submissions every KV_CLEAR_MAX_INFLIGHT calls."""
