@@ -300,9 +300,9 @@ Logit validation against Hugging Face Transformers (FP32 reference,
 - **Run 2's code.** It used the final branch (MTP not enabled). No preemption occurred at 8
   requests per replica.
 - **Run 3** ran on Model Runner V2 (MTP and prefix caching not enabled), with one replica fewer.
-  Its shorter wall time is not a faster decode (a V2 step is about 8% slower than a V1 step on
-  a fixed workload, see the development notes): run 2 lost 13 requests to Aider's 3,600 s
-  timeout, run 3 two. 22 preemptions, no server errors.
+  Its shorter wall time is not a faster decode (V2 and V1 decode at the same speed on a fixed
+  workload, see the development notes): run 2 lost 13 requests to Aider's 3,600 s timeout, run 3
+  two. 22 preemptions, no server errors.
 
 ## Known limitations
 

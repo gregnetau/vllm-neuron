@@ -298,8 +298,8 @@ Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2
 
 - **Same quality as V1.** pass_rate_2 is within run-to-run variance of runs 1 and 2.
 - **Shorter, but not from faster steps.** About 52 tok/s per replica averaged over the run,
-  against about 22 in run 2, while a V2 step is about 8% slower than a V1 step on a fixed
-  workload (see [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s
+  against about 22 in run 2, while V2 and V1 decode at the same speed on a fixed workload
+  (see [Model runner](#model-runner)). Run 2 lost 13 requests to Aider's 3,600 s
   timeout (run 3: 2), and the long tail of the last exercises varies from run to run.
 - **22 preemptions** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`, no server errors.
 
@@ -438,6 +438,13 @@ Found on device:
   45k-token prompt allocated about 1,400 blocks in one step, cleared 8 per graph call; the
   runtime refused the next submission (`Execution Queue Full`). The clearer now also uses
   256-block calls and waits every 32 calls.
+- **KV-block clearing slowed every step.** Clearing new blocks before the forward, every few
+  decode steps with 32-token blocks, made the runtime switch NEFFs twice per clear (an 8-layer
+  runtime trace: 414 executions and 354 model switches where V1 had 309 and 126; device time of
+  the decode graph itself within 2.5% of V1's). Not clearing is wrong: stale K/V in reused
+  blocks changed the logit test's second prompt (K5 0.0201 to 0.061-0.069). Without prefix
+  caching V2 now clears a request's blocks when it is removed (one call per finished or
+  preempted request), which restores the numbers exactly and V1's step time.
 - **Compile cache.** `parallel_compile` compiles every captured HLO without a NEFF in the
   cache directory, also one left by an earlier failed run; delete such entries.
 - **`vllm serve` and the checkout.** The `vllm` launcher runs the venv's Python; a checkout
@@ -462,14 +469,14 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   time; 24 mixed requests 8 at a time without errors. Startup with a warm compile cache about
   19 minutes.
 - **Speed against V1** (same commit, same knobs, one freshly started replica each, greedy,
-  `ignore_eos`): time to first token equal; inter-token time 37.3 ms against 34.5 at B=1 (8k
-  prompt), 59.9 ms against 55.3 at B=8 (4k prompts), 125 ms against 115 at B=4 (30k prompts,
-  decode interleaved with the others' prefill chunks). V2 steps are about 8% slower (a V2
-  replica that had served the Aider run for 6 hours: 39.5 / 62.5 / 130 ms).
+  `ignore_eos`): equal. Inter-token time 35.5 ms against 35.2 at B=1 (8k prompt), 55.5 ms
+  against 55.6 at B=8 (4k prompts), 116 ms against 115 at B=4 (30k prompts, decode interleaved
+  with the others' prefill chunks); time to first token equal.
+  - Before KV blocks were cleared at free time, V2 steps were about 8% slower (37.3 / 59.9 /
+    125 ms) and the first token of a B=8 batch took longer: see "KV-block clearing" above.
   - Where a B=8 step goes on the host: input preparation 1.2 ms (overlapped with the previous
     step), the join's wait for the previous step 52 ms, host inputs 0.9 ms and the forward call
-    3.2 ms (2.5 with `VLLM_NEURON_SKIP_GUARD_EVAL=1`, which gains 0.7 ms per step). The host
-    bubble between steps is about 4 ms, so most of the gap is device time.
+    3.2 ms (2.5 with `VLLM_NEURON_SKIP_GUARD_EVAL=1`, which gains 0.7 ms per step).
 - **Aider Polyglot** (run 3 above): 86.7% after 2 tries in 5.5 h on 7 replicas.
 - **Preemption** under `VLLM_NEURON_MAX_KV_CONCURRENT=8`: 22 preemptions during the Aider run,
   no errors.
@@ -504,8 +511,8 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **Prefix caching on V1.** V2 serves it (align-mode checkpoints of the GDN and PLE state).
 - **Dense prefill with MTP on V2.** The compiler error above at `-O1` (worked around with
   `-O2` for that graph; repro: the captured HLO and command).
-- **V2 step time.** About 8% slower than V1 at B=1 and B=8, mostly on the device: profile the
-  adapter graph (in-graph input building and state commit) against V1's decode graph.
+- **Device profiles of the full model.** The runtime cannot allocate its profiler buffers next
+  to the 48-layer model and KV cache (HBM full); profile truncations, as above.
 - **Smaller costs:**
   - batch the GDN decode kernel's per-request instruction chains (~5 ms/step at B=8);
   - fix the gated-residual group RMSNorm layout (~2 ms/step at B=1);
