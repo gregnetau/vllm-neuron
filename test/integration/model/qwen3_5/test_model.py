@@ -13,6 +13,9 @@ Running (trn2.3xlarge, TP=4):
 
     QWEN3_5_MODEL_PATH=/path/to/Qwen3.8-27B \
     pytest test/integration/model/qwen3_5/test_model.py -v -s --timeout=10800
+
+Add ``VLLM_USE_V2_MODEL_RUNNER=1`` to run it on Model Runner V2, ``QWEN3_5_TP=2`` for
+Qwen3.5-2B (2 KV heads).
 """
 
 import os
@@ -21,6 +24,12 @@ import pytest
 import torch
 
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.8-27B")
+# Tensor parallelism (the KV heads must divide by it: Qwen3.5-2B has 2).
+TP_DEGREE = int(os.environ.get("QWEN3_5_TP", "4"))
+# Segmented prefill's KV segment size. Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) needs
+# segmented prefill for recurrent-state models, so it defaults to 1024 there; V1 to none.
+_V2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1"
+KV_SEGMENT = int(os.environ.get("QWEN3_5_KV_SEGMENT", "1024" if _V2 else "0"))
 
 PROMPTS = [
     "The color of the sky is",
@@ -118,7 +127,7 @@ def test_model_accuracy(batch_size: int, seq_len: int, monkeypatch) -> None:
     # required by logit validation (see the template).
     llm = LLM(
         model=MODEL_PATH,
-        tensor_parallel_size=4,
+        tensor_parallel_size=TP_DEGREE,
         max_model_len=seq_len,
         max_num_batched_tokens=seq_len,
         max_num_seqs=batch_size,
@@ -133,6 +142,7 @@ def test_model_accuracy(batch_size: int, seq_len: int, monkeypatch) -> None:
                 "on_device_sampling_config": {"all_greedy": True},
                 "num_batched_tokens_buckets": [seq_len],
                 "num_seqs_buckets": [batch_size],
+                **({"kv_segment_size_buckets": [KV_SEGMENT]} if KV_SEGMENT else {}),
             }
         },
     )

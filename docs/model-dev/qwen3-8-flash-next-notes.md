@@ -536,6 +536,10 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   500-24k words, 8 at a time), each followed by the hit/miss consistency check: all
   consistent, no errors, 12 preemptions, prefix-cache hit rate 35%.
 
+Qwen3.5 regression (the generic V1/V2 commits; Qwen3.5-2B, TP=2, 2026-10-30): the logit test
+(`test/integration/model/qwen3_5/test_model.py`, `QWEN3_5_TP=2`) passes on V1 and V2 at batch 1
+and 4, no divergent token; V1 gives the `qwen4_exp-upstream` branch's numbers to four decimals.
+
 ## Open work
 
 - **QSA verify rows.** MTP verify steps still mask the full context; a compact context of the
