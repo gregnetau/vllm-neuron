@@ -11130,8 +11130,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         partial_prefill_req_ids = set()
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        # A verify step (scheduled drafts) is a decode, never a prefill chunk. Under async
+        # spec decode req_state.num_tokens already counts the in-flight steps' accepted
+        # tokens (placeholders), so the count below would flag it and drop its tokens.
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens or {}
         for req_id in req_ids:
-            if req_id not in self.requests:
+            if req_id not in self.requests or spec_tokens.get(req_id):
                 continue
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
