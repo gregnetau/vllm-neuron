@@ -13,6 +13,8 @@ Running (trn2.3xlarge, TP=4):
 
     QWEN3_5_MODEL_PATH=/path/to/Qwen3.8-27B \
     pytest test/integration/model/qwen3_5/test_model.py -v -s --timeout=10800
+
+Qwen3.5-2B: QWEN3_5_TP=2.
 """
 
 import os
@@ -21,6 +23,8 @@ import pytest
 import torch
 
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.8-27B")
+# Tensor parallelism: 4 for Qwen3.8-27B on trn2.3xlarge, 2 for Qwen3.5-2B.
+TP = int(os.environ.get("QWEN3_5_TP", "4"))
 
 PROMPTS = [
     "The color of the sky is",
@@ -118,7 +122,7 @@ def test_model_accuracy(batch_size: int, seq_len: int, monkeypatch) -> None:
     # required by logit validation (see the template).
     llm = LLM(
         model=MODEL_PATH,
-        tensor_parallel_size=4,
+        tensor_parallel_size=TP,
         max_model_len=seq_len,
         max_num_batched_tokens=seq_len,
         max_num_seqs=batch_size,
