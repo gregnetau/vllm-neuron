@@ -536,9 +536,24 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
   500-24k words, 8 at a time), each followed by the hit/miss consistency check: all
   consistent, no errors, 12 preemptions, prefix-cache hit rate 35%.
 
-Qwen3.5 regression (the generic V1/V2 commits; Qwen3.5-2B, TP=2, 2026-10-30): the logit test
-(`test/integration/model/qwen3_5/test_model.py`, `QWEN3_5_TP=2`) passes on V1 and V2 at batch 1
-and 4, no divergent token; V1 gives the `qwen4_exp-upstream` branch's numbers to four decimals.
+Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
+- **Logit test** (`test/integration/model/qwen3_5/test_model.py`) passes on V1 and V2 at batch
+  1 and 4, no divergent token, for Qwen3.8-27B (TP=4) and Qwen3.5-2B (`QWEN3_5_TP=2`); V1 gives
+  the `qwen4_exp-upstream` branch's numbers to four decimals.
+- **V1 MTP was broken by `ddfcba8`** (preemption under `VLLM_NEURON_MAX_KV_CONCURRENT`, on
+  `qwen4_exp-upstream`): Qwen3.8-27B with MTP 2 and the recipe's `serve.sh` dropped tokens
+  ("OrderedDictUCache:"); `qwen3_5-upstream` and the commit before were correct (bisected on
+  device). Its partial-prefill check (`num_computed + num_scheduled < num_tokens`, to keep a
+  resumed request's recompute from emitting tokens) also flagged verify steps under async
+  scheduling, whose token count already holds the in-flight steps' accepted tokens, and
+  discarded their tokens. Fixed: a step with scheduled drafts is never a partial prefill. MTP
+  then equals plain decode up to BF16 ties (gap 0.000 and 0.125), 24 ms/token at batch 1. V2
+  was not affected.
+- **Qwen3.5-2B** with MTP hits an out-of-bounds access on device on this branch, on
+  `qwen4_exp-upstream` and (V1) on `qwen3_5-upstream` too, outside the recipe's configuration
+  (`max_model_len` 65536, `kv_segment_size_buckets`); 27B in that configuration as well, while
+  the recipe's `serve.sh` serves it. Its XLA-route compile errors at batch 8 and with a 4096
+  prefill bucket (NCC_ITRF901 / NCC_IGCA044) are known (2B is served on the native route).
 
 ## Open work
 

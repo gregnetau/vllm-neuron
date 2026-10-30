@@ -122,3 +122,40 @@ def test_overcommitted_requests_preempt_and_finish(monkeypatch, tmp_path):
     assert preempted, "the KV cache was expected to run out"
     assert empty_steps < 10
     assert [len(r.output_token_ids) for r in requests] == [200] * 4
+
+
+def test_partial_prefill_ids_resumed_recompute_but_not_verify_steps():
+    """V1 runner: a request resumed after preemption is a partial prefill until its output
+    tokens are recomputed too, but a verify step (scheduled drafts) never is, even when the
+    runner's token count is ahead of it (async spec decode counts the in-flight steps'
+    accepted tokens): flagging it dropped the step's tokens."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+    def state(prompt, outputs):
+        return SimpleNamespace(
+            num_prompt_tokens=prompt, num_tokens=prompt + outputs
+        )
+
+    runner = SimpleNamespace(
+        requests={
+            "verify": state(100, 12),  # 3 tokens ahead of computed + scheduled
+            "resumed": state(100, 40),  # recomputing prompt and outputs
+            "resumed_last": state(100, 40),
+        },
+        input_batch=SimpleNamespace(
+            req_id_to_index={"verify": 0, "resumed": 1, "resumed_last": 2},
+            num_computed_tokens_cpu=np.array([106, 64, 128]),
+        ),
+    )
+    so = SimpleNamespace(
+        num_scheduled_tokens={"verify": 3, "resumed": 64, "resumed_last": 12},
+        scheduled_spec_decode_tokens={"verify": [7, 8]},
+    )
+    partial = NeuronModelRunner._get_partial_prefill_req_ids(
+        runner, so, ["verify", "resumed", "resumed_last"]
+    )
+    assert partial == {"resumed"}
