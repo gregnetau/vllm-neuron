@@ -105,8 +105,6 @@ def test_hybrid_defaults_to_v1_and_is_honored_when_forced(monkeypatch):
             },
             "speculative decoding with debug logits",
         ),
-        # Single-shot prefill: no segmented prefill resolves.
-        ({"max_batched": 2048}, "recurrent-state model without segmented prefill"),
         # max_num_batched_tokens not a supported segment size.
         ({"max_batched": 768}, "recurrent-state model without segmented prefill"),
         (
@@ -308,3 +306,13 @@ def test_mtp_on_the_qwen3_5_moe_checkpoint(tmp_path, monkeypatch):
     )
     assert _decide(monkeypatch, cfg, forced=False) == (False, None)
     assert _decide(monkeypatch, cfg, forced=True) == (True, None)
+
+
+def test_hybrid_single_shot_prefill_is_served_on_v2(monkeypatch):
+    """Every prompt fits one prefill chunk (max_num_batched_tokens >= max_model_len), so no
+    chunk needs segmented attention: V2 serves it when forced."""
+    cfg = _vllm_config(max_batched=2048)
+    unsupported = policy.get_neuron_model_runner_v2_policy(cfg).unsupported_features
+    assert "recurrent-state model without segmented prefill" not in unsupported
+    use_v2, error = _decide(monkeypatch, cfg, forced=True)
+    assert use_v2 and error is None

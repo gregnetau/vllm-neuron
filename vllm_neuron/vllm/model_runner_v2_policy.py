@@ -89,6 +89,21 @@ def _serves_text_only(model_config: object) -> bool:
     return _model_cls_implements(model_config, "ServesTextOnly")
 
 
+def _prefills_in_one_chunk(vllm_config: object) -> bool:
+    """Whether every prompt prefills in one step (max_num_batched_tokens >= max_model_len)."""
+    max_model_len = getattr(
+        getattr(vllm_config, "model_config", None), "max_model_len", None
+    )
+    max_batched = getattr(
+        getattr(vllm_config, "scheduler_config", None), "max_num_batched_tokens", None
+    )
+    return (
+        isinstance(max_model_len, int)
+        and isinstance(max_batched, int)
+        and max_batched >= max_model_len
+    )
+
+
 def _resolves_segmented_prefill(vllm_config: object, neuron_cfg: dict) -> bool:
     """Whether the V2 runner resolves segmented (chunked) prefill for a configuration.
 
@@ -312,9 +327,12 @@ def get_neuron_model_runner_v2_policy(
             dense_generate = False
             if neuron_envs.VLLM_NEURON_SHARED_STATE_POOL:
                 unsupported.append("shared recurrent-state pool")
+            # A prompt longer than one prefill chunk needs segmented attention for every chunk
+            # after the first. Single-shot prefill (every prompt fits one chunk, starting from
+            # zero state) needs none.
             if not _resolves_segmented_prefill(
                 vllm_config, _neuron_config_dict(vllm_config)
-            ):
+            ) and not _prefills_in_one_chunk(vllm_config):
                 unsupported.append("recurrent-state model without segmented prefill")
 
     if getattr(vllm_config, "diffusion_config", None) is not None:
