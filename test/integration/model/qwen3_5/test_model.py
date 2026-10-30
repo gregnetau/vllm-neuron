@@ -14,7 +14,9 @@ Running (trn2.3xlarge, TP=4):
     QWEN3_5_MODEL_PATH=/path/to/Qwen3.8-27B \
     pytest test/integration/model/qwen3_5/test_model.py -v -s --timeout=10800
 
-Qwen3.5-2B: QWEN3_5_TP=2.
+Other checkpoints: QWEN3_5_TP=2 for Qwen3.5-2B; Qwen3.5-35B-A3B (sparse MoE) at the default
+TP=4 uses the MoE Hugging Face class for the reference. VLLM_USE_V2_MODEL_RUNNER=1 runs the
+same validation on Model Runner V2.
 """
 
 import os
@@ -23,7 +25,7 @@ import pytest
 import torch
 
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.8-27B")
-# Tensor parallelism: 4 for Qwen3.8-27B on trn2.3xlarge, 2 for Qwen3.5-2B.
+# Tensor parallelism: 4 for Qwen3.8-27B and Qwen3.5-35B-A3B on trn2.3xlarge, 2 for Qwen3.5-2B.
 TP = int(os.environ.get("QWEN3_5_TP", "4"))
 
 PROMPTS = [
@@ -65,9 +67,14 @@ def _load_text_model(model_checkpoint, dtype, config=None):
     """Load only the text tower (Qwen3_5ForCausalLM) of the published checkpoint; the vision
     tower and MTP head do not take part in the logits and would add host memory."""
     from transformers import AutoConfig
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
     text_config = AutoConfig.from_pretrained(model_checkpoint).text_config
+    if text_config.model_type == "qwen3_5_moe_text":
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeForCausalLM as Qwen3_5ForCausalLM,
+        )
+    else:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     model = Qwen3_5ForCausalLM.from_pretrained(
         model_checkpoint, config=text_config, dtype=dtype, low_cpu_mem_usage=True
     )
