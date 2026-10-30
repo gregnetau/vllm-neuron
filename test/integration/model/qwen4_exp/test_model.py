@@ -43,6 +43,10 @@ KV_CACHE_DTYPE = os.environ.get("QWEN4_EXP_KV_CACHE_DTYPE", "auto")
 # segmented prefill for recurrent-state models, so it defaults to 1024 there; V1 to none.
 _V2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1"
 KV_SEGMENT = int(os.environ.get("QWEN4_EXP_KV_SEGMENT", "1024" if _V2 else "0"))
+# neuronx-cc optimization level (vLLM optimization_level). On V2 the 2048-token prefill graph
+# fails to compile at -O1 (NCC_INLA001, more than 8 activation tables in one instruction); the
+# native route defaults to -O2, the XLA route to -O1, so V2 asks for 2.
+OPT_LEVEL = os.environ.get("QWEN4_EXP_OPTLEVEL") or ("2" if _V2 else None)
 
 # The rendered prompts are part of the golden cache key: any edit invalidates cached goldens.
 MESSAGES = [
@@ -213,6 +217,7 @@ def test_model_accuracy(batch_size: int, seq_len: int) -> None:
         kv_cache_dtype=KV_CACHE_DTYPE,
         limit_mm_per_prompt={"image": 0, "video": 0},
         hf_overrides=hf_overrides,
+        **({"optimization_level": OPT_LEVEL} if OPT_LEVEL else {}),
         additional_config={
             "neuron_config": {
                 "on_device_sampling_config": {"all_greedy": True},
