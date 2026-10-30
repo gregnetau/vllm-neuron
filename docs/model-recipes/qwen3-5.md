@@ -422,6 +422,9 @@ QWEN3_5_MODEL_PATH=<path-to-checkpoint>/Qwen3.8-27B \
     pytest test/integration/model/qwen3_5/test_model.py -v -s
 ```
 
+Re-validated on 2026-10-30 at this branch (trn2.3xlarge, Neuron SDK 2.33): Qwen3.8-27B (TP=4) and
+Qwen3.5-2B (`QWEN3_5_TP=2`) both pass at batch 1 and 4.
+
 The Hugging Face reference runs on CPU and needs about 110 GB of host memory for its FP32 pass;
 it is cached on disk after the first run. Its top-K bounds are wider than the template's BF16
 defaults for one ill-conditioned token, where Hugging Face's own BF16 model has a larger error
