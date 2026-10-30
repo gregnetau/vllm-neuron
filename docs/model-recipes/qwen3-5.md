@@ -598,6 +598,13 @@ QWEN3_5_MODEL_PATH=<path-to-checkpoint>/Qwen3.8-27B \
 
 Re-validated on 2026-10-30 at this branch (trn2.3xlarge, Neuron SDK 2.33): Qwen3.8-27B (TP=4) and
 Qwen3.5-2B (`QWEN3_5_TP=2`) both pass at batch 1 and 4.
+With `VLLM_USE_V2_MODEL_RUNNER=1` the same test passes for both checkpoints on Model Runner V2
+(single-shot 2048-token prefill). For Qwen3.5-35B-A3B the FP32 Hugging Face reference needs about
+140 GB of host memory, more than a trn2.3xlarge has; its BF16 next-token distributions match
+Hugging Face's within about 0.2 nats on natural prompts. Some contexts are ill-conditioned for the
+MoE router (top-8 of 256 experts nearly tied): there the next token moves by several nats with any
+small numeric change, including Hugging Face's own router computed in FP32 instead of BF16, so a
+greedy comparison against any reference can diverge at such a position.
 
 The Hugging Face reference runs on CPU and needs about 110 GB of host memory for its FP32 pass;
 it is cached on disk after the first run. Its top-K bounds are wider than the template's BF16
