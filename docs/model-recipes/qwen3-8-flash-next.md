@@ -327,6 +327,8 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
   16 requests; larger batches use a slower torch path. With MTP on V2, leave the compiler
   optimization level at its default: the model compiles the dense prefill graph with the MTP
   head at `-O2` (neuronx-cc 2.28 fails it at `-O1`), and an explicit level overrides that.
+- **A 2048-token prefill bucket on Model Runner V2** compiles only at `-O2` (NCC_INLA001 at
+  `-O1`); the default buckets (1024, 4096) compile at `-O1`.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** reduces accuracy (the e4m3 rounding; see [FP8](#fp8)).

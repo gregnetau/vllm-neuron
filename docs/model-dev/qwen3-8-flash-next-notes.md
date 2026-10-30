@@ -488,7 +488,11 @@ host-built rows against the graph's and the host copy against the device state.
 
 Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 - **Logit test** (`test/integration/model/qwen4_exp/test_model.py`): passes on V2 and V1 at
-  batch 1 and batch 4 (2026-10-29), no divergent token. Its references now hold the FP8
+  batch 1 and batch 4 (2026-10-29/30), no divergent token, on the native and the XLA route
+  (`VLLM_NEURON_BACKEND=vllm_neuron`, as `serve.sh`). On the XLA route V2 compiles its
+  2048-token prefill graph only at `-O2` (NCC_INLA001 at `-O1`: more than 8 activation tables
+  in one instruction; repro `ncc_inla001_qwen4exp_v2_prefill2048.tgz`), so the test asks for
+  `-O2` on V2 (`QWEN4_EXP_OPTLEVEL`); the serving buckets (1024, 4096) compile at `-O1`. Its references now hold the FP8
   experts the model serves (`_round_experts_to_fp8`, the loader's own per-channel
   quantization, bit-identical to the served weights). Against the BF16-expert references, V2,
   V1 and the `qwen4_exp-upstream` branch (before any V2 work) all failed 2 of 4 prompts with the
@@ -538,8 +542,9 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28):
 
 Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
 - **Logit test** (`test/integration/model/qwen3_5/test_model.py`) passes on V1 and V2 at batch
-  1 and 4, no divergent token, for Qwen3.8-27B (TP=4) and Qwen3.5-2B (`QWEN3_5_TP=2`); V1 gives
-  the `qwen4_exp-upstream` branch's numbers to four decimals.
+  1 and 4, no divergent token: Qwen3.8-27B (TP=4) on the native and the XLA route, Qwen3.5-2B
+  (`QWEN3_5_TP=2`) on the native route. V1 gives the `qwen4_exp-upstream` branch's numbers to
+  four decimals on both routes.
 - **V1 MTP was broken by `ddfcba8`** (preemption under `VLLM_NEURON_MAX_KV_CONCURRENT`, on
   `qwen4_exp-upstream`): Qwen3.8-27B with MTP 2 and the recipe's `serve.sh` dropped tokens
   ("OrderedDictUCache:"); `qwen3_5-upstream` and the commit before were correct (bisected on
@@ -549,11 +554,14 @@ Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
   discarded their tokens. Fixed: a step with scheduled drafts is never a partial prefill. MTP
   then equals plain decode up to BF16 ties (gap 0.000 and 0.125), 24 ms/token at batch 1. V2
   was not affected.
-- **Qwen3.5-2B** with MTP hits an out-of-bounds access on device on this branch, on
-  `qwen4_exp-upstream` and (V1) on `qwen3_5-upstream` too, outside the recipe's configuration
-  (`max_model_len` 65536, `kv_segment_size_buckets`); 27B in that configuration as well, while
-  the recipe's `serve.sh` serves it. Its XLA-route compile errors at batch 8 and with a 4096
-  prefill bucket (NCC_ITRF901 / NCC_IGCA044) are known (2B is served on the native route).
+- **Compile routes.** `VLLM_NEURON_BACKEND` defaults to the native route; `serve.sh` (both
+  models) selects the XLA route (`vllm_neuron`), and the logit tests take whichever the
+  environment sets. MTP on the native route hits an out-of-bounds access on device during warmup
+  or the first request, for Qwen3.8-27B on every branch tried (this one, `qwen4_exp-upstream`,
+  `qwen3_5-upstream`, `qwen3_5-mrv2`) and for Qwen3.5-2B on this branch and
+  `qwen4_exp-upstream` (`qwen3_5-mrv2` serves 2B); not investigated further. Qwen3.5-2B on the
+  native route also fails to compile at batch 8 and with a 4096-token prefill bucket
+  (NCC_ITRF901 / NCC_IGCA044).
 
 ## Open work
 
