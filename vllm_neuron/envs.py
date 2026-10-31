@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     # inference, which V2 does not support yet).
     VLLM_NEURON_ALLOW_V2_WIDE_EP: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
+    VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT: int = 21600
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # Select a guard filter for torch.compile. See
     # get_precompile_guard_filter_fn(). "" keeps every guard.
@@ -297,6 +298,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tp_barrier timeout in seconds (raise for long serial warmups)
     "VLLM_NEURON_BARRIER_TIMEOUT": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_BARRIER_TIMEOUT")) or 3600
+    ),
+    # tp_barrier timeout in seconds after native-route graph extraction, which compiles every
+    # NEFF in-rank: a large prefill graph can take over an hour, and ranks finish apart.
+    # VLLM_NEURON_BARRIER_TIMEOUT, when set, wins.
+    "VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT"))
+        or 21600
     ),
     # Offset for the MPExecutor collective and root-comm base ports. `make test`
     # sets a different offset per concurrent build-time pass to prevent a
