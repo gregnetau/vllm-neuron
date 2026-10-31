@@ -342,8 +342,19 @@ def _radix_search(
     return lo
 
 
+def _bitcast_lowers() -> bool:
+    """Whether ``Tensor.view(torch.int32)`` lowers: the native route (torch.compile) and CPU;
+    not the XLA route."""
+    from vllm_neuron import envs
+
+    return envs.is_native_backend()
+
+
 def topk_block_mask(
-    scores: torch.Tensor, k: torch.Tensor, radix_bits: int = 1
+    scores: torch.Tensor,
+    k: torch.Tensor,
+    radix_bits: int = 1,
+    int_bits: bool | None = None,
 ) -> torch.Tensor:
     """Exact top-k as a bool mask, without sort: ``[..., N]`` -> ``[..., N]``.
 
@@ -351,6 +362,12 @@ def topk_block_mask(
     k: int32 ``[...]`` per-row count, at most the number of eligible entries.
     radix_bits: bits resolved per pass (2**r - 1 thresholds tested at once). 1 = bisection,
         the default: on trn2 r = 5 was ~10x slower for decode (B=8, 64k context) than r = 1.
+    int_bits: compare the scores' int32 bit patterns with each threshold (one bitcast)
+        instead of rebuilding every threshold as fp32 (``_bits_to_float``, ~130 ops per pass
+        and 87% of the selection's ops: the native route's compiler front end then spends
+        hours on a 4096-token prefill graph). The same order for scores >= 0, so the same
+        mask; negative scores and -0.0 have negative patterns and are never counted. None:
+        where the bitcast lowers (``_bitcast_lowers``).
     Selects every score above the k-th largest value v and, among the scores equal to v,
     the lowest-index ones, so exactly k entries per row. All ops are compare / count /
     where on static shapes: ceil(31 / r) + ceil(log2(N) / r) passes, each testing
@@ -364,9 +381,19 @@ def topk_block_mask(
     # 1) v = the k-th largest value. For x >= 0 the int32 bit pattern is monotone in x, so
     #    v's bits = the largest t in [0, 2**31) with count(scores >= t) >= k. Patterns at or
     #    above +inf map to +inf and count 0. k == 0 gives +inf: nothing selected.
-    def value_ok(t):
-        thr = _bits_to_float(t).unsqueeze(-1)  # [..., m, 1]
-        return (s >= thr).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
+    if int_bits is None:
+        int_bits = _bitcast_lowers()
+    if int_bits:
+        s_bits = scores.contiguous().view(torch.int32).unsqueeze(-2)  # [..., 1, N]
+
+        def value_ok(t):
+            return (s_bits >= t.unsqueeze(-1)).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
+
+    else:
+
+        def value_ok(t):
+            thr = _bits_to_float(t).unsqueeze(-1)  # [..., m, 1]
+            return (s >= thr).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
 
     v = _bits_to_float(_radix_search(value_ok, 31, k, r)).unsqueeze(-1)
     gt = scores > v

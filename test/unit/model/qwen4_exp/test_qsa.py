@@ -149,9 +149,10 @@ def test_rope_matches_hf(tiny_hf_model):
     torch.testing.assert_close(sin, sin_hf[0], atol=1e-6, rtol=0)
 
 
+@pytest.mark.parametrize("int_bits", [False, True], ids=["fp32-thresholds", "int-bits"])
 @pytest.mark.parametrize("radix_bits", [1, 2, 5])
 @pytest.mark.parametrize("N", [1, 2, 7, 64, 1000])
-def test_topk_block_mask_exact(N, radix_bits):
+def test_topk_block_mask_exact(N, radix_bits, int_bits):
     g = torch.Generator().manual_seed(N)
     # heavy ties: many exact zeros and repeated values, -1 = ineligible
     s = torch.randint(0, 4, (6, N), generator=g).float() * 0.5
@@ -162,13 +163,36 @@ def test_topk_block_mask_exact(N, radix_bits):
     eligible = (s >= 0).sum(-1)
     for budget in (0, 1, 3, 512):
         k = eligible.clamp(max=budget)
-        m = qsa.topk_block_mask(s, k, radix_bits)
+        m = qsa.topk_block_mask(s, k, radix_bits, int_bits=int_bits)
         for r in range(6):
             kk = int(k[r])
             ref = torch.zeros(N, dtype=torch.bool)
             if kk:
                 ref[_stable_topk(s[r], kk).indices] = True
             assert torch.equal(m[r], ref), (N, budget, r)
+
+
+@pytest.mark.parametrize("N", [64, 1024, 16384])
+def test_topk_block_mask_int_bits_equals_fp32_thresholds(N):
+    """The int32 bit-pattern comparison (native route) selects exactly what the fp32
+    thresholds select (XLA route), over a wide range of magnitudes, heavy ties, zeros, -0.0
+    and ineligible (-1) entries, at every k."""
+    g = torch.Generator().manual_seed(N + 1)
+    rows = 16
+    mag = torch.exp(torch.empty(rows, N).uniform_(-80, 80, generator=g))  # 1e-35 .. 1e35
+    s = mag * torch.randint(1, 5, (rows, N), generator=g).float()
+    s[1] = torch.round(s[1].clamp(max=8.0))  # ties
+    s[2] = 0.0
+    s[3, ::3] = -0.0
+    s[4, : N // 2] = -1.0
+    s[5] = torch.where(torch.rand(N, generator=g) < 0.5, s[5], torch.zeros(()))
+    eligible = (s >= 0).sum(-1)
+    for k in sorted({0, 1, 2, 7, 128, 2048, N // 2, N}):
+        kk = eligible.clamp(max=k).to(torch.int32)
+        a = qsa.topk_block_mask(s, kk, int_bits=False)
+        b = qsa.topk_block_mask(s, kk, int_bits=True)
+        assert torch.equal(a, b), (N, k)
+        assert torch.equal(b.sum(-1), kk.to(torch.int64)), (N, k)
 
 
 def test_dense_shortcut():
