@@ -61,6 +61,17 @@ from vllm_neuron.vllm.worker.neuron_profiler import (
 
 logger = logging.getLogger(__name__)
 
+
+def _graph_extraction_barrier_timeout(native_compile_only: bool) -> timedelta | None:
+    """The barrier timeout after graph extraction. On the native route extraction compiles
+    every NEFF in-rank (one rank per graph, the others wait on its cache lock), so a large
+    prefill graph can take over an hour and ranks reach the barrier apart: wait
+    ``VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT`` unless ``VLLM_NEURON_BARRIER_TIMEOUT`` is
+    set. None: the default barrier timeout."""
+    if not native_compile_only or "VLLM_NEURON_BARRIER_TIMEOUT" in os.environ:
+        return None
+    return timedelta(seconds=envs.VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT)
+
 # Largest GIL switch interval this accepts, in seconds. CPython's own default is 0.005 s, and the
 # point of the knob is to go shorter, so anything above a second is a typo rather than a setting.
 _MAX_GIL_SWITCH_INTERVAL_S = 1.0
@@ -1645,7 +1656,7 @@ class NeuronWorker(WorkerBase):
                 native_compile_only=native_compile_only,
             )
             logger.info("Barrier: waiting for all ranks to finish graph extraction")
-            tp_barrier()
+            tp_barrier(_graph_extraction_barrier_timeout(native_compile_only))
             if not native_compile_only:
                 # graph.hlo -> XLA compilation. Native fork workers have
                 # already persisted their StableHLO-derived NEFFs.

@@ -39,6 +39,14 @@ if (envs.VLLM_NEURON_MEGA_DMA_ORDER_CONSTRAINTS_FILE or "").strip():
     for _name, _value in _MEGA_DMA_ORDER_KERNEL_FLAGS.items():
         os.environ.setdefault(_name, _value)
 
+# Native route (torch.compile): a rank that needs a NEFF another rank is compiling waits on its
+# cache lock for TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT (torch-neuronx default 1200 s), then
+# compiles it itself. A large prefill graph takes longer than that, so every rank compiled it
+# at once and they finished over an hour apart. Seeded here so every process inherits it; an
+# explicit value wins.
+if envs.is_native_backend():
+    os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "21600")
+
 # Initialize logging early so VLLM_NEURON_LOG_LEVEL takes effect
 from vllm_neuron.logging_config import setup_logging as _setup_logging
 
