@@ -331,13 +331,14 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
   head at `-O2` (neuronx-cc 2.28 fails it at `-O1`), and an explicit level overrides that.
 - **A 2048-token prefill bucket on Model Runner V2** compiles only at `-O2` (NCC_INLA001 at
   `-O1`); the default buckets (1024, 4096) compile at `-O1`.
-- **Native compile route** (`BACKEND=neuron_native`): plain decode and prefix caching serve (Aider run
-  5), but prefill is about 28% slower than on the XLA route (time to first token 7.3 s against
+- **Native compile route** (`BACKEND=neuron_native`): plain decode serves (Aider run 5), but prefill
+  is about 28% slower than on the XLA route (time to first token 7.3 s against
   5.7 s at B=1, 8k tokens) and decode 2-20% slower (36.2 / 62.1 / 139 ms against 35.5 / 55.5 /
   116 ms at B=1 / B=8 / B=4 with 30k prompts). Set `NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=2`
-  when several replicas load at once (each rank traces its graphs in forked processes). MTP does
-  not serve on this route yet: its verify graphs need more than 24 GB of HBM (NCC_EOOM002) after
-  about 4 h of compilation each.
+  when several replicas load at once (each rank traces its graphs in forked processes). MTP at
+  65,536 tokens does not fit the 24 GB of HBM on this route (its graphs need about 0.5 GB more
+  than on the XLA route); use the XLA route (`serve.sh`) for MTP. A cold start with MTP compiles
+  for about 75 min; the plugin raises the compile-cache lock and barrier timeouts for that.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** reduces accuracy (the e4m3 rounding; see [FP8](#fp8)).

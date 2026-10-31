@@ -582,10 +582,35 @@ Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
   per graph and rank, 11 per rank by default) copied the table, filling the 2 TB host. The host
   inputs now live outside the module (e7a4e9a): one V2 server peaks at 218 GB of host memory with
   2 trace processes per rank, 548 GB with the default. Plain V2 serving then works (Aider run 5).
-  With MTP the 8 verify graphs fail: about 4 h each in the compiler front end, then
-  `NCC_EOOM002` (27 GB peak HBM against 24 GB, 39.4 GB of I/O tensors), with `--model-type`
-  `generic` or `transformer` and at `-O1` or `-O2` alike; the XLA route compiles them in about
-  20 minutes. MTP on the native route hits an out-of-bounds access on device during warmup
+  With MTP (64k configuration, 11 graphs per rank) warmup first timed out, for three reasons
+  found in turn:
+  - *One graph compiled for hours.* The 4096-token prefill graph with the MTP drafter (665k
+    ops, 74% of them the QSA top-k bisection's fp32 thresholds, `_bits_to_float`, 20% the GDN
+    chunk loop) spent 3 h 51 min in neuronx-cc's HierarchySplitter, which the native backend
+    always enables (`stablehlo.hierarchy_splitter_compatible`; the XLA route compiles the same
+    computation, an HLO proto without that attribute, in 22 min). The splitter grows faster than
+    the square of the op count. Since f16c1bc the native route bisects over the scores' int32
+    bit patterns (same mask, same logit-test errors to four decimals): a cold compile of all 11
+    graphs takes 74 min. Without the attribute neuronx-cc fails this graph's ISA validation
+    (NCC_IINAR001, at `-O1` and `-O2`; repro `ncc_iinar001_qwen4exp_native_prefill4096.tgz`).
+  - *Every rank compiled it.* A rank waits for another's compile of the same graph for at most
+    `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT` (1200 s), then compiles it itself: 8 contending
+    compiles of one graph, finishing over an hour apart. With the timeout raised one rank
+    compiles it (measured on a 4-layer truncation: no skew, 1719 s against 3230 s).
+  - *The ranks then missed the barrier* after graph extraction (`VLLM_NEURON_BARRIER_TIMEOUT`,
+    3600 s).
+  With both timeouts raised (the defaults on the native route since 289a763) it compiles, but no
+  64k configuration fits the 24 GB of HBM through batch 8: the native NEFFs carry 1.1-1.9 GB of
+  code and up to 2.4 GB of scratchpad next to 19.2-19.7 GB of weights and KV, about 0.5 GB more
+  than the XLA route, so loading or the first batch-8 steps fail to allocate (all four prefill
+  and decode buckets at 0.82; no decode context buckets at 0.82 or 0.80; 1024-token prefill
+  only with or without decode buckets at 0.80; `NEURON_RT_IO_RING_CACHE_SIZE=4` changes nothing).
+  Correctness is fine: with 1024-token prefill chunks, no decode buckets and 0.80, greedy
+  outputs at batch 1 equal plain native decode up to BF16 ties (gaps 0.000, 0.000, 0.250;
+  needles at 12k and 30k identical), 84% of drafts accepted. An earlier reading of this failure
+  as an HBM overflow of the verify graphs (`NCC_EOOM002`) was wrong: that came from standalone
+  recompiles of the prefill graph with other flags, whose "39.4 GB of I/O tensors" counts the
+  inputs once per physical core; graph I/O is aliased as on the XLA route. MTP on the native route hits an out-of-bounds access on device during warmup
   or the first request, for Qwen3.8-27B on every branch tried (this one, `qwen4_exp-upstream`,
   `qwen3_5-upstream`, `qwen3_5-mrv2`) and for Qwen3.5-2B on this branch and
   `qwen4_exp-upstream` (`qwen3_5-mrv2` serves 2B); not investigated further. Qwen3.5-2B on the
