@@ -331,6 +331,26 @@ against 200k):
   request's own blocks matches HF on CPU (`test_preemption_with_prefix_caching_matches_hf`).
 - **175 preemptions** (hit rate 10-18% per replica), no server errors.
 
+### Run 5 on Model Runner V2, native compile route (2026-10-31)
+
+Run 3's configuration on the native route (`BACKEND=neuron_native`, `torch.compile`; `serve.sh`
+selects the XLA route otherwise), 6 replicas on cores 16-63 started 5 minutes apart with
+`NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=2`, 48 Aider threads:
+
+| Metric | Value |
+|---|---|
+| pass_rate_1 / pass_rate_2 | 48.9 / 87.6 (110 / 197) |
+| percent_cases_well_formed | 98.7 |
+| error_outputs | 17 (13 exhausted context windows) |
+| prompt / completion tokens | 3,066,071 / 6,076,043 |
+| wall time | 5.1 h (about 330 tok/s average, 6 replicas) |
+
+- **Same quality as the XLA runs** (194-197 of 225 after 2 tries, except run 4's 191).
+- **Slower steps.** One replica on an idle host, same benchmark as the speed comparison under
+  [Model runner](#model-runner): inter-token 36.2 / 62.1 / 139 ms at B=1 / B=8 / B=4 with 30k
+  prompts (XLA route: 35.5 / 55.5 / 116), time to first token 7.3 / 16.5 / 73.7 s (5.7 / 12.9 /
+  57.5).
+
 ## Device validation (2026-10-26)
 
 Full 48-layer FP8 model on trn2.48xlarge unless noted.
@@ -556,7 +576,16 @@ Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
   was not affected.
 - **Compile routes.** `VLLM_NEURON_BACKEND` defaults to the native route; `serve.sh` (both
   models) selects the XLA route (`vllm_neuron`), and the logit tests take whichever the
-  environment sets. MTP on the native route hits an out-of-bounds access on device during warmup
+  environment sets. On the native route Qwen3.8-Flash-Next first failed to start: `torch.compile`
+  pickles what the model module reaches for its guard state, which included the host n-gram
+  table and its thread pool (`cannot pickle '_queue.SimpleQueue'`), and every trace process (one
+  per graph and rank, 11 per rank by default) copied the table, filling the 2 TB host. The host
+  inputs now live outside the module (e7a4e9a): one V2 server peaks at 218 GB of host memory with
+  2 trace processes per rank, 548 GB with the default. Plain V2 serving then works (Aider run 5).
+  With MTP the 8 verify graphs fail: about 4 h each in the compiler front end, then
+  `NCC_EOOM002` (27 GB peak HBM against 24 GB, 39.4 GB of I/O tensors), with `--model-type`
+  `generic` or `transformer` and at `-O1` or `-O2` alike; the XLA route compiles them in about
+  20 minutes. MTP on the native route hits an out-of-bounds access on device during warmup
   or the first request, for Qwen3.8-27B on every branch tried (this one, `qwen4_exp-upstream`,
   `qwen3_5-upstream`, `qwen3_5-mrv2`) and for Qwen3.5-2B on this branch and
   `qwen4_exp-upstream` (`qwen3_5-mrv2` serves 2B); not investigated further. Qwen3.5-2B on the
