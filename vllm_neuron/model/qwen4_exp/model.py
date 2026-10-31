@@ -34,6 +34,7 @@ replicated with all-reduce.
 
 import logging
 import math
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -63,6 +64,12 @@ logger = logging.getLogger(__name__)
 
 CKPT = W.TEXT_PREFIX  # "model.language_model."
 _loader = Q._loader
+
+# Each model's host n-gram inputs (ngram.HostPLEInputs), kept off the module: torch.compile's
+# guard serialization (native route) pickles what the module's __dict__ reaches, and the table
+# (memory-mapped shards, a gather thread pool) cannot be pickled, nor copied into every trace
+# process. The graph never reads it; the runner calls build_host_inputs on the host.
+_HOST_PLE: "weakref.WeakKeyDictionary[nn.Module, object]" = weakref.WeakKeyDictionary()
 
 
 def group_rmsnorm(x: torch.Tensor, gamma: torch.Tensor, group: int, eps: float):
@@ -1259,6 +1266,18 @@ def load_rank_weights(
 @async_speculative_decoding
 class Qwen4ExpForCausalLM(nn.Module):
     """Qwen3.8-Flash-Next text model + column-parallel LM head (untied)."""
+
+    @property
+    def _host_ple(self):
+        """ngram.HostPLEInputs (set by load_weights), held outside the module (_HOST_PLE)."""
+        return _HOST_PLE.get(self)
+
+    @_host_ple.setter
+    def _host_ple(self, value) -> None:
+        if value is None:
+            _HOST_PLE.pop(self, None)
+        else:
+            _HOST_PLE[self] = value
 
     def __init__(self, config: Qwen4ExpConfig):
         super().__init__()
