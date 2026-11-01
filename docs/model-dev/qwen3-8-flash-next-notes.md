@@ -637,6 +637,16 @@ check (each question alone vs all four at once) flags one question: its 73rd tok
 top-2 tie at batch 1 (gap 0.000) that batch 4 breaks the other way (0.125), as between batch
 sizes elsewhere.
 
+QSA top-k compares (fa4a888, 2026-11-01): the int32 bit-pattern compares of f16c1bc lowered
+to GpSimd tensor-tensor ops, the whole native/XLA prefill gap on a 4-layer truncation (device
+profiles); both routes now compare fp32 (thresholds bitcast back where the bitcast lowers) and
+the tie-break runs on fp32 indices. XLA route against the previous commit: greedy outputs
+identical on 10 Aider transcripts of 3k-39k tokens, needles 6 of 6, logit test passes; time to
+first token 4.84 / 10.98 / 48.3 s (was 5.73 / 13.0 / 57.4) at B=1 8k / B=8 4k / B=4 30k,
+inter-token 34.9 / 53.4 / 104 ms (34.9 / 55.0 / 115). Native route: time to first token 6.51 /
+14.70 / 65.3 s (8.26 / 18.64 / 83.0). Native-route 2-hour soak of plain V2 (84298d4): 15
+rounds consistent, no serving errors.
+
 ## Open work
 
 - **QSA verify rows.** MTP verify steps still mask the full context; a compact context of the
