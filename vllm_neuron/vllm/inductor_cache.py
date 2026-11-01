@@ -177,6 +177,52 @@ def _compiler_options(vllm_config: "VllmConfig") -> dict[str, Any]:
     }
 
 
+# CacheConfig fields that vLLM's compute_hash() ignores but a Neuron graph
+# depends on. vLLM ignores them because on GPU the KV cache size is a runtime
+# value. On Neuron every graph takes the KV cache as a static-shape input, so a
+# different block count is a different graph set. Prefix caching changes the
+# graph set too (the recurrent-state checkpoint graphs).
+_KV_SIZING_CACHE_FIELDS = (
+    "gpu_memory_utilization",
+    "kv_cache_memory_bytes",
+    "num_gpu_blocks_override",
+    "enable_prefix_caching",
+)
+
+
+def _kv_cache_sizing(vllm_config: "VllmConfig") -> dict[str, Any]:
+    """Return the inputs that size the KV cache, which the graph shapes depend on.
+
+    ``vllm_config.compute_hash()`` excludes these, so without this entry 2 runs
+    that differ only in ``--gpu-memory-utilization`` share a cache directory.
+    torch then keeps the graphs of both runs in one precompile package (the
+    package is keyed by the function, not by the input shapes), and a warm
+    start restores every graph in it. Each restore builds a Neuron executor,
+    which loads the NEFF into HBM, so the stale graphs of the other run cost
+    device memory even though their guards never match.
+
+    The worker computes the block count after load_model, too late for this
+    key, so the key holds the inputs of that computation instead: the cache
+    config fields above and the Neuron sizing variables (see
+    ``NeuronWorker._compute_kv_budget``). The model weight bytes are a function
+    of the model config, which ``compute_hash()`` covers.
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> cfg = SimpleNamespace(cache_config=SimpleNamespace(
+        ...     gpu_memory_utilization=0.8))
+        >>> _kv_cache_sizing(cfg)["gpu_memory_utilization"]
+        0.8
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    sizing: dict[str, Any] = {
+        name: getattr(cache_config, name, None) for name in _KV_SIZING_CACHE_FIELDS
+    }
+    sizing["kv_cap_fraction"] = envs.VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION
+    sizing["reserved_headroom_gib"] = envs.VLLM_NEURON_RESERVED_HEADROOM_GIB
+    return sizing
+
+
 def resolve_dp_index(parallel_config: Any) -> int:
     """Return the true DP replica index from a ParallelConfig.
 
@@ -229,21 +275,25 @@ def build_fingerprint_inputs(
 ) -> dict[str, Any]:
     """Assemble every input that the compile-cache fingerprint covers.
 
-    The inputs are the vLLM config hash, the resolved bucket sets, the platform
-    target, the compiler options, the versions, and the NEFF cache directory. The
-    bucket sets cover the Neuron config and the encoder config. The versions cover
-    the framework, the compiler, and the plugin. The result is rank-independent, so
-    every rank derives the same fingerprint.
+    The inputs are the vLLM config hash, the resolved bucket sets, the KV cache
+    sizing inputs, the platform target, the compiler options, the versions, and
+    the NEFF cache directory. The bucket sets cover the Neuron config and the
+    encoder config. The KV cache sizing covers what ``compute_hash()`` leaves
+    out but the static graph shapes depend on. The versions cover the framework,
+    the compiler, and the plugin. The result is rank-independent, so every rank
+    derives the same fingerprint.
 
     Examples:
         >>> inputs = build_fingerprint_inputs(vllm_config, neuron_config)  # doctest: +SKIP
-        >>> set(inputs) == {"config_hash", "buckets", "platform_target",
-        ...                  "compiler_options", "versions", "neff_cache_dir"}  # doctest: +SKIP
+        >>> set(inputs) == {"config_hash", "buckets", "kv_cache_sizing",
+        ...                  "platform_target", "compiler_options", "versions",
+        ...                  "neff_cache_dir"}  # doctest: +SKIP
         True
     """
     return {
         "config_hash": vllm_config.compute_hash(),
         "buckets": _collect_buckets(neuron_config, encoder_neuron_config),
+        "kv_cache_sizing": _kv_cache_sizing(vllm_config),
         "platform_target": _platform_target(),
         "compiler_options": _compiler_options(vllm_config),
         "versions": _versions(),
@@ -473,6 +523,26 @@ def collect_cache_counters() -> dict[str, int]:
     }
 
 
+def resident_executor_count() -> int:
+    """Return how many native-route executors (loaded NEFFs) this process holds.
+
+    Each executor holds one NEFF in device memory. After warmup the count must
+    equal the graph set of this configuration; a larger count means the process
+    restored graphs it does not dispatch. Returns -1 when the native backend is
+    absent (CPU mode, the XLA route).
+
+    Examples:
+        >>> resident_executor_count() >= -1  # doctest: +SKIP
+        True
+    """
+    try:
+        from libtorch_neuronx_lite.compile import native_backend
+
+        return len(native_backend._EXECUTORS)
+    except Exception:  # noqa: BLE001 - a log field must not break a startup
+        return -1
+
+
 def _count_saved_artifacts(info: Any) -> int:
     """Return the total artifact count in a torch CacheInfo object.
 
@@ -541,8 +611,10 @@ def save_compile_cache_artifacts() -> int:
         return 0
     # Read the counters after the save, so autograd_cache_saved reflects it.
     logger.info(
-        "Saved torch compile cache: %d artifacts. Cache counters: %s",
+        "Saved torch compile cache: %d artifacts. Resident executors: %d. "
+        "Cache counters: %s",
         saved,
+        resident_executor_count(),
         collect_cache_counters(),
     )
     return saved
