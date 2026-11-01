@@ -62,7 +62,8 @@ from .moe import Qwen4ExpSparseMoe, attach_moe_loaders, moe_weight_mappings
 
 logger = logging.getLogger(__name__)
 
-def _NATIVE_ROUTE() -> bool:
+
+def _on_native_route() -> bool:
     """Whether graphs are captured on the native route (torch.compile), where some ops lower
     differently from the XLA route."""
     from vllm_neuron import envs
@@ -393,7 +394,7 @@ class Qwen4ExpGatedDeltaNet(Q.Qwen3_5GatedDeltaNet):
         zero = torch.zeros((), dtype=self.state_a.dtype, device=self.state_a.device)
         for state in (self.state_a, self.state_b):
             val = torch.where(pad, zero, state.index_select(0, src))
-            if _NATIVE_ROUTE():
+            if _on_native_route():
                 # The native route lowers index_copy_ to an element-wise scatter over the whole
                 # [B, 512, 128] page (~74 MiB of instruction code per batch-8 verify graph);
                 # index_put_ stays a row copy. Padded rows all write zeros to the null page.

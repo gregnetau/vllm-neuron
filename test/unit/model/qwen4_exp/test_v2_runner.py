@@ -310,7 +310,10 @@ class _Engine:
             init_none_hash(hash_fn)
             self.block_hasher = get_request_block_hasher(hash_block_size, hash_fn)
         self.admitted = {}  # req_id -> cached tokens at admission
-        self.preempted, self.resumed = set(), {}  # resumed: cached tokens at readmission
+        self.preempted, self.resumed = (
+            set(),
+            {},
+        )  # resumed: cached tokens at readmission
         cls = NeuronAsyncScheduler if self.async_scheduling else NeuronScheduler
         self.scheduler = cls(
             vllm_config=vllm_config,

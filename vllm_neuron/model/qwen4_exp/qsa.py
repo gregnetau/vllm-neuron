@@ -350,8 +350,8 @@ def _radix_search(
 
 
 def _bitcast_lowers() -> bool:
-    """Whether ``Tensor.view(torch.int32)`` lowers: the native route (torch.compile) and CPU;
-    not the XLA route."""
+    """Whether ``Tensor.view(dtype)`` (a bitcast) lowers: on the native route (torch.compile,
+    the plugin's default, so also CPU tests), not on the XLA route."""
     from vllm_neuron import envs
 
     return envs.is_native_backend()
@@ -361,7 +361,7 @@ def topk_block_mask(
     scores: torch.Tensor,
     k: torch.Tensor,
     radix_bits: int = 1,
-    int_bits: bool | None = None,
+    bitcast_thresholds: bool | None = None,
 ) -> torch.Tensor:
     """Exact top-k as a bool mask, without sort: ``[..., N]`` -> ``[..., N]``.
 
@@ -369,18 +369,19 @@ def topk_block_mask(
     k: int32 ``[...]`` per-row count, at most the number of eligible entries.
     radix_bits: bits resolved per pass (2**r - 1 thresholds tested at once). 1 = bisection,
         the default: on trn2 r = 5 was ~10x slower for decode (B=8, 64k context) than r = 1.
-    int_bits: compare the scores' int32 bit patterns with each threshold (one bitcast)
-        instead of rebuilding every threshold as fp32 (``_bits_to_float``, ~130 ops per pass
-        and 87% of the selection's ops: the native route's compiler front end then spends
-        hours on a 4096-token prefill graph). The same order for scores >= 0, so the same
-        mask; negative scores and -0.0 have negative patterns and are never counted. None:
-        where the bitcast lowers (``_bitcast_lowers``).
+    bitcast_thresholds: turn each threshold's int32 bit pattern into its fp32 value by a
+        bitcast (``_bits_view_float``) instead of rebuilding it arithmetically
+        (``_bits_to_float``, ~130 ops per threshold: 87% of the selection's ops, on which
+        the native route's compiler front end spent hours for a 4096-token prefill graph).
+        The same values, so the same mask. None: where the bitcast lowers
+        (``_bitcast_lowers``).
     Selects every score above the k-th largest value v and, among the scores equal to v,
     the lowest-index ones, so exactly k entries per row. All ops are compare / count /
     where on static shapes: ceil(31 / r) + ceil(log2(N) / r) passes, each testing
     2**r - 1 thresholds over the row.
     """
     N = scores.shape[-1]
+    assert N < 2**24, "tie indices are compared as fp32 (exact below 2**24)"
     r = radix_bits
     k = k.to(torch.int32)
     s = scores.unsqueeze(-2)  # [..., 1, N]
@@ -393,9 +394,9 @@ def topk_block_mask(
     # lowers to tensor-tensor ops on GpSimd (~4x slower on trn2, and the top-k's largest
     # cost). Where the bitcast lowers, the few thresholds are bitcast back to fp32
     # (``_bits_view_float``) instead of rebuilt with ``_bits_to_float`` (~130 ops each).
-    if int_bits is None:
-        int_bits = _bitcast_lowers()
-    to_float = _bits_view_float if int_bits else _bits_to_float
+    if bitcast_thresholds is None:
+        bitcast_thresholds = _bitcast_lowers()
+    to_float = _bits_view_float if bitcast_thresholds else _bits_to_float
 
     def value_ok(t):
         thr = to_float(t).unsqueeze(-1)  # [..., m, 1]
