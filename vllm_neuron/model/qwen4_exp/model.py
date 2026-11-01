@@ -62,6 +62,14 @@ from .moe import Qwen4ExpSparseMoe, attach_moe_loaders, moe_weight_mappings
 
 logger = logging.getLogger(__name__)
 
+def _NATIVE_ROUTE() -> bool:
+    """Whether graphs are captured on the native route (torch.compile), where some ops lower
+    differently from the XLA route."""
+    from vllm_neuron import envs
+
+    return envs.is_native_backend()
+
+
 CKPT = W.TEXT_PREFIX  # "model.language_model."
 _loader = Q._loader
 
@@ -384,9 +392,14 @@ class Qwen4ExpGatedDeltaNet(Q.Qwen3_5GatedDeltaNet):
         src, dst = src.long().clamp(min=0), dst.long().clamp(min=0)
         zero = torch.zeros((), dtype=self.state_a.dtype, device=self.state_a.device)
         for state in (self.state_a, self.state_b):
-            state.index_copy_(
-                0, dst, torch.where(pad, zero, state.index_select(0, src))
-            )
+            val = torch.where(pad, zero, state.index_select(0, src))
+            if _NATIVE_ROUTE():
+                # The native route lowers index_copy_ to an element-wise scatter over the whole
+                # [B, 512, 128] page (~74 MiB of instruction code per batch-8 verify graph);
+                # index_put_ stays a row copy. Padded rows all write zeros to the null page.
+                state.index_put_((dst,), val)
+            else:
+                state.index_copy_(0, dst, val)
 
     def _decode_spec(self, hidden_states, md):
         """MTP verify (S = 1 + k tokens per request, see the Qwen3.5 ``_decode_spec``) with the
@@ -1385,7 +1398,9 @@ class Qwen4ExpForCausalLM(nn.Module):
         The dense-context prefill graph with the MTP head inside it (Model Runner V2's
         ``prefill_dense_spec``) fails at the default ``-O1`` with neuronx-cc 2.28
         ([NCC_INLA001] in lower_act, ``LowerPWPImpl::generateInstLoadActFuncSet``), and
-        compiles at ``-O2``. Every other graph keeps the base arguments.
+        compiles at ``-O2``. Every other graph keeps the base arguments (on the native route
+        ``-O2``; with the decode graphs at ``-O1`` its 64k MTP configuration failed to compile
+        with the same NCC_INLA001).
         """
         from vllm_neuron.utils.compiler_args_ctx import with_optimization_level
 
