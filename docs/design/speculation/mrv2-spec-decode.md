@@ -4,7 +4,7 @@
 Model Runner V2: fixed-layout verify graph, in-graph rejection and multi-token commit, and a
 device-resident per-slot accepted count. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-11-01 -->
 
 ## Overview
 
@@ -63,8 +63,9 @@ speculative configuration with: a method or architecture outside the allowlist, 
 a transferred prompt is scheduled with spec width), sliding-window groups (trimmed tables are
 cut from the host count, which is an upper bound), expert parallelism with data parallelism
 (the spec / non-spec NEFF vote is not synchronized), debug logits, and a
-`rejection_sample_method` other than `standard` / `synthetic`. Structured outputs, tensor
-capture and decode context-length buckets are unsupported on V2 for every model. Prefix
+`rejection_sample_method` other than `standard` / `synthetic`. Structured outputs and tensor
+capture are unsupported on V2 for every model; decode context-length buckets are supported only
+for recurrent-state models (see [Decode context-length buckets](#decode-context-length-buckets)). Prefix
 caching of recurrent-state models works with MTP on V2 (V1 does not support MTP with prefix
 caching): a verify step's state after each token is in its own pool page, and the checkpoint
 for a block boundary it reaches is copied from the page of the token on the boundary, using
@@ -175,7 +176,7 @@ graph signature is unchanged.
    discarded sample there) and the last position is patched with the sample on the final chunk.
 4. **Multi-token commit** (`_compute_next_device_state`): for each active slot, with `W = 1 + k`
    columns and `c = valid_count` (prefill and single-token rows: `W = c = 1`):
-   - `num_computed_tokens += c` on verify rows (`query_len` on prefill rows, as today).
+   - `num_computed_tokens += c` on verify rows (`query_len` on prefill rows, as without speculative decoding).
    - The `c` accepted tokens are appended to `token_ids` at `total_len .. total_len + c - 1`
      (one guarded `index_put_` per column, capacity-checked against `max_model_len`), and
      `total_len` grows by the number stored.
@@ -335,8 +336,11 @@ trimmed table by construction.
 
 ## Warmup and compile
 
-- Prefill: every `(num_batched_tokens_bucket, kv_segment_size)` as today, with the drafter in
-  the graph (synthetic slot 0).
+- Prefill: every `(num_batched_tokens_bucket, kv_segment_size)`, as without speculative
+  decoding, with the drafter in the graph (synthetic slot 0). Models with
+  `prefill_dense_context` (Qwen3.8-Flash-Next) also get the dense-context prefill variant with
+  the drafter in it (graph type `prefill_dense_spec` for the model's `compiler_args_for`;
+  Qwen3.8-Flash-Next compiles it at `-O2`).
 - Decode: every `num_seqs_bucket` `B` (times every decode context bucket, with
   `decode_context_length_buckets`) as a verify graph with `n_r = k` for all rows
   (`_build_decode_synthetic_inputs`), the same assembly path as serving.
@@ -399,7 +403,9 @@ need in-graph window trimming, since the host count is an upper bound.
 
 ## Not done yet
 
-- Device validation (below). Nothing here has run on a Neuron device.
+- Device validation for Qwen3.5 / Qwen3.8 dense beyond the logit test and the MTP parity
+  check against plain decode (below). Qwen3.8-Flash-Next serves MTP on V2 on device (see its
+  [development notes](../../model-dev/qwen3-8-flash-next-notes.md#model-runner)).
 - EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
 - KV transfer (DI) with speculative decoding, sliding-window targets, decode context-length
   buckets on V2 for models without recurrent state.

@@ -16,15 +16,27 @@
 #   # FP8 KV cache (unit scales, about 1.67x the KV tokens; less accurate, see the recipe):
 #   MODEL=... KV_CACHE_DTYPE=fp8 examples/vllm_neuron/models/qwen4_exp/serve.sh
 #
-# Knobs:
-#   MAX_MODEL_LEN (default 65536), MAX_NUM_SEQS (8), PREFILL_BUCKETS ("1024, 4096": short prompts
-#   pad to the smallest, long ones are chunked by the largest), SEQS_BUCKETS ("1, 8"),
-#   DECODE_CTX_BUCKETS ("4096, 16384, 32768": decode reads only the bucket's KV; MAX_MODEL_LEN is
-#   the implicit last one), GPU_MEM_UTIL (0.82: 16.5 GiB weights + ~3.2 GiB KV per 24 GiB core; the QSA indexer views share the KV pool and the graph I/O check NCC_EVRF009 counts it twice), KV_CAP_FRACTION (0.5), SERVED_MODEL_NAME
-#   (qwen3.8-flash-next), MTP_TOKENS (unset; 1 or 2: MTP draft tokens, which turns async scheduling
-#   off on V1 and is faster at batch 1 only, see the recipe), RUNNER (v1 default, or v2: Model
-#   Runner V2, which runs every prefill with the first KV segment size, so only that one is
-#   passed).
+# Knobs (environment variables, default in parentheses):
+#   CORES (0-7): logical NeuronCore range of the replica; PORT (8000).
+#   MAX_MODEL_LEN (65536), MAX_NUM_SEQS (8).
+#   PREFILL_BUCKETS ("1024, 4096"): short prompts pad to the smallest, long ones are chunked by
+#     the largest.
+#   SEQS_BUCKETS ("1, MAX_NUM_SEQS"): decode batch buckets.
+#   DECODE_CTX_BUCKETS (unset; the recipe uses "4096, 16384, 32768"): decode reads only the
+#     bucket's KV; MAX_MODEL_LEN is the implicit last one.
+#   DECODE_INTERLEAVE (unset): decode steps between the chunks of a long prefill.
+#   GPU_MEM_UTIL (0.82): 16.5 GiB weights + ~3.2 GiB KV per 24 GiB core. The QSA indexer views
+#     share the KV pool, and the graph I/O check NCC_EVRF009 counts it twice.
+#   KV_CAP_FRACTION (0.5), KV_CACHE_DTYPE (auto: BF16; fp8), SERVED_MODEL_NAME
+#     (qwen3.8-flash-next).
+#   MTP_TOKENS (unset; 1 or 2): MTP draft tokens. Turns async scheduling off on V1; faster at
+#     batch 1 only, see the recipe.
+#   RUNNER (v1, or v2: Model Runner V2, which runs every prefill with the first KV segment size,
+#     so only that one is passed).
+#   PREFIX_CACHING (0; 1 needs RUNNER=v2).
+#   BACKEND (vllm_neuron: the XLA route; neuron_native: the native torch.compile route, the
+#     plugin's own default, see the recipe's "Compile routes").
+#   NEURON_LIBTORCH_COMPILATION_TIMEOUT (3600): seconds a rank waits for another rank's compile.
 #
 # The n-gram embedding rows are built on the host from the sampled tokens every step
 # (HasHostInputs); async scheduling joins on the sampled tokens before each step (host-token join).

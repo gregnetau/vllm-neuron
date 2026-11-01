@@ -3,7 +3,7 @@
 <!-- meta: description: The HasHostInputs model capability. The V1 and V2 runners build extra
 per-token tensors on the host every step and trace every compiled graph with them. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-28 -->
+<!-- meta: date_updated: 2026-11-01 -->
 
 ## Overview
 
@@ -53,6 +53,12 @@ Two different checks read the capability:
 - The runner checks the module that `from_configs` returns, with `isinstance`, and calls its
   methods. It looks through `torch.compile`'s `_orig_mod`. The `@async_speculative_decoding`
   decorator patches `forward` on the class, so the module needs no other unwrapping.
+
+Keep the state that builds the host inputs (tables, thread pools) off the `nn.Module`. On the
+native compile route `torch.compile` pickles what the module reaches for its guard state,
+which fails on a thread pool (`cannot pickle '_queue.SimpleQueue'`) and copies a large table
+into every trace process. Qwen3.8-Flash-Next keeps its n-gram table and gather pool in a
+module-level `WeakKeyDictionary` keyed by the model, behind a `_host_ple` property.
 
 ## Runner integration (V1)
 

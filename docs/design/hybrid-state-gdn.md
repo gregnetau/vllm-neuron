@@ -3,7 +3,7 @@
 <!-- meta: description: Design of per-request recurrent state (Gated DeltaNet) alongside paged
 KV cache in the vLLM Neuron plugin, as used by Qwen3.5 / Qwen3.8 dense models. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-11-01 -->
 
 ## Overview
 
@@ -148,6 +148,13 @@ the prefix-cache granularity, and allocates `2 + k` state blocks per request and
 (used only as checkpoint targets) plus one per retained checkpoint. The dedicated pool is
 taken out of the KV budget as without prefix caching.
 
+State layers of different sizes: align mode needs one block size for every KV group, so with
+prefix caching every state layer takes the largest state page, and the specs carry one
+placeholder state shape, so vLLM keeps one group per layer type instead of one-layer groups
+(which made every attention layer's KV view span the whole pool). Qwen3.8-Flash-Next needs
+both: 36 GDN layers and one much smaller PLE conv-state layer. Without prefix caching each
+state layer keeps its own page size.
+
 ### Blocks
 
 The runner requires one block size for every KV group (the enlarged attention block,
@@ -246,7 +253,10 @@ functions, the candidates, the block split and the runner's specs and layout.
 
 ### Device validation
 
-Not run on a device yet. On a trn2 instance with no other process on the devices:
+Run on device for Qwen3.8-Flash-Next, which uses the same checkpointer with its GDN and PLE
+state (Aider Polyglot with prefix caching, two-hour soaks with FP8 KV and MTP; see its
+[development notes](../model-dev/qwen3-8-flash-next-notes.md#model-runner)). Not yet run for
+Qwen3.5 / Qwen3.8 dense. On a trn2 instance with no other process on the devices:
 
 ```bash
 # Qwen3.5-2B, TP=2, BF16 KV: without and with MTP
@@ -400,6 +410,16 @@ model then skips its own clearing (`set_runner_clears_kv_blocks`); without the r
 clears blocks on their first write, at prefill and at block boundaries during decode. Writing
 the cache ahead of `attention_decode` inside the decode graph makes the kernel input a copy of
 the whole cache, which is why clearing moved out of the graph.
+
+Model Runner V2 without prefix caching clears at free time instead: it records the attention
+blocks of each removed request (finished, preempted or readmitted) and clears them before the
+next forward, so every free block stays zeroed (the pool starts zeroed), with one clearing
+call per removal. With 32-token blocks, clearing new blocks before most decode steps made the
+runtime switch NEFFs twice per clear and slowed V2's steps by about 8%. With prefix caching
+freed blocks stay cached, so V2 clears new blocks at allocation, as V1 does. A long prompt
+allocates thousands of 32-token blocks at once, so the clearer also compiles a 256-block call,
+used while more than four small calls remain, and waits for its submissions every 32 calls
+(the runtime refuses submissions past its execution queue).
 
 Unused block-table entries are passed to the decode kernel as the null block rather than
 `-1`: the kernel skips out-of-bounds reads but keeps the previous SBUF contents.

@@ -6,7 +6,7 @@ including feature support, configuration, data-parallel serving, performance, ac
 known limitations. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.8-Flash-Next, qwen4_exp, Qwen Sparse Attention, QSA,
 Gated DeltaNet, MoE, n-gram embedding, hyper-connections, FP8, model recipe, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-11-01 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -60,6 +60,14 @@ Tested with vLLM Neuron plugin 0.29.0.1.2.0 (vLLM 0.29.0) and Neuron SDK 2.33 on
 | **Speculative decoding** | MTP (1-2 draft tokens) | ⚠️ faster at batch 1 only (batch 2 with an extra batch-2 graph), slower above (see [MTP](#mtp-speculative-decoding)) |
 | **Runner** | Model Runner V1 | ✅ (default) |
 | | Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`, `serve.sh` `RUNNER=v2`) | ✅ opt-in: host inputs, MTP with async scheduling, decode context buckets, preemption, prefix caching (see the [development notes](../model-dev/qwen3-8-flash-next-notes.md#model-runner)) |
+| **Compilation** | XLA route (`serve.sh` default, `BACKEND=vllm_neuron`) | ✅ |
+| | Native torch.compile route (`BACKEND=neuron_native`, the plugin default) | ⚠️ plain decode serves; slower, MTP only in a reduced configuration (see [Compile routes](#compile-routes)) |
+
+**Status legend:**
+
+- ✅ Supported: integrated and tested on the full 48-layer model
+- ⚠️ Works with limitations (see the linked section)
+- ❌ Not supported
 
 ## Quick start
 
@@ -73,8 +81,10 @@ python examples/vllm_neuron/models/qwen4_exp/run.py --model <path>/Qwen3.8-Flash
 ```
 
 The first start compiles about 30 graphs (prefill buckets, dense-prefill variants, and decode
-batch x context buckets). This takes roughly 20-30 minutes on a trn2.48xlarge; later starts hit the
-compile cache.
+batch x context buckets). This takes roughly 20-30 minutes on a trn2.48xlarge on the XLA route
+(`serve.sh`'s default); later starts hit the compile cache, but a start with a warm compile
+cache still takes about 20 minutes (loading the weights and the graphs; 19 minutes measured
+on Model Runner V2).
 
 ## Serving
 
@@ -104,19 +114,29 @@ A trn2.48xlarge fits 8 replicas. `run_replicas.sh` starts them on consecutive co
 ports behind `dp_proxy.py`. The proxy sends each request to the healthy replica with the fewest
 requests in flight.
 
+Recommended configuration (the one of Aider runs 2-4: 8 requests per replica at 64k context,
+MTP off):
+
 ```bash
-MODEL=<path>/Qwen3.8-Flash-Next REPLICAS=8 MAX_MODEL_LEN=65536 PREFILL_BUCKETS="1024, 4096" \
-    DECODE_CTX_BUCKETS="4096, 16384, 32768" GPU_MEM_UTIL=0.85 DECODE_INTERLEAVE=1 \
-    examples/vllm_neuron/models/qwen4_exp/run_replicas.sh
+VLLM_NEURON_MAX_KV_CONCURRENT=8 MODEL=<path>/Qwen3.8-Flash-Next REPLICAS=8 MAX_MODEL_LEN=65536 \
+    PREFILL_BUCKETS="1024, 4096" DECODE_CTX_BUCKETS="4096, 16384, 32768" GPU_MEM_UTIL=0.85 \
+    DECODE_INTERLEAVE=1 examples/vllm_neuron/models/qwen4_exp/run_replicas.sh
 curl -s localhost:8000/proxy/stats                   # health and load per replica
 STOP=1 examples/vllm_neuron/models/qwen4_exp/run_replicas.sh
 ```
 
+Add `RUNNER=v2` for Model Runner V2 and `RUNNER=v2 PREFIX_CACHING=1` for prefix caching
+(Aider runs 3 and 4). `run_replicas.sh` passes the `serve.sh` knobs through and starts the
+replicas `STAGGER_S` seconds apart (default 60); on the native route use `STAGGER_S=300` (see
+[Compile routes](#compile-routes)).
+
 ### Memory and concurrency
 
 - **Per-core memory.** With FP8 experts the weights take 16.5 GiB of each 24 GiB core. At
-  `gpu_memory_utilization=0.85` the KV cache gets about 2.8 GiB, plus 0.9 GiB of side caches for
-  the QSA indexer's raw and compressed keys: about 244k tokens.
+  `gpu_memory_utilization=0.85` (`GPU_MEM_UTIL=0.85`, as in the data-parallel example) the KV
+  cache gets about 2.8 GiB, plus 0.9 GiB of side caches for the QSA indexer's raw and
+  compressed keys: about 244k tokens. `serve.sh` defaults to 0.82 (about 200k tokens), which
+  MTP with 2 draft tokens needs.
 - **Concurrency cap.** The scheduler caps concurrency at KV tokens // max_model_len (3 requests
   at 65,536). `VLLM_NEURON_MAX_KV_CONCURRENT` overrides the cap; requests that outgrow the KV
   cache are then preempted and recomputed.
@@ -130,6 +150,28 @@ STOP=1 examples/vllm_neuron/models/qwen4_exp/run_replicas.sh
   prefill. Prompts of 1,025-2,048 tokens pad to the 4,096 bucket and take the sparse path; add a
   2,048 bucket to avoid that.
 
+### Prefix caching
+
+`RUNNER=v2 PREFIX_CACHING=1` (`--enable-prefix-caching` on Model Runner V2) caches prompt
+prefixes with checkpoints of the GDN and PLE state at block boundaries (vLLM's Mamba cache
+mode `align`; see the [design note](../design/hybrid-state-gdn.md#prefix-caching-on-model-runner-v2)).
+`serve.sh` refuses `PREFIX_CACHING=1` without `RUNNER=v2`: Model Runner V1 does not support
+prefix caching for this model.
+
+- **Blocks.** 512 tokens with BF16 KV, 1,024 with FP8 KV. The KV cache holds about 188k
+  tokens per replica at 65,536 context, against 200k without prefix caching.
+- **Speed.** On a 12k-token shared prefix, time to first token drops from 9.8 s (cold) to
+  1.1 s (cached).
+- **Outputs.** Greedy outputs with hits equal those without prefix caching up to exact BF16
+  ties (sequential and concurrent requests, a turn continuing an answer, 10 Aider transcripts
+  of 3k-39k tokens).
+- **With MTP and FP8 KV.** Prefix caching combines with `MTP_TOKENS` and
+  `KV_CACHE_DTYPE=fp8` on V2 (1,024-token blocks, 146k KV tokens with 2 draft tokens at
+  `GPU_MEM_UTIL=0.82`); two-hour soaks of that server ran without errors and with hits
+  consistent with misses. With MTP a hit is one block shorter (vLLM drops the last matched
+  block).
+- Validated on the XLA route only.
+
 ### FP8
 
 `quantization="fp8"` (set by `serve.sh`) stores the routed experts in float8_e4m3fn with one
@@ -138,8 +180,8 @@ Attention, GDN, the shared expert, the router, the gated residual and the PLE pr
 BF16.
 
 - Decode uses a sparse MoE kernel that loads only the local experts some token selected.
-- **FP8 KV cache** (`--kv-cache-dtype fp8`). It holds 1.67x the tokens (427k per replica at
-  65,536, default cap 6), and the QSA indexer side cache stays BF16. It uses unit scales (K/V
+- **FP8 KV cache** (`KV_CACHE_DTYPE=fp8`, `--kv-cache-dtype fp8`). It holds 1.67x the tokens
+  (427k per replica at 65,536 and `GPU_MEM_UTIL=0.85`, default cap 6), and the QSA indexer side cache stays BF16. It uses unit scales (K/V
   values stay within +-35, and calibrated per-layer scales give the same rounding error). The
   logit test passes at batch 4 and fails 2 of 4 prompts at batch 1, without a divergent token.
   Greedy output on the 3,532-token prompt is still 8/8. BF16 KV is the default.
@@ -148,8 +190,15 @@ BF16.
 ### MTP speculative decoding
 
 `MTP_TOKENS=2 serve.sh`, `--speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'`
-or `run.py --mtp 2` loads the checkpoint's MTP head as the draft. Async scheduling turns off
-automatically with speculative decoding for this model.
+or `run.py --mtp 2` loads the checkpoint's MTP head as the draft. On Model Runner V1 async
+scheduling turns off automatically with speculative decoding for this model; Model Runner V2
+(`RUNNER=v2`) keeps it. Serve MTP on the XLA route (`serve.sh`'s default; see
+[Compile routes](#compile-routes)).
+
+The measurements below are on Model Runner V1 unless noted. On Model Runner V2 (2 draft
+tokens, async scheduling, greedy, 64k configuration): 19.2 ms/token at B=1 against 35.5 without
+MTP (1.85x), 67.1 against 55.5 ms at B=8 (21% slower), 111 against 116 ms at B=4 with 30k
+prompts; 2.68 tokens per step; KV cache 107k tokens at `GPU_MEM_UTIL=0.82`.
 
 MTP is not part of the recommended 8-request configuration. In the 65,536-token configuration
 it speeds up a single request, but is slower than plain decode as soon as two or more requests
@@ -192,7 +241,43 @@ single-request latency: `MTP_TOKENS=2` with `serve.sh`'s default `GPU_MEM_UTIL` 
 - **Logprobs** are returned for every emitted token, speculated ones included, with and
   without async scheduling.
 
+### Compile routes
+
+vLLM Neuron compiles through one of two torch.compile routes. The plugin defaults to the
+native route; `serve.sh` selects the XLA route (`VLLM_NEURON_BACKEND=vllm_neuron`), and
+`BACKEND=neuron_native` selects the native route. Use the XLA route unless you need the
+native one.
+
+- **What serves on the native route.** Plain decode on Model Runner V2 (Aider run 5, a
+  two-hour soak without errors) and the logit test on V1 and V2 (both measured before the fp32
+  QSA top-k compares of 2026-11-01, which give the same selection by construction). Prefix caching and the FP8
+  KV cache have not been validated on the native route.
+- **Speed.** Time to first token is about 35% higher than on the XLA route: 6.51 / 14.70 /
+  65.3 s against 4.84 / 10.98 / 48.3 s at B=1 8k / B=8 4k / B=4 30k prompts (measured after
+  the fp32 QSA top-k compares, 2026-11-01). Decode was 2-20% slower (inter-token 36.2 / 62.1 /
+  139 ms against 35.5 / 55.5 / 116 ms at B=1 / B=8 / B=4 with 30k prompts, measured before
+  that change; the XLA route now gives 34.9 / 53.4 / 104 ms).
+- **Starting replicas.** Each rank traces its graphs in forked processes, and one V2 server
+  peaks at 548 GB of host memory with the default number of trace processes, 218 GB with
+  `NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=2`. Set that when several replicas load at once, and
+  start replicas apart (`run_replicas.sh` `STAGGER_S=300`, as in Aider run 5).
+- **Compile timeouts.** On the native route every rank compiles its NEFFs in-process during
+  graph extraction. The plugin seeds `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=21600` and waits
+  `VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT` (21600 s) at the barrier after extraction, so a
+  long first compile does not time out; explicit values win.
+- **MTP.** The default 64k MTP configuration does not fit the 24 GB of HBM on the native route
+  (its graphs need about 2 GiB more than on the XLA route). It fits with `MTP_TOKENS=2
+  PREFILL_BUCKETS=1024 DECODE_CTX_BUCKETS=4096 NEURON_RT_IO_RING_CACHE_SIZE=4` at the default
+  `GPU_MEM_UTIL` of 0.82 (107k KV tokens), which is fast at batch 1 (23 ms/token) but 2-3x
+  slower than XLA-route MTP at batch 8 and with long contexts. A cold start with MTP compiled
+  for about 75 minutes (measured before the fp32 QSA top-k compares of 2026-11-01).
+
 ## Performance
+
+> Unless noted, the numbers in this section were measured before the fp32 QSA top-k compares
+> (2026-11-01). That change made prefill 16-21% faster on both routes (XLA route, time to first
+> token 5.73 / 13.0 / 57.4 s to 4.84 / 10.98 / 48.3 s at B=1 8k / B=8 4k / B=4 30k) and left
+> plain decode at the same speed (34.9 ms at B=1, 55.0 to 53.4 ms at B=8).
 
 Decode, one replica, FP8 experts, greedy:
 
@@ -249,7 +334,7 @@ buckets 4,096 / 16,384 / 32,768, `DECODE_INTERLEAVE=1`); greedy unless noted.
 
 - **Aggregate.** 8 replicas with 24 concurrent short requests: 364 tok/s.
 - **Prefill.** About 1.4k tokens/s at long context: 2.9 s per 4,096-token chunk at 30k, 57.7k
-  tokens in 41.2 s.
+  tokens in 41.2 s (before the fp32 QSA top-k compares, which made prefill 16-21% faster).
 - **Long-context decode.** Decode attends only to the selected tokens: the decode kernel reads
   a compact context of the 512 selected blocks plus the open tail (2,304 slots) through a block
   table over the KV cache, whatever the context length. The indexer scores cached compressed
@@ -285,7 +370,7 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
 - thinking mode at the template's default `reasoning_effort=xhigh`, model-card sampling
   (temperature 1.0, top_p 0.95, top_k 20);
 - Aider 0.86.3.dev (5dc9490);
-- served by replicas at 64k context (8 on Model Runner V1, 7 on V2).
+- served by replicas at 64k context (8 on Model Runner V1, 6-7 on V2).
 
 | | Run 1 (2026-10-22) | Run 2 (2026-10-27) | Run 3, Model Runner V2 (2026-10-28) | Run 4, V2 + prefix caching (2026-10-29) | Run 5, V2, native route (2026-10-31) |
 |---|---|---|---|---|---|
@@ -301,18 +386,19 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
   thinking responses (about 20 a run), which either reach Aider's 3,600 s request timeout or,
   decoded faster, `max_model_len` (Aider counts `finish_reason=length` as an exhausted context
   window): 21, 19, 9 and 19 in runs 1-4.
-- **Run 2's code.** It used the final branch (MTP not enabled). No preemption occurred at 8
-  requests per replica.
+- **Run 2** ran the code of this recipe on Model Runner V1 (MTP not enabled). No preemption
+  occurred at 8 requests per replica.
 - **Run 3** ran on Model Runner V2 (MTP and prefix caching not enabled), with one replica fewer.
   Its shorter wall time is not a faster decode (V2 and V1 decode at the same speed on a fixed
   workload, see the development notes): run 2 lost 13 requests to Aider's 3,600 s timeout, run 3
   two. 22 preemptions, no server errors.
-- **Run 5** ran on the native compile route (`BACKEND=neuron_native`, the plugin default; `serve.sh`
-  otherwise selects the XLA route) with 6 replicas. The pass rate matches the XLA runs.
 - **Run 4** added prefix caching: hit rate 10-18% per replica, 175 preemptions (run 3: 22; the
   KV cache holds 188k tokens in 512-token blocks, against 200k), no server errors. The pass rate
   is within run-to-run variance; hits give the same outputs as misses (see the development
   notes).
+- **Run 5** ran on the native compile route (`BACKEND=neuron_native`, the plugin default; `serve.sh`
+  otherwise selects the XLA route) with 6 replicas, without prefix caching. The pass rate matches
+  the XLA runs.
 
 ## Known limitations
 
@@ -331,17 +417,14 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
   head at `-O2` (neuronx-cc 2.28 fails it at `-O1`), and an explicit level overrides that.
 - **A 2048-token prefill bucket on Model Runner V2** compiles only at `-O2` (NCC_INLA001 at
   `-O1`); the default buckets (1024, 4096) compile at `-O1`.
-- **Native compile route** (`BACKEND=neuron_native`): plain decode serves (Aider run 5), but prefill
-  is about 28% slower than on the XLA route (time to first token 7.3 s against
-  5.7 s at B=1, 8k tokens) and decode 2-20% slower (36.2 / 62.1 / 139 ms against 35.5 / 55.5 /
-  116 ms at B=1 / B=8 / B=4 with 30k prompts). Set `NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=2`
-  when several replicas load at once (each rank traces its graphs in forked processes). MTP:
-  use the XLA route (`serve.sh`). On the native route the 64k MTP graphs need about 2 GiB more
-  HBM than on the XLA route; it fits only with `PREFILL_BUCKETS=1024 DECODE_CTX_BUCKETS=4096
-  NEURON_RT_IO_RING_CACHE_SIZE=4`, which is fast at batch 1 (23 ms/token) but 2-3x slower than
-  XLA MTP at batch 8 and with long contexts. A cold start with MTP compiles for about 75 min;
-  the plugin raises the compile-cache lock and barrier timeouts for that on the native route.
+- **Native compile route** (`BACKEND=neuron_native`): plain decode serves (Aider run 5), but time
+  to first token is about 35% higher than on the XLA route (6.51 s against 4.84 s at B=1, 8k
+  tokens) and decode was 2-20% slower (measured before the fp32 QSA top-k compares). MTP fits
+  only a reduced configuration there and is slow beyond batch 1; serve MTP on the XLA route.
+  Prefix caching and the FP8 KV cache are not validated on the native route. See
+  [Compile routes](#compile-routes).
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
-  15k-token prompts take about 43 s, against about 14 s for one.
+  15k-token prompts took about 43 s, against about 14 s for one (before the fp32 QSA top-k
+  compares).
 - **FP8 KV cache** reduces accuracy (the e4m3 rounding; see [FP8](#fp8)).
 - **Text only.** The vision tower is not loaded.
