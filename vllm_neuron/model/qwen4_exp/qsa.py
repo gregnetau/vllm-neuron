@@ -325,6 +325,13 @@ def _bits_to_float(b: torch.Tensor) -> torch.Tensor:
     return (m.to(torch.float32) * (2.0**-23)) * p
 
 
+def _bits_view_float(b: torch.Tensor) -> torch.Tensor:
+    """``_bits_to_float`` by a bitcast (where it lowers): fp32 value of the non-negative
+    int32 bit patterns ``b``; exponent 255 (inf / NaN patterns) maps to +inf."""
+    f = b.contiguous().view(torch.float32)
+    return torch.where(b >= 0x7F800000, torch.full_like(f, float("inf")), f)
+
+
 def _radix_search(
     count_ok, nbits: int, rows_like: torch.Tensor, r: int
 ) -> torch.Tensor:
@@ -381,36 +388,38 @@ def topk_block_mask(
     # 1) v = the k-th largest value. For x >= 0 the int32 bit pattern is monotone in x, so
     #    v's bits = the largest t in [0, 2**31) with count(scores >= t) >= k. Patterns at or
     #    above +inf map to +inf and count 0. k == 0 gives +inf: nothing selected.
+    # Compare in fp32 on both routes: an fp32 score row against a per-row fp32 threshold
+    # is a tensor-scalar op on the vector engine; an int32 compare of the bit patterns
+    # lowers to tensor-tensor ops on GpSimd (~4x slower on trn2, and the top-k's largest
+    # cost). Where the bitcast lowers, the few thresholds are bitcast back to fp32
+    # (``_bits_view_float``) instead of rebuilt with ``_bits_to_float`` (~130 ops each).
     if int_bits is None:
         int_bits = _bitcast_lowers()
-    if int_bits:
-        s_bits = scores.contiguous().view(torch.int32).unsqueeze(-2)  # [..., 1, N]
+    to_float = _bits_view_float if int_bits else _bits_to_float
 
-        def value_ok(t):
-            return (s_bits >= t.unsqueeze(-1)).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
+    def value_ok(t):
+        thr = to_float(t).unsqueeze(-1)  # [..., m, 1]
+        return (s >= thr).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
 
-    else:
-
-        def value_ok(t):
-            thr = _bits_to_float(t).unsqueeze(-1)  # [..., m, 1]
-            return (s >= thr).sum(-1, dtype=torch.int32) >= k.unsqueeze(-1)
-
-    v = _bits_to_float(_radix_search(value_ok, 31, k, r)).unsqueeze(-1)
+    v = to_float(_radix_search(value_ok, 31, k, r)).unsqueeze(-1)
     gt = scores > v
     eq = scores == v
     need = k - gt.sum(-1, dtype=torch.int32)
     # 2) ties at v, lowest index first: I = the index of the need-th tie = the largest i with
     #    count(eq & idx < i) < need (need >= 1); select eq & idx <= I.
-    idx = torch.arange(N, device=scores.device, dtype=torch.int32)
-    eq_i = eq.unsqueeze(-2)
+    #    The indices of the ties as fp32 (exact below 2**24; +inf elsewhere), so each pass
+    #    is one fp32 tensor-scalar compare (vector engine), not int32 tensor-tensor (GpSimd).
+    idx = torch.arange(N, device=scores.device, dtype=torch.float32)
+    tie_idx = torch.where(eq, idx, torch.full((), float("inf"), device=scores.device))
+    tie_i = tie_idx.unsqueeze(-2)  # [..., 1, N]
 
     def index_ok(t):
-        c = (eq_i & (idx < t.unsqueeze(-1))).sum(-1, dtype=torch.int32)
+        c = (tie_i < t.to(torch.float32).unsqueeze(-1)).sum(-1, dtype=torch.int32)
         return c < need.unsqueeze(-1)
 
     nbits = max(1, (N - 1).bit_length())
-    last = _radix_search(index_ok, nbits, k, r)
-    return gt | (eq & (idx <= last.unsqueeze(-1)) & (need > 0).unsqueeze(-1))
+    last = _radix_search(index_ok, nbits, k, r).to(torch.float32)
+    return gt | ((tie_idx <= last.unsqueeze(-1)) & (need > 0).unsqueeze(-1))
 
 
 def select_blocks(
