@@ -607,7 +607,20 @@ Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
   only with or without decode buckets at 0.80; `NEURON_RT_IO_RING_CACHE_SIZE=4` changes nothing).
   Correctness is fine: with 1024-token prefill chunks, no decode buckets and 0.80, greedy
   outputs at batch 1 equal plain native decode up to BF16 ties (gaps 0.000, 0.000, 0.250;
-  needles at 12k and 30k identical), 84% of drafts accepted. An earlier reading of this failure
+  needles at 12k and 30k identical), 84% of drafts accepted.
+  Where the extra HBM goes (NEFF analysis against the XLA twins): about 1 GiB more code, 82% of
+  it in the 8 verify graphs (`-O2`, the native default, shares a 12-layer body three times
+  where `-O1` shares a 4-layer one; and `index_copy_` in `_copy_state_pages` lowered to a
+  page-wide scatter, about 74 MiB per batch-8 graph, now `index_put_` on the native route,
+  a5b9812), and about 1 GiB more prefill scratchpad (the native partition cut points keep the
+  QSA token masks live across partitions). Verify graphs at `-O1` fail to compile there
+  (NCC_INLA001). The DMA rings also grow during execution (to 1.27 GB with the plugin's
+  `NEURON_RT_IO_RING_CACHE_SIZE=32`).
+  A 64k configuration that fits at 0.82 (107k KV tokens): `PREFILL_BUCKETS=1024
+  DECODE_CTX_BUCKETS=4096 NEURON_RT_IO_RING_CACHE_SIZE=4`; two full benchmark passes without
+  an allocation failure, 87% of drafts accepted. It is slow beyond batch 1: inter-token 23 /
+  172-188 / 222 ms at B=1 / B=8 / B=4 with 30k prompts (XLA MTP: 19 / 67 / 111), time to first
+  token 9.5 s at B=1 (XLA MTP 6.1 s); contexts above 4k decode over the whole 64k bucket. An earlier reading of this failure
   as an HBM overflow of the verify graphs (`NCC_EOOM002`) was wrong: that came from standalone
   recompiles of the prefill graph with other flags, whose "39.4 GB of I/O tensors" counts the
   inputs once per physical core; graph I/O is aliased as on the XLA route. MTP on the native route hits an out-of-bounds access on device during warmup
@@ -616,6 +629,13 @@ Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
   `qwen4_exp-upstream` (`qwen3_5-mrv2` serves 2B); not investigated further. Qwen3.5-2B on the
   native route also fails to compile at batch 8 and with a 4096-token prefill bucket
   (NCC_ITRF901 / NCC_IGCA044).
+
+Release-candidate check (f16c1bc, XLA route, 2026-11-01): logit test on V1 and V2 at batch 1
+and 4 passes (no divergent token); 2-hour soak of prefix caching + FP8 KV + MTP 20 of 20 rounds
+consistent, no errors; 2-hour soak of plain V2 without errors. The plain soak's consistency
+check (each question alone vs all four at once) flags one question: its 73rd token is an exact
+top-2 tie at batch 1 (gap 0.000) that batch 4 breaks the other way (0.125), as between batch
+sizes elsewhere.
 
 ## Open work
 

@@ -335,10 +335,12 @@ FP8 expert weights, so the bounds measure the compute, not the quantization):
   is about 28% slower than on the XLA route (time to first token 7.3 s against
   5.7 s at B=1, 8k tokens) and decode 2-20% slower (36.2 / 62.1 / 139 ms against 35.5 / 55.5 /
   116 ms at B=1 / B=8 / B=4 with 30k prompts). Set `NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=2`
-  when several replicas load at once (each rank traces its graphs in forked processes). MTP at
-  65,536 tokens does not fit the 24 GB of HBM on this route (its graphs need about 0.5 GB more
-  than on the XLA route); use the XLA route (`serve.sh`) for MTP. A cold start with MTP compiles
-  for about 75 min; the plugin raises the compile-cache lock and barrier timeouts for that.
+  when several replicas load at once (each rank traces its graphs in forked processes). MTP:
+  use the XLA route (`serve.sh`). On the native route the 64k MTP graphs need about 2 GiB more
+  HBM than on the XLA route; it fits only with `PREFILL_BUCKETS=1024 DECODE_CTX_BUCKETS=4096
+  NEURON_RT_IO_RING_CACHE_SIZE=4`, which is fast at batch 1 (23 ms/token) but 2-3x slower than
+  XLA MTP at batch 8 and with long contexts. A cold start with MTP compiles for about 75 min;
+  the plugin raises the compile-cache lock and barrier timeouts for that on the native route.
 - **Prefill is sequential.** Long prompts are prefilled one after another: three concurrent
   15k-token prompts take about 43 s, against about 14 s for one.
 - **FP8 KV cache** reduces accuracy (the e4m3 rounding; see [FP8](#fp8)).
