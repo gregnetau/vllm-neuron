@@ -1950,8 +1950,14 @@ class NeuronModelRunnerV2:
         # every free block zeroed, with one clearing call per removal instead of one per
         # newly allocated block (with --block-size blocks, every few decode steps, each
         # a NEFF switch). With prefix caching freed blocks stay cached (they hold valid
-        # KV or state checkpoints), so new blocks are cleared at allocation.
-        self._clear_on_free = kv_clearer is not None and not ckpt_block
+        # KV or state checkpoints), so new blocks are cleared at allocation. A KV connector
+        # may keep a removed request's blocks (delayed free) to send them: then clear at
+        # allocation too.
+        self._clear_on_free = (
+            kv_clearer is not None
+            and not ckpt_block
+            and getattr(self.vllm_config, "kv_transfer_config", None) is None
+        )
         self._freed_kv_blocks = []
         if checkpointer is not None:
             self._ckpt = checkpointer

@@ -136,9 +136,7 @@ def test_partial_prefill_ids_resumed_recompute_but_not_verify_steps():
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
     def state(prompt, outputs):
-        return SimpleNamespace(
-            num_prompt_tokens=prompt, num_tokens=prompt + outputs
-        )
+        return SimpleNamespace(num_prompt_tokens=prompt, num_tokens=prompt + outputs)
 
     runner = SimpleNamespace(
         requests={

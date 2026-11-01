@@ -68,9 +68,10 @@ def _graph_extraction_barrier_timeout(native_compile_only: bool) -> timedelta | 
     prefill graph can take over an hour and ranks reach the barrier apart: wait
     ``VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT`` unless ``VLLM_NEURON_BARRIER_TIMEOUT`` is
     set. None: the default barrier timeout."""
-    if not native_compile_only or "VLLM_NEURON_BARRIER_TIMEOUT" in os.environ:
+    if not native_compile_only or os.environ.get("VLLM_NEURON_BARRIER_TIMEOUT"):
         return None
     return timedelta(seconds=envs.VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT)
+
 
 # Largest GIL switch interval this accepts, in seconds. CPython's own default is 0.005 s, and the
 # point of the knob is to go shorter, so anything above a second is a typo rather than a setting.

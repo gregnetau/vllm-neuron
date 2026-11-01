@@ -537,10 +537,12 @@ def resident_executor_count() -> int:
     """
     try:
         from libtorch_neuronx_lite.compile import native_backend
-
-        return len(native_backend._EXECUTORS)
-    except Exception:  # noqa: BLE001 - a log field must not break a startup
+    except ImportError:
         return -1
+    executors = getattr(
+        native_backend, "_EXECUTORS", None
+    )  # private: no public count yet
+    return -1 if executors is None else len(executors)
 
 
 def _count_saved_artifacts(info: Any) -> int:
