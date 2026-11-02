@@ -3,7 +3,7 @@
 <!-- meta: description: Complete reference for all Neuron-specific
 configuration parameters available through additional_config and environment
 variables. -->
-<!-- meta: date_updated: 2026-10-16 -->
+<!-- meta: date_updated: 2026-11-01 -->
 <!-- Content type: reference-general -->
 
 ## Overview
@@ -206,6 +206,7 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `NEURON_LIBTORCH_REMOTE_CACHE` | str | -- | Path to NFS/FSx mount for shared persistent cache across nodes. |
 | `NEURON_LIBTORCH_DISABLE_COMPILE_CACHE` | bool | 0 | Disable compilation cache entirely. Forces recompilation on every startup. |
 | `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | int | -- | Timeout in seconds for individual NEFF compilation. |
+| `VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT` | int | 21600 | Native route only: seconds the ranks wait at the barrier after graph extraction, which compiles every NEFF in-rank (a large prefill graph can take over an hour, and ranks finish apart). `VLLM_NEURON_BARRIER_TIMEOUT`, when set, wins. On the native route the plugin also seeds `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=21600` (an explicit value wins), so one rank compiles a long graph while the others wait for it. |
 | `VLLM_NEURON_DISABLE_WARMUP_COMPILE` | bool | 0 | Treat cache miss as fatal error. Use when all graphs must be pre-compiled. |
 | `VLLM_CACHE_ROOT` | str | `~/.cache/vllm` | Root directory for vLLM cache storage. |
 

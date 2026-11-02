@@ -4,7 +4,7 @@
 Model Runner V2: fixed-layout verify graph, in-graph rejection and multi-token commit, and a
 device-resident per-slot accepted count. -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-27 -->
+<!-- meta: date_updated: 2026-11-01 -->
 
 ## Overview
 
@@ -26,11 +26,11 @@ recent V1 fixes covers a case that this design handles by construction:
 
 | V1 fix | Failure | V2 design |
 |---|---|---|
-| 1327be7 | A held-back request's positions were corrected twice | Positions come from the device count, which is never corrected; nothing is corrected |
-| f83411a | A request was corrected by the wrong step's drafts | Each slot's accepted count is committed by the step that verified it and read by the slot's next step, whichever step that is |
-| d9c33bd | A request absent from the previous step resumed from the wrong state block | `state_in` is read from the slot's own committed accepted count |
-| 932f443 | A step with mixed draft counts misaligned the `[B, 1 + k]` verify layout | The layout is always `[B, 1 + k]`; a row with fewer drafts is padded inside its own row |
-| d88c405 | The rejection sampler dropped the bonus token of a row with fewer drafts | The fixed-layout sampler masks a row's positions past its draft count as accepted |
+| Do not correct a held-back request's positions twice | A held-back request's positions were corrected twice | Positions come from the device count, which is never corrected; nothing is corrected |
+| Correct a request by the drafts its last step verified | A request was corrected by the wrong step's drafts | Each slot's accepted count is committed by the step that verified it and read by the slot's next step, whichever step that is |
+| Correct requests that missed the previous step | A request absent from the previous step resumed from the wrong state block | `state_in` is read from the slot's own committed accepted count |
+| No step mixes requests with and without drafts | A step with mixed draft counts misaligned the `[B, 1 + k]` verify layout | The layout is always `[B, 1 + k]`; a row with fewer drafts is padded inside its own row |
+| Emit the bonus token of a request with fewer drafts (rejection sampler) | The rejection sampler dropped the bonus token of a row with fewer drafts | The fixed-layout sampler masks a row's positions past its draft count as accepted |
 
 The design follows vLLM's GPU MRv2 (`vllm/v1/worker/gpu/`): positions come from the
 device `num_computed_tokens` (`prepare_pos_seq_lens`), draft token values come from a
@@ -39,8 +39,9 @@ device per-request table (`req_states.draft_tokens`, read by
 hybrid model resumes from the state block given by a per-slot accepted count
 (`model_states/mamba_hybrid.py`, `num_accepted_tokens_gpu`).
 
-Scope: MTP (`speculative_config.method == "mtp"`, Qwen3.5 / Qwen3.8 dense, the
-`Qwen3_5MTP` head) first. The draft-model contract is the one EAGLE3 and the MTP proposer of
+Scope: MTP (`speculative_config.method == "mtp"`): Qwen3.5 / Qwen3.8 dense with the
+`Qwen3_5MTP` head, and Qwen3.8-Flash-Next (qwen4_exp) with the `Qwen4ExpMTP` head, whose verify
+rows also need host inputs (the n-gram rows of the drafts, [Host inputs](../host-inputs.md)). The draft-model contract is the one EAGLE3 and the MTP proposer of
 upstream PR #78 share (`forward(...) -> (tokens [B, 1 + k], drafts [B, k], logits)`), so
 EAGLE3 is a target-output parser and a hidden-state width away (see [EAGLE3](#eagle3)).
 
@@ -50,8 +51,9 @@ Speculative decoding stays on V1 unless both hold:
 
 - `VLLM_USE_V2_MODEL_RUNNER=1`, and
 - the method and the target architecture are in `V2_SPEC_DECODE_METHODS`
-  (`vllm/worker/v2_spec_decode.py`; initially `mtp` for `Qwen3_5ForCausalLM` /
-  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense).
+  (`vllm/worker/v2_spec_decode.py`: `mtp` for `Qwen3_5ForCausalLM` /
+  `Qwen3_5ForConditionalGeneration`, which also covers Qwen3.8 dense, and for
+  `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration`).
 
 `get_neuron_model_runner_v2_policy` keeps `default_enabled=False` for every speculative
 configuration (V1 stays the default until device parity runs pass), and
@@ -61,8 +63,9 @@ speculative configuration with: a method or architecture outside the allowlist, 
 a transferred prompt is scheduled with spec width), sliding-window groups (trimmed tables are
 cut from the host count, which is an upper bound), expert parallelism with data parallelism
 (the spec / non-spec NEFF vote is not synchronized), debug logits, and a
-`rejection_sample_method` other than `standard` / `synthetic`. Structured outputs, tensor
-capture and decode context-length buckets are unsupported on V2 for every model. Prefix
+`rejection_sample_method` other than `standard` / `synthetic`. Structured outputs and tensor
+capture are unsupported on V2 for every model; decode context-length buckets are supported only
+for recurrent-state models (see [Decode context-length buckets](#decode-context-length-buckets)). Prefix
 caching of recurrent-state models works with MTP on V2 (V1 does not support MTP with prefix
 caching): a verify step's state after each token is in its own pool page, and the checkpoint
 for a block boundary it reaches is copied from the page of the token on the boundary, using
@@ -157,7 +160,7 @@ graph signature is unchanged.
    [B, 1 + k], drafts [B, k], num_drafts [B])` returns `[B, 1 + k]` with `-1` past the
    accepted prefix (the same acceptance rule as V1's `rejection_sampler`, sharing its
    `synthetic` mode; positions past a row's own drafts count as accepted so the bonus token
-   is kept, d88c405). The on-device sampler draws each target token from the target
+   is kept, as in the V1 rejection-sampler fix for rows with fewer drafts). The on-device sampler draws each target token from the target
    distribution, so accept-if-equal keeps the output distribution exact at any temperature,
    as in V1. `valid_count [B]` (1 .. 1 + n_r) is the accepted count.
 3. **Drafter in the same graph**: the draft model's contract is the EAGLE3 / MTP fused draft
@@ -173,7 +176,7 @@ graph signature is unchanged.
    discarded sample there) and the last position is patched with the sample on the final chunk.
 4. **Multi-token commit** (`_compute_next_device_state`): for each active slot, with `W = 1 + k`
    columns and `c = valid_count` (prefill and single-token rows: `W = c = 1`):
-   - `num_computed_tokens += c` on verify rows (`query_len` on prefill rows, as today).
+   - `num_computed_tokens += c` on verify rows (`query_len` on prefill rows, as without speculative decoding).
    - The `c` accepted tokens are appended to `token_ids` at `total_len .. total_len + c - 1`
      (one guarded `index_put_` per column, capacity-checked against `max_model_len`), and
      `total_len` grows by the number stored.
@@ -273,9 +276,10 @@ unchanged: a verify graph touches exactly the slots of its rows.
 
 - The scheduler limits a step to `max_model_len - 1 - num_computed` tokens, so a request near
   the end gets `n_r < k` drafts (sync) or none (async: `NeuronAsyncScheduler` stops drafting
-  for every request while any request is near the end, 932f443). Both are rows with fewer
+  for every request while any request is near the end: the V1 async fix so that no step
+  mixes requests with and without drafts). Both are rows with fewer
   drafts in the fixed layout.
-- The scheduler-side rule of 932f443 does not exclude every mixed step: once the request near
+- That scheduler-side rule does not exclude every mixed step: once the request near
   the end has finished, a request whose final prefill chunk ran while the others were held back
   gets placeholders, while the held-back requests keep the empty draft lists of their last
   step, so the next step mixes rows with `k` and with 0 drafts (seen in the CPU test with
@@ -333,8 +337,11 @@ trimmed table by construction.
 
 ## Warmup and compile
 
-- Prefill: every `(num_batched_tokens_bucket, kv_segment_size)` as today, with the drafter in
-  the graph (synthetic slot 0).
+- Prefill: every `(num_batched_tokens_bucket, kv_segment_size)`, as without speculative
+  decoding, with the drafter in the graph (synthetic slot 0). Models with
+  `prefill_dense_context` (Qwen3.8-Flash-Next) also get the dense-context prefill variant with
+  the drafter in it (graph type `prefill_dense_spec` for the model's `compiler_args_for`;
+  Qwen3.8-Flash-Next compiles it at `-O2`).
 - Decode: every `num_seqs_bucket` `B` (times every decode context bucket, with
   `decode_context_length_buckets`) as a verify graph with `n_r = k` for all rows
   (`_build_decode_synthetic_inputs`), the same assembly path as serving.
@@ -397,7 +404,9 @@ need in-graph window trimming, since the host count is an upper bound.
 
 ## Not done yet
 
-- Device validation (below). Nothing here has run on a Neuron device.
+- Device validation for Qwen3.5 / Qwen3.8 dense beyond the logit test and the MTP parity
+  check against plain decode (below). Qwen3.8-Flash-Next serves MTP on V2 on device (see its
+  [development notes](../../model-dev/qwen3-8-flash-next-notes.md#model-runner)).
 - EAGLE3 (see [EAGLE3](#eagle3)), DFlash, and dense targets other than Qwen3.5.
 - KV transfer (DI) with speculative decoding, sliding-window targets, decode context-length
   buckets on V2 for models without recurrent state.
@@ -450,5 +459,6 @@ Checks: greedy (`temperature=0`) completions equal V1 MTP and V2 without
 arriving together, a long prompt (several chunks) arriving while others decode, and requests
 that run to `max_model_len` (for example `MAX_MODEL_LEN=2048` with `max_tokens` past it);
 `logprobs=1` returns one entry per generated token. Signs of a layout or state bug are the
-ones 932f443 describes: tokens with logprob far below the top token in the last tokens of
+ones described by the V1 async fix that keeps a step from mixing requests with and without
+drafts: tokens with logprob far below the top token in the last tokens of
 requests near the end, or divergence after the first verify step with partial acceptance.
