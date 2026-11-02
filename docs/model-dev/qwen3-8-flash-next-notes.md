@@ -266,7 +266,7 @@ The run averaged about 120 tok/s, where 24 short requests reach 364 tok/s. Reaso
 
 ### Run 2 (2026-10-27)
 
-Same configuration on the final branch, but with 8 concurrent requests per replica
+Same configuration on the final V1 code, but with 8 concurrent requests per replica
 (`VLLM_NEURON_MAX_KV_CONCURRENT=8`) and 64 Aider threads:
 
 | Metric | Value |
@@ -284,7 +284,7 @@ Same configuration on the final branch, but with 8 concurrent requests per repli
 
 ### Run 3 on Model Runner V2 (2026-10-28)
 
-Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the `qwen4_exp-mrv2` branch), with
+Same configuration as run 2 on Model Runner V2 (`RUNNER=v2`, the Model Runner V2 port of this work), with
 7 replicas (one TP=8 range was kept for validation) and 56 Aider threads:
 
 | Metric | Value |
@@ -385,9 +385,9 @@ Full 48-layer FP8 model on trn2.48xlarge unless noted.
 - **FP8 KV.** 1.67x KV tokens, but fails logit validation (unit scales). Superseded: with
   references that hold the FP8 experts it passes at batch 4 (see [Model runner](#model-runner)).
 
-### On the 2026-10-27 qwen3_5-upstream base
+### On the 2026-10-27 Qwen3.5 base
 
-The work was replayed onto the updated Qwen3.5 branch. That brings in logprobs for speculative
+The work was replayed onto the updated Qwen3.5 base. That brings in logprobs for speculative
 and async-scheduled steps, seeded sampling on Neuron, int64 slot mappings, and dedicated
 state-pool pages kept inside the pool. Re-validated on device:
 - the 48-layer FP8 logit test passes with the same numbers as before;
@@ -461,7 +461,7 @@ V1 (`neuron_model_runner.py`) is the default. Model Runner V2 (`neuron_model_run
 serves the model with `VLLM_USE_V2_MODEL_RUNNER=1` (`serve.sh` `RUNNER=v2`), with async
 scheduling also with MTP, decode context-length buckets, preemption, and prefix caching
 (`PREFIX_CACHING=1`, V2 only). It builds on V2's support for recurrent-state models and MTP
-(the Qwen3.5 work, the generic commits of the `qwen3_5-mrv2` branch).
+(the Qwen3.5 work: the generic commits of the Qwen3.5 Model Runner V2 work).
 
 What V2 needed for this model:
 - **Host inputs.** V2 builds `input_ids` and positions in the graph, so the runner keeps a host
@@ -517,7 +517,7 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28 to 2026-10-30):
   `-O2` on V2 (`QWEN4_EXP_OPTLEVEL`); the serving buckets (1024, 4096) compile at `-O1`. Its references now hold the FP8
   experts the model serves (`_round_experts_to_fp8`, the loader's own per-channel
   quantization, bit-identical to the served weights). Against the BF16-expert references, V2,
-  V1 and the `qwen4_exp-upstream` branch (before any V2 work) all failed 2 of 4 prompts with the
+  V1 and the V1-only base of this work (before any V2 work) all failed 2 of 4 prompts with the
   same numbers to four decimals (prompt 1 diverging at token 4 on a 0.375 near-tie): the test
   measured the FP8 quantization against bounds meant for BF16 compute. The 4-layer BF16
   truncation passes (three-way).
@@ -565,11 +565,11 @@ Validation (trn2.48xlarge, 48-layer FP8, 2026-10-28 to 2026-10-30):
 Qwen3.5 regression (the generic V1/V2 commits, 2026-10-30):
 - **Logit test** (`test/integration/model/qwen3_5/test_model.py`) passes on V1 and V2 at batch
   1 and 4, no divergent token: Qwen3.8-27B (TP=4) on the native and the XLA route, Qwen3.5-2B
-  (`QWEN3_5_TP=2`) on the native route. V1 gives the `qwen4_exp-upstream` branch's numbers to
+  (`QWEN3_5_TP=2`) on the native route. V1 gives the same numbers as before the V2 work, to
   four decimals on both routes.
-- **V1 MTP was broken by `ddfcba8`** (preemption under `VLLM_NEURON_MAX_KV_CONCURRENT`, on
-  `qwen4_exp-upstream`): Qwen3.8-27B with MTP 2 and the recipe's `serve.sh` dropped tokens
-  ("OrderedDictUCache:"); `qwen3_5-upstream` and the commit before were correct (bisected on
+- **V1 MTP was broken by the change that added preemption under
+  `VLLM_NEURON_MAX_KV_CONCURRENT`** (in the V1-only base of this work): Qwen3.8-27B with MTP 2 and the recipe's `serve.sh` dropped tokens
+  ("OrderedDictUCache:"); the Qwen3.5 base and the commit before that change were correct (bisected on
   device). Its partial-prefill check (`num_computed + num_scheduled < num_tokens`, to keep a
   resumed request's recompute from emitting tokens) also flagged verify steps under async
   scheduling, whose token count already holds the in-flight steps' accepted tokens, and
@@ -585,7 +585,8 @@ route (`vllm_neuron`), and the logit tests take whichever the environment sets.
   `torch.compile` pickles what the model module reaches for its guard state, which included
   the host n-gram table and its thread pool (`cannot pickle '_queue.SimpleQueue'`), and every
   trace process (one per graph and rank, 11 per rank by default) copied the table, filling the
-  2 TB host. The host inputs now live outside the module (e7a4e9a): one V2 server peaks at
+  2 TB host. The host inputs now live outside the module (since the fix that keeps the host n-gram inputs
+  off the module): one V2 server peaks at
   218 GB of host memory with 2 trace processes per rank, 548 GB with the default. Plain V2
   serving then works (Aider run 5).
 - **Compile time and timeouts.** With MTP (64k configuration, 11 graphs per rank) warmup first
@@ -595,13 +596,14 @@ route (`vllm_neuron`), and the logit tests take whichever the environment sets.
     chunk loop) spent 3 h 51 min in neuronx-cc's HierarchySplitter, which the native backend
     always enables (`stablehlo.hierarchy_splitter_compatible`; the XLA route compiles the same
     computation, an HLO proto without that attribute, in 22 min). The splitter grows faster than
-    the square of the op count. f16c1bc first made the native route bisect over the scores'
+    the square of the op count. A first fix made the native route bisect over the scores'
     int32 bit patterns (same mask, same logit-test errors to four decimals): a cold compile of
-    all 11 graphs then took 74 min. fa4a888 replaced those compares, which lowered to slow
+    all 11 graphs then took 74 min. A later change (fp32 QSA top-k compares on both routes)
+    replaced those compares, which lowered to slow
     GpSimd tensor-tensor ops (see "QSA top-k compares" below): both routes now compare fp32
     scores against fp32 thresholds, and on the native route each threshold is bitcast back to
     fp32 (`_bits_view_float`) instead of rebuilt with `_bits_to_float`, so the graph stays
-    small. The 74-min cold compile was measured before fa4a888 and has not been re-measured.
+    small. The 74-min cold compile was measured before the fp32-compare change and has not been re-measured.
     Without the attribute neuronx-cc fails this graph's ISA validation (NCC_IINAR001, at `-O1`
     and `-O2`; repro `ncc_iinar001_qwen4exp_native_prefill4096.tgz`, kept outside the
     repository).
@@ -612,8 +614,8 @@ route (`vllm_neuron`), and the logit tests take whichever the environment sets.
   - *The ranks then missed the barrier* after graph extraction (`VLLM_NEURON_BARRIER_TIMEOUT`,
     3600 s).
 
-  Both timeouts are raised by default on the native route since 289a763
-  (`TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=21600`,
+  Both timeouts are raised by default on the native route since the change that made compile timeouts survive a
+  long first compile (`TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=21600`,
   `VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT=21600`).
 - **HBM fit with MTP.** With the timeouts raised it compiles, but the default 64k configuration
   does not fit the 24 GB of HBM through batch 8. The native NEFFs carry 1.1-1.9 GB of code and
@@ -630,8 +632,8 @@ route (`vllm_neuron`), and the logit tests take whichever the environment sets.
   - Where the extra HBM goes (NEFF analysis against the XLA twins): about 1 GiB more code, 82%
     of it in the 8 verify graphs (`-O2`, the native default, shares a 12-layer body three times
     where `-O1` shares a 4-layer one; and `index_copy_` in `_copy_state_pages` lowered to a
-    page-wide scatter, about 74 MiB per batch-8 graph, now `index_put_` on the native route,
-    a5b9812), and about 1 GiB more prefill scratchpad (the native partition cut points keep the
+    page-wide scatter, about 74 MiB per batch-8 graph, now `index_put_` on the native route
+    by the change that copies MTP state pages with `index_put_`), and about 1 GiB more prefill scratchpad (the native partition cut points keep the
     QSA token masks live across partitions). Verify graphs at `-O1` fail to compile there
     (NCC_INLA001). The DMA rings also grow during execution (to 1.27 GB with the plugin's
     `NEURON_RT_IO_RING_CACHE_SIZE=32`).
@@ -640,28 +642,28 @@ route (`vllm_neuron`), and the logit tests take whichever the environment sets.
     an allocation failure, 87% of drafts accepted. It is slow beyond batch 1: inter-token 23 /
     172-188 / 222 ms at B=1 / B=8 / B=4 with 30k prompts (XLA MTP: 19 / 67 / 111), time to
     first token 9.5 s at B=1 (XLA MTP 6.1 s); contexts above 4k decode over the whole 64k
-    bucket. Measured before fa4a888.
+    bucket. Measured before the fp32-compare change.
   - An earlier reading of this failure as an HBM overflow of the verify graphs (`NCC_EOOM002`)
     was wrong: that came from standalone recompiles of the prefill graph with other flags,
     whose "39.4 GB of I/O tensors" counts the inputs once per physical core; graph I/O is
     aliased as on the XLA route.
 - **MTP on Qwen3.5 / Qwen3.8 dense.** MTP on the native route hits an out-of-bounds access on
-  device during warmup or the first request, for Qwen3.8-27B on every branch tried (this one,
-  `qwen4_exp-upstream`, `qwen3_5-upstream`, `qwen3_5-mrv2`) and for Qwen3.5-2B on this branch
-  and `qwen4_exp-upstream` (`qwen3_5-mrv2` serves 2B); not investigated further. Qwen3.5-2B on
+  device during warmup or the first request, for Qwen3.8-27B on every code base tried (this work,
+  its V1-only base, the Qwen3.5 base, the Qwen3.5 Model Runner V2 work) and for Qwen3.5-2B on
+  this work and its V1-only base (the Qwen3.5 Model Runner V2 work serves 2B); not investigated further. Qwen3.5-2B on
   the native route also fails to compile at batch 8 and with a 4096-token prefill bucket
   (NCC_ITRF901 / NCC_IGCA044).
 
 ### Release-candidate check and QSA top-k compares (2026-11-01)
 
-Release-candidate check (f16c1bc, XLA route, 2026-11-01): logit test on V1 and V2 at batch 1
+Release-candidate check (with the int32 bit-pattern top-k compares, XLA route, 2026-11-01): logit test on V1 and V2 at batch 1
 and 4 passes (no divergent token); 2-hour soak of prefix caching + FP8 KV + MTP 20 of 20 rounds
 consistent, no errors; 2-hour soak of plain V2 without errors. The plain soak's consistency
 check (each question alone vs all four at once) flags one question: its 73rd token is an exact
 top-2 tie at batch 1 (gap 0.000) that batch 4 breaks the other way (0.125), as between batch
 sizes elsewhere.
 
-QSA top-k compares (fa4a888, 2026-11-01): the int32 bit-pattern compares of f16c1bc lowered
+QSA top-k compares (2026-11-01): the int32 bit-pattern compares of the first fix lowered
 to GpSimd tensor-tensor ops, the whole native/XLA prefill gap on a 4-layer truncation (device
 profiles); both routes now compare fp32 (thresholds bitcast back where the bitcast lowers) and
 the tie-break runs on fp32 indices. XLA route against the previous commit: greedy outputs
@@ -669,7 +671,7 @@ identical on 10 Aider transcripts of 3k-39k tokens, needles 6 of 6, logit test p
 first token 4.84 / 10.98 / 48.3 s (was 5.73 / 13.0 / 57.4) at B=1 8k / B=8 4k / B=4 30k,
 inter-token 34.9 / 53.4 / 104 ms (34.9 / 55.0 / 115). Native route: time to first token 6.51 /
 14.70 / 65.3 s (8.26 / 18.64 / 83.0), still about 35% above the XLA route on the full model
-(native decode not re-measured). Native-route 2-hour soak of plain V2 (84298d4): 15
+(native decode not re-measured). Native-route 2-hour soak of plain V2 (before the fp32-compare change): 15
 rounds consistent, no serving errors.
 
 ## Open work

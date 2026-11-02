@@ -26,11 +26,11 @@ recent V1 fixes covers a case that this design handles by construction:
 
 | V1 fix | Failure | V2 design |
 |---|---|---|
-| 1327be7 | A held-back request's positions were corrected twice | Positions come from the device count, which is never corrected; nothing is corrected |
-| f83411a | A request was corrected by the wrong step's drafts | Each slot's accepted count is committed by the step that verified it and read by the slot's next step, whichever step that is |
-| d9c33bd | A request absent from the previous step resumed from the wrong state block | `state_in` is read from the slot's own committed accepted count |
-| 932f443 | A step with mixed draft counts misaligned the `[B, 1 + k]` verify layout | The layout is always `[B, 1 + k]`; a row with fewer drafts is padded inside its own row |
-| d88c405 | The rejection sampler dropped the bonus token of a row with fewer drafts | The fixed-layout sampler masks a row's positions past its draft count as accepted |
+| Do not correct a held-back request's positions twice | A held-back request's positions were corrected twice | Positions come from the device count, which is never corrected; nothing is corrected |
+| Correct a request by the drafts its last step verified | A request was corrected by the wrong step's drafts | Each slot's accepted count is committed by the step that verified it and read by the slot's next step, whichever step that is |
+| Correct requests that missed the previous step | A request absent from the previous step resumed from the wrong state block | `state_in` is read from the slot's own committed accepted count |
+| No step mixes requests with and without drafts | A step with mixed draft counts misaligned the `[B, 1 + k]` verify layout | The layout is always `[B, 1 + k]`; a row with fewer drafts is padded inside its own row |
+| Emit the bonus token of a request with fewer drafts (rejection sampler) | The rejection sampler dropped the bonus token of a row with fewer drafts | The fixed-layout sampler masks a row's positions past its draft count as accepted |
 
 The design follows vLLM's GPU MRv2 (`vllm/v1/worker/gpu/`): positions come from the
 device `num_computed_tokens` (`prepare_pos_seq_lens`), draft token values come from a
@@ -160,7 +160,7 @@ graph signature is unchanged.
    [B, 1 + k], drafts [B, k], num_drafts [B])` returns `[B, 1 + k]` with `-1` past the
    accepted prefix (the same acceptance rule as V1's `rejection_sampler`, sharing its
    `synthetic` mode; positions past a row's own drafts count as accepted so the bonus token
-   is kept, d88c405). The on-device sampler draws each target token from the target
+   is kept, as in the V1 rejection-sampler fix for rows with fewer drafts). The on-device sampler draws each target token from the target
    distribution, so accept-if-equal keeps the output distribution exact at any temperature,
    as in V1. `valid_count [B]` (1 .. 1 + n_r) is the accepted count.
 3. **Drafter in the same graph**: the draft model's contract is the EAGLE3 / MTP fused draft
@@ -276,9 +276,10 @@ unchanged: a verify graph touches exactly the slots of its rows.
 
 - The scheduler limits a step to `max_model_len - 1 - num_computed` tokens, so a request near
   the end gets `n_r < k` drafts (sync) or none (async: `NeuronAsyncScheduler` stops drafting
-  for every request while any request is near the end, 932f443). Both are rows with fewer
+  for every request while any request is near the end: the V1 async fix so that no step
+  mixes requests with and without drafts). Both are rows with fewer
   drafts in the fixed layout.
-- The scheduler-side rule of 932f443 does not exclude every mixed step: once the request near
+- That scheduler-side rule does not exclude every mixed step: once the request near
   the end has finished, a request whose final prefill chunk ran while the others were held back
   gets placeholders, while the held-back requests keep the empty draft lists of their last
   step, so the next step mixes rows with `k` and with 0 drafts (seen in the CPU test with
@@ -458,5 +459,6 @@ Checks: greedy (`temperature=0`) completions equal V1 MTP and V2 without
 arriving together, a long prompt (several chunks) arriving while others decode, and requests
 that run to `max_model_len` (for example `MAX_MODEL_LEN=2048` with `max_tokens` past it);
 `logprobs=1` returns one entry per generated token. Signs of a layout or state bug are the
-ones 932f443 describes: tokens with logprob far below the top token in the last tokens of
+ones described by the V1 async fix that keeps a step from mixing requests with and without
+drafts: tokens with logprob far below the top token in the last tokens of
 requests near the end, or divergence after the first verify step with partial acceptance.
