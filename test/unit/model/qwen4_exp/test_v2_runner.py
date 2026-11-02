@@ -587,13 +587,28 @@ def test_clear_on_free_with_block_reuse_matches_hf(tmp_path, plugin_mtp, scenari
     assert cleared, "no block was cleared"
 
 
+@pytest.fixture(scope="module")
+def preemption_scenario():
+    """Three prompts and their HF greedy continuations (180 tokens), shared by the
+    preemption variants: the per-token HF reference dominates their run time."""
+    hf, hf_cfg = _hf_model()
+    g = torch.Generator().manual_seed(13)
+    lengths = {"x": 50, "y": 55, "z": 45}
+    prompts = {
+        r: torch.randint(2, hf_cfg.vocab_size, (n,), generator=g).tolist()
+        for r, n in lengths.items()
+    }
+    expected = {r: _hf_greedy(hf, p, 180) for r, p in prompts.items()}
+    return hf, hf_cfg, prompts, expected
+
+
 @pytest.mark.parametrize(
     "draft,async_scheduling",
     [(None, False), (None, True), ("oracle", True)],
     ids=["plain-sync", "plain-async", "oracle-async"],
 )
 def test_preemption_with_prefix_caching_matches_hf(
-    tmp_path, monkeypatch, plugin_mtp, draft, async_scheduling
+    tmp_path, monkeypatch, plugin_mtp, preemption_scenario, draft, async_scheduling
 ):
     """Prefix caching on a KV cache too small for the requests' growth: three requests
     fit at admission, then cross block boundaries while decoding, so the scheduler
@@ -602,15 +617,8 @@ def test_preemption_with_prefix_caching_matches_hf(
     checkpoint. Greedy outputs equal HF's."""
     # Admit all three (the scheduler otherwise caps them at the worst case, max_model_len).
     monkeypatch.setenv("VLLM_NEURON_MAX_KV_CONCURRENT", "3")
-    hf, hf_cfg = _hf_model()
+    hf, hf_cfg, prompts, expected = preemption_scenario
     model = _model(plugin_mtp, hf, hf_cfg)
-    g = torch.Generator().manual_seed(13)
-    lengths = {"x": 50, "y": 55, "z": 45}
-    prompts = {
-        r: torch.randint(2, hf_cfg.vocab_size, (n,), generator=g).tolist()
-        for r, n in lengths.items()
-    }
-    expected = {r: _hf_greedy(hf, p, 180) for r, p in prompts.items()}
     vllm_config = _vllm_config(
         tmp_path,
         hf_cfg,

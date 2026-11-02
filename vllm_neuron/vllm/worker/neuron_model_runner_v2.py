@@ -81,6 +81,19 @@ from .neuron_request_state import NO_LOGPROBS, NeuronRequestState
 logger = logging.getLogger(__name__)
 
 
+def _should_clear_on_free(kv_clearer, ckpt_block, vllm_config) -> bool:
+    """Whether to zero a removed request's KV blocks (instead of new blocks at allocation).
+
+    Only with a KV clearer, without prefix caching (``ckpt_block``: freed blocks stay
+    cached and hold valid KV or state checkpoints) and without a KV connector (which may
+    keep a removed request's blocks to send them)."""
+    return (
+        kv_clearer is not None
+        and not ckpt_block
+        and getattr(vllm_config, "kv_transfer_config", None) is None
+    )
+
+
 class _DebugLogitRow(NamedTuple):
     logit_row: int
     batch_idx: int
@@ -1953,10 +1966,8 @@ class NeuronModelRunnerV2:
         # KV or state checkpoints), so new blocks are cleared at allocation. A KV connector
         # may keep a removed request's blocks (delayed free) to send them: then clear at
         # allocation too.
-        self._clear_on_free = (
-            kv_clearer is not None
-            and not ckpt_block
-            and getattr(self.vllm_config, "kv_transfer_config", None) is None
+        self._clear_on_free = _should_clear_on_free(
+            kv_clearer, ckpt_block, self.vllm_config
         )
         self._freed_kv_blocks = []
         if checkpointer is not None:

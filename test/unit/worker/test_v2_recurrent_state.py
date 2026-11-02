@@ -690,3 +690,24 @@ def test_kv_cache_manager_blocks_feed_the_runner():
             sm = model_input.slot_mappings[g]
             assert int(sm[0]) == block_ids[g][0] * MAX_MODEL_LEN
             assert int(sm[511]) == block_ids[g][0] * MAX_MODEL_LEN + 511
+
+
+@pytest.mark.parametrize(
+    "clearer,ckpt_block,kv_transfer,expected",
+    [
+        (True, 0, None, True),  # a clearer, no prefix caching, no KV connector
+        (False, 0, None, False),  # nothing to clear with
+        (True, 512, None, False),  # prefix caching: freed blocks stay cached
+        (True, 0, object(), False),  # a KV connector may keep the blocks to send them
+    ],
+)
+def test_should_clear_on_free(clearer, ckpt_block, kv_transfer, expected):
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.worker.neuron_model_runner_v2 import _should_clear_on_free
+
+    cfg = SimpleNamespace(kv_transfer_config=kv_transfer)
+    assert (
+        _should_clear_on_free(object() if clearer else None, ckpt_block, cfg)
+        is expected
+    )
