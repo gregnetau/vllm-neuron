@@ -51,9 +51,9 @@ from vllm.v1.worker.gpu.kv_connector import (
 from . import hybrid_state
 from .host_inputs import (
     HostInputSpecs,
-    _host_input_specs_of,
     build_step_host_inputs,
     build_v2_host_input_layout,
+    host_input_specs_of,
     host_input_zero_kwargs,
 )
 from .neuron_forward_adapter import (
@@ -3522,7 +3522,7 @@ class NeuronModelRunnerV2:
     # ------------------------------------------------------------------
     def _init_host_inputs(self) -> None:
         """Resolve the loaded model's host inputs and allocate the host token history."""
-        self._host_input_specs = _host_input_specs_of(self.model)
+        self._host_input_specs = host_input_specs_of(self.model)
         self._host_token_ids = None
         self._host_join_queue.clear()
         if not self._host_input_specs:

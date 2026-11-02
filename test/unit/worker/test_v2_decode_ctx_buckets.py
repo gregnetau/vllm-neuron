@@ -182,6 +182,53 @@ def test_worker_builds_one_v2_decode_job_per_row_and_ctx_bucket(buckets, targets
     assert jobs == sorted(targets, reverse=True) == built
 
 
+def test_worker_prefill_jobs_name_the_runner_graph_type():
+    # Each prefill job carries the runner's graph type for its context variant (the
+    # model's per-graph compiler args key on it).
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        prefill_ctx_variants=lambda kv_seg_size, bucket_size: (False, True),
+        _build_prefill_synthetic_inputs=lambda bucket, kv_seg, device, dense_ctx: None,
+        prefill_graph_type=lambda dense_ctx: (
+            "prefill_dense_spec" if dense_ctx else "prefill"
+        ),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner, _build_trace_job=lambda model_input, **kw: kw
+    )
+    jobs = NeuronWorker._build_prefill_trace_jobs(
+        worker, [(1024, 4096)], native_compile_only=True
+    )
+    assert [j["graph_type"] for j in jobs] == ["prefill", "prefill_dense_spec"]
+    # A runner without prefill_graph_type: no graph type.
+    del runner.prefill_graph_type
+    jobs = NeuronWorker._build_prefill_trace_jobs(worker, [(1024, 4096)])
+    assert [j["graph_type"] for j in jobs] == [None, None]
+
+
+def test_worker_model_bytes_count_the_v2_draft_model():
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
+
+    model, draft = torch.nn.Linear(4, 8), torch.nn.Linear(2, 3, bias=False)
+    draft.register_buffer("scale", torch.zeros(5))
+
+    def nbytes(m):
+        return sum(t.nbytes for t in (*m.parameters(), *m.buffers()))
+
+    runner = SimpleNamespace(model=model, drafter=None, draft_model=draft)
+    worker = SimpleNamespace(model_runner=runner)
+    both = nbytes(model) + nbytes(draft)
+    assert NeuronWorker._get_byte_used_from_model(worker) == both
+    runner.draft_model = None
+    assert NeuronWorker._get_byte_used_from_model(worker) == nbytes(model)
+
+
 def test_verify_untrimmed_table_is_unchanged():
     # Without a trim (table covers max_model_len), positions clamp to max_model_len - 1
     # and the guard is not traced.

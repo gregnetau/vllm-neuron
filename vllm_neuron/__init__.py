@@ -45,7 +45,9 @@ if (envs.VLLM_NEURON_MEGA_DMA_ORDER_CONSTRAINTS_FILE or "").strip():
 # at once and they finished over an hour apart. Seeded here so every process inherits it; an
 # explicit value wins.
 if envs.is_native_backend():
-    os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "21600")
+    os.environ.setdefault(
+        "TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", str(envs.NATIVE_COMPILE_TIMEOUT_S)
+    )
 
 # Initialize logging early so VLLM_NEURON_LOG_LEVEL takes effect
 from vllm_neuron.logging_config import setup_logging as _setup_logging

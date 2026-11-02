@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Native route (torch.compile): how long a rank waits for NEFFs other ranks are compiling, as
+# the default tp_barrier timeout after graph extraction and the seeded
+# TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT (vllm_neuron/__init__.py). The longest first compile
+# observed (a large prefill graph) took about 4 h.
+NATIVE_COMPILE_TIMEOUT_S = 6 * 3600
+
 
 if TYPE_CHECKING:
     # Core System Variables
@@ -34,7 +40,7 @@ if TYPE_CHECKING:
     # inference, which V2 does not support yet).
     VLLM_NEURON_ALLOW_V2_WIDE_EP: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
-    VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT: int = 21600
+    VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT: int = NATIVE_COMPILE_TIMEOUT_S
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # Select a guard filter for torch.compile. See
     # get_precompile_guard_filter_fn(). "" keeps every guard.
@@ -304,7 +310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_NEURON_BARRIER_TIMEOUT, when set, wins.
     "VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_NATIVE_COMPILE_BARRIER_TIMEOUT"))
-        or 21600
+        or NATIVE_COMPILE_TIMEOUT_S
     ),
     # Offset for the MPExecutor collective and root-comm base ports. `make test`
     # sets a different offset per concurrent build-time pass to prevent a
