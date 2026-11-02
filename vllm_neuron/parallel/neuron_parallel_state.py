@@ -2062,11 +2062,37 @@ def tp_barrier(timeout: timedelta | None = None):
     """
     from vllm.distributed.parallel_state import get_tp_group
 
-    timeout = timeout or _default_barrier_timeout()
     group = get_tp_group()
-    if group.world_size > 1:
-        group.cpu_group.set_timeout(timeout)
-        group.cpu_group.barrier().wait(timeout=timeout)
+    if group.world_size <= 1:
+        return
+    cpu_group = group.cpu_group
+    if not timeout:
+        timeout = _default_barrier_timeout()
+        cpu_group.set_timeout(timeout)
+        cpu_group.barrier().wait(timeout=timeout)
+        return
+    # An explicit timeout (e.g. 6 h after native-route compilation) applies to this barrier
+    # only: restore the group's previous timeout, so later collectives keep theirs.
+    previous = _cpu_group_timeout(cpu_group) or _default_barrier_timeout()
+    cpu_group.set_timeout(timeout)
+    try:
+        cpu_group.barrier().wait(timeout=timeout)
+    finally:
+        cpu_group.set_timeout(previous)
+
+
+def _cpu_group_timeout(cpu_group) -> timedelta | None:
+    """The current default timeout of a gloo ``ProcessGroup``, or None where it cannot be
+    read: ``ProcessGroup`` has ``set_timeout`` but no getter, so this reads the gloo
+    backend's options (private: ``ProcessGroupGloo.options._timeout``, which ``set_timeout``
+    updates)."""
+    try:
+        import torch
+
+        timeout = cpu_group._get_backend(torch.device("cpu")).options._timeout
+    except (AttributeError, RuntimeError):
+        return None
+    return timeout if isinstance(timeout, timedelta) else None
 
 
 def _default_barrier_timeout() -> timedelta:

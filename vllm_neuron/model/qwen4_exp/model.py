@@ -43,6 +43,7 @@ from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.model import route_caps
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, StateLayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.model.qwen3_5 import gdn_ops
@@ -61,14 +62,6 @@ from .config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen4ExpConfig
 from .moe import Qwen4ExpSparseMoe, attach_moe_loaders, moe_weight_mappings
 
 logger = logging.getLogger(__name__)
-
-
-def _on_native_route() -> bool:
-    """Whether graphs are captured on the native route (torch.compile), where some ops lower
-    differently from the XLA route."""
-    from vllm_neuron import envs
-
-    return envs.is_native_backend()
 
 
 CKPT = W.TEXT_PREFIX  # "model.language_model."
@@ -394,10 +387,10 @@ class Qwen4ExpGatedDeltaNet(Q.Qwen3_5GatedDeltaNet):
         zero = torch.zeros((), dtype=self.state_a.dtype, device=self.state_a.device)
         for state in (self.state_a, self.state_b):
             val = torch.where(pad, zero, state.index_select(0, src))
-            if _on_native_route():
-                # The native route lowers index_copy_ to an element-wise scatter over the whole
-                # [B, 512, 128] page (~74 MiB of instruction code per batch-8 verify graph);
-                # index_put_ stays a row copy. Padded rows all write zeros to the null page.
+            if route_caps.index_copy_lowers_to_scatter():
+                # index_copy_ would scatter element-wise over the whole [B, 512, 128] page
+                # (~74 MiB of instruction code per batch-8 verify graph); index_put_ stays a
+                # row copy. Padded rows all write zeros to the null page.
                 state.index_put_((dst,), val)
             else:
                 state.index_copy_(0, dst, val)

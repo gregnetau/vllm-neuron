@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_neuron.model import route_caps
 from vllm_neuron.model.qwen4_exp import model as M
 
 
@@ -28,7 +29,7 @@ def test_host_ple_inputs_stay_off_the_module():
 
 @pytest.mark.parametrize("native", [False, True], ids=["index_copy", "index_put"])
 def test_copy_state_pages_copies_rows_and_zeroes_padding(monkeypatch, native):
-    monkeypatch.setattr(M, "_on_native_route", lambda: native)
+    monkeypatch.setattr(route_caps, "index_copy_lowers_to_scatter", lambda: native)
     g = torch.Generator().manual_seed(0)
     a0, b0 = torch.randn(8, 4, 3, generator=g), torch.randn(8, 4, 3, generator=g)
     layer = SimpleNamespace(state_a=a0.clone(), state_b=b0.clone())

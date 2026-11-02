@@ -48,6 +48,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from vllm_neuron.model import route_caps
 from vllm_neuron.model.kv_cache import paged_slot_indices
 
 __all__ = [
@@ -349,14 +350,6 @@ def _radix_search(
     return lo
 
 
-def _bitcast_lowers() -> bool:
-    """Whether ``Tensor.view(dtype)`` (a bitcast) lowers: on the native route (torch.compile,
-    the plugin's default, so also CPU tests), not on the XLA route."""
-    from vllm_neuron import envs
-
-    return envs.is_native_backend()
-
-
 def topk_block_mask(
     scores: torch.Tensor,
     k: torch.Tensor,
@@ -374,7 +367,7 @@ def topk_block_mask(
         (``_bits_to_float``, ~130 ops per threshold: 87% of the selection's ops, on which
         the native route's compiler front end spent hours for a 4096-token prefill graph).
         The same values, so the same mask. None: where the bitcast lowers
-        (``_bitcast_lowers``).
+        (``route_caps.bitcast_lowers``).
     Selects every score above the k-th largest value v and, among the scores equal to v,
     the lowest-index ones, so exactly k entries per row. All ops are compare / count /
     where on static shapes: ceil(31 / r) + ceil(log2(N) / r) passes, each testing
@@ -395,7 +388,7 @@ def topk_block_mask(
     # cost). Where the bitcast lowers, the few thresholds are bitcast back to fp32
     # (``_bits_view_float``) instead of rebuilt with ``_bits_to_float`` (~130 ops each).
     if bitcast_thresholds is None:
-        bitcast_thresholds = _bitcast_lowers()
+        bitcast_thresholds = route_caps.bitcast_lowers()
     to_float = _bits_view_float if bitcast_thresholds else _bits_to_float
 
     def value_ok(t):

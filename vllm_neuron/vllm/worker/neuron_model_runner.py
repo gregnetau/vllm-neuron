@@ -44,9 +44,9 @@ from vllm_neuron.model.state_cache import (
 from vllm_neuron.vllm.worker import hybrid_state
 from vllm_neuron.vllm.worker.host_inputs import (
     HostInputSpecs,
-    _host_input_specs_of,
     build_step_host_inputs,
     host_input_req_rows,
+    host_input_specs_of,
     host_input_zero_kwargs,
 )
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
@@ -11911,7 +11911,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         model = getattr(self, "model", None)
         if model is None:
             return None
-        specs = _host_input_specs_of(model)
+        specs = host_input_specs_of(model)
         if (
             specs
             and getattr(self, "use_async_scheduling", False)

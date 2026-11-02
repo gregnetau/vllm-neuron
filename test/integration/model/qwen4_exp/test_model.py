@@ -153,9 +153,8 @@ def _round_experts_to_fp8(model):
         if not name.endswith("mlp.experts"):
             continue
         for w in (module.gate_up_proj, module.down_proj):
-            for e in range(
-                w.shape[0]
-            ):  # one expert at a time: the FP32 model is ~650 GB
+            # One expert at a time: the FP32 model is ~650 GB.
+            for e in range(w.shape[0]):
                 q, scale = fp8_quantize_per_channel(w[e], 1)
                 w[e] = (q.float() * scale[:, None]).to(w.dtype)
 

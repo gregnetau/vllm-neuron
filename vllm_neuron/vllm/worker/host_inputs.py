@@ -20,7 +20,7 @@ from vllm_neuron.model.interfaces import HasHostInputs
 HostInputSpecs = dict[str, tuple[tuple[int, ...], torch.dtype]]
 
 
-def _host_input_specs_of(model: Any) -> HostInputSpecs | None:
+def host_input_specs_of(model: Any) -> HostInputSpecs | None:
     """Return the ``HasHostInputs`` specs of a loaded model, or None without the capability.
 
     ``torch.compile`` wraps the module, so test the original. The spec-decode decorator

@@ -6,9 +6,11 @@ import os
 import subprocess
 import sys
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
+from vllm_neuron.parallel import neuron_parallel_state
 from vllm_neuron.vllm.worker import neuron_worker
 
 
@@ -60,3 +62,95 @@ def test_neff_cache_lock_timeout_seeded_on_native_route(backend, explicit, expec
         check=True,
     )
     assert out.stdout.strip().splitlines()[-1] == expected
+
+
+class _StubCpuGroup:
+    """A gloo-like cpu_group: ``set_timeout`` updates the backend options' timeout."""
+
+    def __init__(self, timeout, readable=True, fail=False):
+        self.options = SimpleNamespace(_timeout=timeout)
+        self.readable, self.fail = readable, fail
+        self.calls = []
+
+    def _get_backend(self, device):
+        if not self.readable:
+            raise RuntimeError("no backend")
+        return self
+
+    def set_timeout(self, timeout):
+        self.calls.append(("set_timeout", timeout))
+        self.options._timeout = timeout
+
+    def barrier(self):
+        group = self
+
+        class _Work:
+            def wait(self, timeout):
+                group.calls.append(("wait", timeout))
+                if group.fail:
+                    raise RuntimeError("barrier timed out")
+
+        return _Work()
+
+
+def _patch_tp_group(monkeypatch, cpu_group, world_size=2):
+    import vllm.distributed.parallel_state as vps
+
+    group = SimpleNamespace(world_size=world_size, cpu_group=cpu_group)
+    monkeypatch.setattr(vps, "get_tp_group", lambda: group)
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["getter", "no_getter"])
+@pytest.mark.parametrize("fail", [False, True], ids=["ok", "raises"])
+def test_tp_barrier_restores_timeout_after_an_explicit_one(monkeypatch, readable, fail):
+    monkeypatch.setenv("VLLM_NEURON_BARRIER_TIMEOUT", "900")
+    before = timedelta(seconds=1800)
+    six_h = timedelta(hours=6)
+    g = _StubCpuGroup(before, readable=readable, fail=fail)
+    _patch_tp_group(monkeypatch, g)
+    if fail:
+        with pytest.raises(RuntimeError):
+            neuron_parallel_state.tp_barrier(six_h)
+    else:
+        neuron_parallel_state.tp_barrier(six_h)
+    # Unreadable: back to the default barrier timeout.
+    restored = before if readable else timedelta(seconds=900)
+    assert g.calls == [
+        ("set_timeout", six_h),
+        ("wait", six_h),
+        ("set_timeout", restored),
+    ]
+    assert g.options._timeout == restored
+
+
+def test_tp_barrier_default_timeout_stays_set(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_BARRIER_TIMEOUT", "900")
+    g = _StubCpuGroup(timedelta(seconds=1800))
+    _patch_tp_group(monkeypatch, g)
+    neuron_parallel_state.tp_barrier()
+    default = timedelta(seconds=900)
+    assert g.calls == [("set_timeout", default), ("wait", default)]
+
+
+def test_tp_barrier_single_rank_is_a_no_op(monkeypatch):
+    g = _StubCpuGroup(timedelta(seconds=1800))
+    _patch_tp_group(monkeypatch, g, world_size=1)
+    neuron_parallel_state.tp_barrier(timedelta(hours=6))
+    assert g.calls == []
+
+
+def test_cpu_group_timeout_reads_a_real_gloo_group():
+    # The getter reads a private attribute: check it against torch's gloo ProcessGroup,
+    # the type of vLLM's cpu_group, and that set_timeout moves it.
+    import torch
+    import torch.distributed as dist
+
+    store = dist.HashStore()
+    gloo = dist.ProcessGroupGloo(store, 0, 1, timedelta(seconds=55))
+    pg = dist.ProcessGroup(store, 0, 1)
+    pg._set_default_backend(dist.ProcessGroup.BackendType.GLOO)
+    pg._register_backend(torch.device("cpu"), dist.ProcessGroup.BackendType.GLOO, gloo)
+    assert neuron_parallel_state._cpu_group_timeout(pg) == timedelta(seconds=55)
+    pg.set_timeout(timedelta(seconds=3))
+    assert neuron_parallel_state._cpu_group_timeout(pg) == timedelta(seconds=3)
+    assert neuron_parallel_state._cpu_group_timeout(object()) is None

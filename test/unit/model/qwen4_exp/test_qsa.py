@@ -183,9 +183,8 @@ def test_topk_block_mask_bitcast_equals_rebuilt_thresholds(N):
     and ineligible (-1) entries, at every k."""
     g = torch.Generator().manual_seed(N + 1)
     rows = 16
-    mag = torch.exp(
-        torch.empty(rows, N).uniform_(-80, 80, generator=g)
-    )  # 1e-35 .. 1e35
+    # 1e-35 .. 1e35
+    mag = torch.exp(torch.empty(rows, N).uniform_(-80, 80, generator=g))
     s = mag * torch.randint(1, 5, (rows, N), generator=g).float()
     s[1] = torch.round(s[1].clamp(max=8.0))  # ties
     s[2] = 0.0
